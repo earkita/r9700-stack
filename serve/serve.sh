@@ -2,7 +2,7 @@
 # Qwen3.8-Flash-Next GPTQ on STOCK vLLM (ROCm 10 nightly image) + the r9700_vllm plugin, 2x R9700 TP2.
 # Experts in pinned host memory (stock --cpu-offload-params) + the plugin's device LRU expert cache, PLE int6
 # table in pinned host, bf16 KV (stock QSA), MTP via the plugin's allowlist patch.
-# Knobs: MODEL (path inside the container, /models/...), OFFLOAD_GB (per rank, 0 = none), MAXLEN, EAGER=1, MTP=n, DRAFT=/models/x SPEC=n, ATTN=, DRAFT_ATTN=, KVMEM=GiB, CHAT_TEMPLATE=, SPEC_EXTRA=, UTIL, NBT, NSEQ, P2P=1, HWQ=, MWAITX=, CGMODE=, OVERLAYS=..., EXTRA="...",
+# Knobs: MODEL (path inside the container, /models/...), OFFLOAD_GB (per rank, 0 = none), MAXLEN, EAGER=1, MTP=n, DRAFT=/models/x SPEC=n, ATTN=, DRAFT_ATTN=, KVMEM=GiB, KV_DTYPE=, DRAFT_KV_DTYPE=, CHAT_TEMPLATE=, SPEC_EXTRA=, UTIL, NBT, NSEQ, P2P=1, HWQ=, MWAITX=, CGMODE=, OVERLAYS=..., EXTRA="...",
 #   GPUS=0,1 (HIP ordinals), TP=2 (4 = our N-rank P2P all-reduce <= 512 KB, RCCL above; R9K_ARN=0 for RCCL only), PORT=8080, NAME=vllmstock (two servers
 #   side by side need distinct GPUS/PORT/NAME), DOCKER_ARGS="-e NCCL_DEBUG=INFO ..." (extra docker run args),
 # plus every R9K_* plugin knob (forwarded). WRAP=rocprof / PROF=1 for profiling.
@@ -22,15 +22,15 @@ done
 [ "${P2P:-1}" = 1 ] && MNT+=(-e NCCL_PROTO=Simple) || MNT+=(-e NCCL_P2P_DISABLE=1)
 # (re)build libr9k.so into the mounted repo when missing or older than any kernel source
 SO=$REPO/r9700_vllm/kernels/libr9k.so
-if [ ! -f $SO ] || [ -n "$(find $REPO/kernels -name '*.hip' -newer $SO)" ]; then
-  sudo docker run --rm --entrypoint bash -v $REPO:/opt/r9700 $IMG -c \
+if [ "${DRYRUN:-0}" != 1 ] && [ "${BUILD_KERNELS:-1}" = 1 ] && { [ ! -f "$SO" ] || [ -n "$(find "$REPO/kernels" -name '*.hip' -newer "$SO")" ]; }; then
+  ${DOCKER_SUDO-sudo} docker run --rm --entrypoint bash -v $REPO:/opt/r9700 $IMG -c \
     "cd /opt/r9700/kernels && ./build.sh && cp libr9k.so /opt/r9700/r9700_vllm/kernels/" || exit 1
 fi
 # torch.compile/AOT cache per plugin configuration: vLLM's cache key does not see R9K_* knobs, and a graph traced
 # with different weight layouts fails at runtime ("wrong number of dimensions").
 # The plugin's own source is part of the key too: a code change can change weight layouts under the same knobs.
 PSRC=$(find $REPO/r9700_vllm -name '*.py' -print0 | sort -z | xargs -0 cat | md5sum | cut -c1-8)
-CKEY=$( (env | grep -E '^(R9K|VLLM)_' | sort; echo "${MTP-3}${MODEL:+ $MODEL}${DRAFT:+ $DRAFT $SPEC $DRAFT_ATTN $SPEC_EXTRA}${ATTN:+ $ATTN} $PSRC") | md5sum | cut -c1-10)
+CKEY=$( (env | grep -E '^(R9K|VLLM)_' | sort; echo "${MTP-3}${MODEL:+ $MODEL}${DRAFT:+ $DRAFT $SPEC $DRAFT_ATTN $SPEC_EXTRA $DRAFT_KV_DTYPE}${ATTN:+ $ATTN} $KV_DTYPE $IMG $PSRC") | md5sum | cut -c1-10)
 # recommended defaults (VM with >=256 GB RAM): all experts in host memory, LRU cache on every layer, fp8 LM heads
 : ${R9K_EXPERT_CACHE_SLOTS:=270}; : ${R9K_TARGET_LMHEAD:=fp8}; : ${R9K_DRAFT_LMHEAD:=fp8}
 export R9K_EXPERT_CACHE_SLOTS R9K_TARGET_LMHEAD R9K_DRAFT_LMHEAD
@@ -58,6 +58,8 @@ if [ -n "$CHAT_TEMPLATE" ]; then MNT+=(-v "$CHAT_TEMPLATE:/opt/chat_template.jin
 # runtime footprint once load-time requantization / merges are on (27B: OOM at the first 1.7k-token prefill with
 # util 0.90-0.94; its own log suggests ~9.6 GiB); a fixed budget is exact.
 [ -n "$KVMEM" ] && ARGS+=(--kv-cache-memory "$(python3 -c "print(int($KVMEM * 2**30))")")
+# Separate storage precision for the target and a speculative draft.
+[ -n "$KV_DTYPE" ] && ARGS+=(--kv-cache-dtype "$KV_DTYPE")
 # OFFLOAD_GB=0: no expert offload (models that fit in VRAM, e.g. the dense 27B checkpoints)
 OFFL=(); [ "${OFFLOAD_GB:-34}" != 0 ] && OFFL=(--cpu-offload-gb ${OFFLOAD_GB:-34} --cpu-offload-params experts)
 # UTIL: vLLM's --gpu-memory-utilization. 0.94, except TP2 with offloaded experts (Flash-Next on two cards): 0.96,
@@ -91,7 +93,7 @@ CC=()
 ENTRY=(); PRE=()
 # (ROCPROF_WINDOW=all traces the whole run; PROFDIR=host dir, default ~/stock-prof)
 if [ "$WRAP" = rocprof ]; then
-  PD=${PROFDIR:-$HOME/stock-prof}; mkdir -p $PD; MNT+=(-v $PD:/prof)
+  PD=${PROFDIR:-$HOME/stock-prof}; [ "${DRYRUN:-0}" = 1 ] || mkdir -p "$PD"; MNT+=(-v "$PD:/prof")
   ENTRY=(--entrypoint /usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/bin/rocprofv3)
   PRE=(--kernel-trace --memory-copy-trace --stats -f csv -d /prof/rp -o %nid%_%pid%)
   [ "${ROCPROF_WINDOW:-600:20}" != all ] && PRE+=(--collection-period "${ROCPROF_WINDOW:-600:20}:1" --collection-period-unit sec)
@@ -99,36 +101,43 @@ if [ "$WRAP" = rocprof ]; then
 fi
 # PROF=1: torch profiler (POST /start_profile, /stop_profile) -> ~/stock-prof (use with EAGER=1 to see kernels;
 # PROFSTACK=true records Python stacks so every launch has a call site -- eager only, graphs carry no stacks)
-[ "${PROF:-0}" = 1 ] && { PD=${PROFDIR:-$HOME/stock-prof}; mkdir -p $PD; MNT+=(-v $PD:/prof)
+[ "${PROF:-0}" = 1 ] && { PD=${PROFDIR:-$HOME/stock-prof}; [ "${DRYRUN:-0}" = 1 ] || mkdir -p "$PD"; MNT+=(-v "$PD:/prof")
   ARGS+=(--profiler-config "{\"profiler\": \"torch\", \"torch_profiler_dir\": \"/prof\", \"torch_profiler_with_stack\": ${PROFSTACK:-false}, \"torch_profiler_use_gzip\": false}"); }
 MTP=${MTP-3}
 # DRAFT=/models/<drafter> (e.g. a DFlash2 checkpoint) + SPEC=n: separate-drafter speculation instead of MTP
 if [ -n "$DRAFT" ]; then
-  ARGS+=(--speculative-config "{\"model\": \"$DRAFT\", \"num_speculative_tokens\": ${SPEC:-7}${SPEC_METHOD:+, \"method\": \"$SPEC_METHOD\"}${DRAFT_ATTN:+, \"attention_backend\": \"$DRAFT_ATTN\"}${SPEC_EXTRA:+, $SPEC_EXTRA}}")
+  ARGS+=(--speculative-config "{\"model\": \"$DRAFT\", \"num_speculative_tokens\": ${SPEC:-7}${SPEC_METHOD:+, \"method\": \"$SPEC_METHOD\"}${DRAFT_ATTN:+, \"attention_backend\": \"$DRAFT_ATTN\"}${DRAFT_KV_DTYPE:+, \"kv_cache_dtype\": \"$DRAFT_KV_DTYPE\"}${SPEC_EXTRA:+, $SPEC_EXTRA}}")
 elif [ -n "$MTP" ]; then
   ARGS+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP}")
 fi
-# DRYRUN=1: print the assembled docker command and exit (config check without touching the GPUs)
-if [ "${DRYRUN:-0}" = 1 ]; then
-  printf '%q ' docker run -d --name ${NAME:-vllmstock} "${MNT[@]}" "${ENTRY[@]}" "$IMG" "${PRE[@]}" \
-    ${MODEL:-/models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ} "${OFFL[@]}" "${ARGS[@]}" $EXTRA; echo; exit 0
-fi
-sudo docker rm -f ${NAME:-vllmstock} 2>/dev/null
 # --pid=host: two servers side by side (e.g. one per PLX switch) otherwise both get worker PIDs 104/105 in their own
 # PID namespaces, and with the shared host network the second one's RCCL init fails (hipIpcGetMemHandle: invalid
 # argument, HSA_ENABLE_IPC_MODE_LEGACY=0). PIDNS= (empty) to keep a private PID namespace.
-sudo docker run -d --name ${NAME:-vllmstock} --ipc=host --network=host ${PIDNS---pid=host} --shm-size 32g \
+CMD=(docker run -d --name "${NAME:-vllmstock}" --ipc=host --network=host ${PIDNS---pid=host} --shm-size 32g \
   --device=/dev/kfd --device=/dev/dri --group-add 44 --group-add 991 --ulimit memlock=-1 \
   --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
   -e HIP_VISIBLE_DEVICES=${GPUS:-0,1} -e VLLM_ROCM_USE_AITER=0 -e HSA_ENABLE_IPC_MODE_LEGACY=0 \
   -e GPU_MAX_HW_QUEUES=${HWQ:-1} -e HSA_ENABLE_MWAITX=${MWAITX:-1} -e OMP_NUM_THREADS=8 -e R9K_LIB=/opt/r9700/r9700_vllm/kernels/libr9k.so \
-  $DOCKER_ARGS "${MNT[@]}" -v $HOME/models:/models -v $HOME/vllmstock-cache-$CKEY:/root/.cache/vllm \
+  $DOCKER_ARGS "${MNT[@]}" -v "${MODELS_DIR:-$HOME/models}:/models" -v $HOME/vllmstock-cache-$CKEY:/root/.cache/vllm \
   -v $HOME/vllmstock-triton:/root/.triton \
-  "${ENTRY[@]}" $IMG "${PRE[@]}" ${MODEL:-/models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ} \
-  --served-model-name Qwen3.8 --host 0.0.0.0 --port ${PORT:-8080} \
+  "${ENTRY[@]}" "$IMG" "${PRE[@]}" "${MODEL:-/models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ}" \
+  --served-model-name "${SERVED_MODEL_NAME:-Qwen3.8}" --host "${HOST:-0.0.0.0}" --port ${PORT:-8080} \
   --tensor-parallel-size ${TP:-2} --max-model-len ${MAXLEN:-32768} --max-num-seqs ${NSEQ:-4} \
   --max-num-batched-tokens ${NBT:-4096} --gpu-memory-utilization $UTIL \
   "${OFFL[@]}" \
-  --reasoning-parser qwen3 --tool-call-parser qwen3_coder --enable-auto-tool-choice ${LMONLY---language-model-only} \
-  "${ARGS[@]}" $EXTRA
+  --reasoning-parser "${REASONING_PARSER:-qwen3}" --tool-call-parser "${TOOL_CALL_PARSER:-qwen3_coder}" --enable-auto-tool-choice ${LMONLY---language-model-only} \
+  "${ARGS[@]}" $EXTRA)
+# Print precisely the command used below. A dry run must not compile kernels or start containers.
+if [ "${DRYRUN:-0}" = 1 ]; then
+  printf '%q ' "${CMD[@]}"; echo; exit 0
+fi
+# Opt-in structural checkpoint check, in the runtime's Python environment. No GPU allocation.
+if [ -n "${MODEL_PREFLIGHT:-}" ]; then
+  ${DOCKER_SUDO-sudo} docker run --rm --entrypoint python3 "${MNT[@]}" \
+    -v "${MODELS_DIR:-$HOME/models}:/models:ro" -e PYTHONPATH=/opt/r9700 \
+    "$IMG" -m "$MODEL_PREFLIGHT" "$MODEL" --tp "${TP:-2}" || exit $?
+fi
+# REPLACE=0 is useful for profiles that must not interrupt an existing named server.
+if [ "${REPLACE:-1}" = 1 ]; then ${DOCKER_SUDO-sudo} docker rm -f "${NAME:-vllmstock}" 2>/dev/null; fi
+${DOCKER_SUDO-sudo} "${CMD[@]}" || exit $?
 echo "started stock vLLM + r9700 plugin (offload ${OFFLOAD_GB:-34} GB/rank, maxlen ${MAXLEN:-32768})"
