@@ -34,8 +34,11 @@ def patch() -> bool:
     import os
     if os.environ.get("R9K_GLM_MOE", "stock") == "stock":
         return False
+    if os.environ["R9K_GLM_MOE"] == "w4a16":
+        from .glm_w4a16 import patch as patch_w4a16
+        return patch_w4a16()
     if os.environ["R9K_GLM_MOE"] != "w4a4":
-        raise ValueError("R9K_GLM_MOE must be stock or w4a4")
+        raise ValueError("R9K_GLM_MOE must be stock, w4a4 or w4a16")
     max_rows = int(os.environ.get("R9K_GLM_W4A4_MAX_ROWS", "1"))
     if max_rows not in (1, 8, 32):
         raise ValueError("R9K_GLM_W4A4_MAX_ROWS must be 1, 8 or 32")
