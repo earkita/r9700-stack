@@ -1,0 +1,8 @@
+# Historical source-patched reference only. New GLM builds use docker/Dockerfile
+# with the FP8 plugin; see notes/glm-overview.md.
+# Keep the original image intact. Check the local BASE tag against the recorded
+# image ID, or use a registry digest of the same r9700 build elsewhere.
+ARG BASE=r9700/vllm:glm53-bf16-20bdbfe
+FROM ${BASE}
+COPY patches/vllm /opt/r9700-upstream-patches
+RUN python /opt/r9700-upstream-patches/apply.py

@@ -1,0 +1,13 @@
+{
+  "vllm_commit": "e9757321527ca1ecd514c07c1418dd2c53da3d19",
+  "files": {
+    "vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py": {
+      "before": "7444de2f0a2e85f74c5e06e6c2109b290936b32167594bb8a2583c72393e9e83",
+      "after": "69ec4cd12338500135776112e9ee519ced5cad80c92b9a768ed61141bb4b3e19"
+    },
+    "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py": {
+      "before": "40fccd0466ed53e26c618a5f85b0c120c5ea3ff83c0423027010857bea81c984",
+      "after": "879fbbcb134c967772de4fc07504e8fedd5909f1e04c01550cf10b792324259b"
+    }
+  }
+}
