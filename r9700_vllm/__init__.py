@@ -32,6 +32,8 @@ def register_glm() -> None:
     patch_mamba()
     from .compat.glm_paged_logits import patch as patch_logits
     patch_logits()
+    from .compat.glm_moe import patch as patch_moe
+    patch_moe()
 
 
 def register() -> None:

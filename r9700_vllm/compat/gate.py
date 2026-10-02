@@ -14,6 +14,7 @@ logger = init_logger("vllm." + __name__)
 TESTED = {
     "glm_paged_logits": (("e97573215",), "GLM tiled indexer cache vs AITER RDNA stage1 token-major reader (#58858)"),
     "glm_mamba_seed": (("e97573215",), "vllm-project/vllm#55601; GLM V2 APC state block units"),
+    "glm_w4a4_c1": (("e97573215",), "Opt-in GLM C1 Quark W4A4 grouped WMMA adapter"),
     "glm_rdna_indexer": (("e97573215",), "GLM kpool RDNA4 predicate and token-sized cache pages"),
     # patch name: (vLLM commits tested, upstream issue/PR that would retire it)
     "mtp_allowlist": (("dee37d891", "e97573215"), "vllm-project/vllm#55292"),

@@ -79,8 +79,9 @@ permission for THIS project, and that permission does not transfer to you.
 --------------------------------------------------------------------------------
 5. Runtime dependencies  -- not redistributed
 --------------------------------------------------------------------------------
-    vLLM, ROCm, PyTorch and Triton are used unmodified at runtime and are not
-    included here.
+    vLLM, ROCm, PyTorch and Triton distributions are runtime dependencies and
+    are not included here. The GLM kernel source adaptations in item 6 are
+    the bounded exception; the installed upstream files stay unmodified.
 
     libr4d's binary (r4d.so) is NOT redistributed by this repository
     (.gitignore excludes *.so) and, since 2026-09-22, is NOT USED AT ALL by the
@@ -91,6 +92,31 @@ permission for THIS project, and that permission does not transfer to you.
 
     So the ONLY libr4d exposure left in this repository is the derived GEMM
     source in item 2 above -- a licensing question, not a runtime dependency.
+
+--------------------------------------------------------------------------------
+6. GLM kernel adaptations -- Apache-2.0
+--------------------------------------------------------------------------------
+    r9700_vllm/attn/glm_tail.py
+    r9700_vllm/moe/packed_gemv.py
+    r9700_vllm/attn/glm_sparse_fp8.py
+    r9700_vllm/compat/glm_sparse_fp8.py
+
+    Copyright contributors to the vLLM project. Licensed under Apache-2.0;
+    SPDX and source copyright headers are preserved. The tail kernels are
+    adapted from vLLM commit e9757321527ca1ecd514c07c1418dd2c53da3d19,
+    vllm/models/glm5next/amd/ops/kpool_compress.py. Local changes enlarge the
+    speculative tail ring and exclude future pools per verification row.
+
+    The packed GEMV is adapted from the local my-llm project's Apache-2.0
+    vLLM patches 0022 (packed RDNA4 MXFP4 decode GEMV) and 0026 (output-tiled
+    variant), scoped here to the Quark GLM W4A4 verifier. CREDITS.md records
+    the patch filenames.
+
+    The sparse FP8 reader and forward adapter are adapted from the same
+    pinned vLLM's rocm_aiter_mla_sparse backend/ops. Local changes retain BF16
+    queries, apply E4M3 KV scales and tune short gfx1201 batches to eight warps.
+    Historical source-patch equivalents are retained under patches/vllm/;
+    the current default installs only process-local plugin adapters.
 
 See CREDITS.md for the third-party components, and notes/independence.md for the
 provenance of the kernels -- what was replaced with original work, what each

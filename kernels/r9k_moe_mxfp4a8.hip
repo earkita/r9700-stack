@@ -175,7 +175,7 @@ __device__ __forceinline__ void lds_barrier() {
 
 // FOLD (MXFP4 only): folded-exponent unpack (see mxfp4_unpack8_fold), no per-group FMAs, 2^(Wref - 127) in the
 // epilogue. Selected per weight tensor by the host (MT bit 4).
-template <int MT, int NPW, bool NV, bool LDSA, bool FOLD>
+template <int MT, int NPW, bool NV, bool LDSA, bool FOLD, bool W4A4 = false, bool MULTIROW = false>
 __global__ void __launch_bounds__(LDSA ? 256 : 1024) r9k_moe_mxfp4a8_kernel(
     const unsigned char* __restrict__ A, const float* __restrict__ As,
     const unsigned int* __restrict__ Wp_all, const unsigned char* __restrict__ Ws_all,
@@ -188,6 +188,10 @@ __global__ void __launch_bounds__(LDSA ? 256 : 1024) r9k_moe_mxfp4a8_kernel(
   constexpr int BLK = 16 * MT;
   static_assert(!(LDSA && MT == 1), "LDS A staging is for MT > 1");
   static_assert(!(NV && FOLD), "folding is for E8M0 (MXFP4) scales");
+  // W4A4 consumes Quark's original row-major packed weights and losslessly
+  // encoded, already-MXFP4-rounded activations with one FP32 scale per 32 K.
+  // C1 uses one real slot/block; MULTIROW gives each real slot its own scale.
+  static_assert(!W4A4 || (MT == 1 && !NV && !LDSA && !FOLD), "W4A4 requires M=16 routing tiles");
   const int by = blockIdx.y;
   if (by * BLK >= ntpp[0]) return;
   const int e = expert_ids[by];
@@ -211,6 +215,16 @@ __global__ void __launch_bounds__(LDSA ? 256 : 1024) r9k_moe_mxfp4a8_kernel(
   // for a live block) for padding entries.
   const int first = sorted_ids[by * BLK];
   if (first < 0 || first >= numel) return;          // fully padded block: nothing valid to read or write
+  // WMMA accumulator q belongs to row (lane / 16)*8 + q, while nlane
+  // selects the output column. Each real row has its own group-32 scale.
+  int scale_rows[8];
+  if constexpr (MULTIROW) {
+    static_assert(W4A4 && MT == 1, "multirow scales require W4A4 M=16 tiles");
+    for (int q = 0; q < 8; q++) {
+      int flat = sorted_ids[by * BLK + mhalf + q];
+      scale_rows[q] = (flat < numel ? flat : first) / a_row_div;
+    }
+  }
   unsigned aoff[MT];                                // byte offset of the lane's A row (+ K half) in A
   if constexpr (!LDSA) {
 #pragma unroll
@@ -254,7 +268,8 @@ __global__ void __launch_bounds__(LDSA ? 256 : 1024) r9k_moe_mxfp4a8_kernel(
   for (int j = 0; j < NPW; j++) {
     const int t = nt0 + j;
     const int wt = t < ntmax ? t : ntmax;
-    woff[j] = ((unsigned)wt * (unsigned)ksteps * WAVE32 + lane) * 4u;
+    woff[j] = W4A4 ? (unsigned)(wt * 16 + nlane) * (unsigned)(K / 2) + mhalf / 2
+                  : ((unsigned)wt * (unsigned)ksteps * WAVE32 + lane) * 4u;
     soff[j] = (unsigned)(wt * 16 + nlane);
   }
   // FOLD: the lane's column reference exponents (one byte per N tile, hoisted) and the wave's kMag table.
@@ -283,7 +298,8 @@ __global__ void __launch_bounds__(LDSA ? 256 : 1024) r9k_moe_mxfp4a8_kernel(
     const int g_ = (KGV) / KG;                                                                               \
     _Pragma("unroll")                                                                                        \
     for (int j = 0; j < NPW; j++) {                                                                          \
-      const unsigned int sb = ld_nt_u32off<(MT == 1)>(Ws, (unsigned)g_ * (unsigned)N + soff[j]);                        \
+      const unsigned int sb = ld_nt_u32off<(MT == 1)>(Ws, W4A4 ? soff[j] * (unsigned)(K / GROUP) + g_             \
+                                                              : (unsigned)g_ * (unsigned)N + soff[j]);       \
       if constexpr (FOLD) {                                                                                  \
         const int dsh_ = fold_dsh(wref[j], (int)sb);                                                         \
         _Pragma("unroll")                                                                                    \
@@ -304,11 +320,16 @@ __global__ void __launch_bounds__(LDSA ? 256 : 1024) r9k_moe_mxfp4a8_kernel(
           for (int i = 0; i < MT; i++)                                                                       \
             t[i] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(AF[sidx][i], wf, t[i]);              \
         }                                                                                                    \
-        const float sc = NV ? __builtin_amdgcn_cvt_f32_fp8((int)sb, 0) : __uint_as_float(sb << 23);          \
+        const float wsc = NV ? __builtin_amdgcn_cvt_f32_fp8((int)sb, 0)                                       \
+                            : ((W4A4 && sb == 0) ? 0x1p-127f : __uint_as_float(sb << 23));                   \
+        const float sc = (W4A4 && !MULTIROW) ? wsc * As[(first / a_row_div) * (K / GROUP) + g_] : wsc;       \
         _Pragma("unroll")                                                                                    \
         for (int i = 0; i < MT; i++)                                                                         \
           _Pragma("unroll")                                                                                  \
-          for (int q = 0; q < 8; q++) acc[j][i][q] = fmaf(t[i][q], sc, acc[j][i][q]);   /* -ffp-contract=off */ \
+          for (int q = 0; q < 8; q++) {                                                                     \
+            const float row_sc = MULTIROW ? sc * As[scale_rows[q] * (K / GROUP) + g_] : sc;                 \
+            acc[j][i][q] = fmaf(t[i][q], row_sc, acc[j][i][q]);                                                \
+          }                                                                                                 \
       }                                                                                                      \
     }                                                                                                        \
   }
@@ -327,7 +348,8 @@ __global__ void __launch_bounds__(LDSA ? 256 : 1024) r9k_moe_mxfp4a8_kernel(
       for (int sidx = 0; sidx < SPG; sidx++) {
 #pragma unroll
         for (int j = 0; j < NPW; j++)
-          wv[j][sidx] = ld_nt_u32off<(MT == 1)>(Wp, woff[j] + (unsigned)(kg / 16 + sidx) * (WAVE32 * 4));
+          wv[j][sidx] = ld_nt_u32off<(MT == 1)>(Wp, woff[j] +
+              (W4A4 ? (unsigned)(kg + sidx * 16) / 2 : (unsigned)(kg / 16 + sidx) * (WAVE32 * 4)));
 #pragma unroll
         for (int i = 0; i < MT; i++) af[sidx][i] = ld_u32off((const v2i*)A, aoff[i] + (unsigned)(kg + sidx * 16));
       }
@@ -419,7 +441,8 @@ __global__ void __launch_bounds__(LDSA ? 256 : 1024) r9k_moe_mxfp4a8_kernel(
       if (fr >= numel) continue;                                  // padding row
       float v = 0.f;
       for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + off];
-      float sc = (NV ? Wg[n] : (FOLD ? __uint_as_float((unsigned)Wref[n] << 23) : 1.f)) * As[fr / a_row_div];
+      float sc = (NV ? Wg[n] : (FOLD ? __uint_as_float((unsigned)Wref[n] << 23) : 1.f)) *
+                 (W4A4 ? 1.f : As[fr / a_row_div]);
       if (topk_w) sc *= topk_w[fr];
       C[(size_t)fr * N + n] = (__hip_bfloat16)(v * sc);
     }
@@ -551,6 +574,47 @@ extern "C" int r9k_moe_mxfp4a8(long a, long as, long wq, long ws, long wref, lon
                                int WV, int SK, int NPW, int MT, long stream) {
   return moe_launch(false, a, as, wq, ws, wref, c, sorted_ids, expert_ids, ntpp, topk_w, ws_estride, wref_estride,
                     max_blocks, numel, a_row_div, K, N, WV, SK, NPW, MT, stream);
+}
+
+// C1-geometry W4A4 variant, reusing the grouped WMMA kernel. No weight repack/cache and
+// no full BF16 weight tensor. Caller must provide one valid slot per 16-row block,
+// MXFP4-QDQ activations encoded losslessly as group-32 FP8 + FP32 scales, and
+// original Quark [E,N,K/2] weights / [E,N,K/32] E8M0 scales.
+// A bounded batch can repeat activation rows per routed slot and use a_row_div=1;
+// expert IDs may then repeat across blocks, whose output slots remain disjoint.
+extern "C" int r9k_moe_mxfp4a4_c1(long a, long as, long wq, long ws, long c,
+                                  long sorted_ids, long expert_ids, long ntpp, long topk_w,
+                                  int max_blocks, int numel, int a_row_div, int K, int N,
+                                  int WV, int SK, long stream) {
+  if (N <= 0 || N % 16 || K <= 0 || WV <= 0 || SK <= 0 || K % (SK * GROUP)) return -1;
+  if (WV * SK > 32 || WV * SK * 256 * sizeof(float) > 65536) return -2;
+  if (numel <= 0 || (a_row_div != 1 && a_row_div != numel)) return -3;
+  dim3 grid((N / 16 + WV - 1) / WV, max_blocks), block(WV * SK * WAVE32);
+  hipLaunchKernelGGL((r9k_moe_mxfp4a8_kernel<1, 1, false, false, false, true>),
+      grid, block, WV * SK * 256 * sizeof(float), (hipStream_t)stream,
+      (const unsigned char*)a, (const float*)as, (const unsigned int*)wq,
+      (const unsigned char*)ws, nullptr, (__hip_bfloat16*)c,
+      (const int*)sorted_ids, (const int*)expert_ids, (const int*)ntpp,
+      (const float*)topk_w, (long)N * (K / GROUP), 0L, numel, a_row_div, K, N, WV, SK);
+  return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+// Multiple real rows per expert tile, with independent per-row activation
+// scales. The original C1 and W4A8 specializations remain unchanged.
+extern "C" int r9k_moe_mxfp4a4_batch(long a, long as, long wq, long ws, long c,
+    long sorted_ids, long expert_ids, long ntpp, long topk_w,
+    int max_blocks, int numel, int a_row_div, int K, int N, int WV, int SK, long stream) {
+  if (N <= 0 || N % 16 || K <= 0 || WV <= 0 || SK <= 0 || K % (SK * GROUP)) return -1;
+  if (WV * SK > 32 || WV * SK * 256 * sizeof(float) > 65536) return -2;
+  if (numel <= 0 || a_row_div <= 0 || numel % a_row_div) return -3;
+  dim3 grid((N / 16 + WV - 1) / WV, max_blocks), block(WV * SK * WAVE32);
+  hipLaunchKernelGGL((r9k_moe_mxfp4a8_kernel<1, 1, false, false, false, true, true>),
+      grid, block, WV * SK * 256 * sizeof(float), (hipStream_t)stream,
+      (const unsigned char*)a, (const float*)as, (const unsigned int*)wq,
+      (const unsigned char*)ws, nullptr, (__hip_bfloat16*)c,
+      (const int*)sorted_ids, (const int*)expert_ids, (const int*)ntpp,
+      (const float*)topk_w, (long)N * (K / GROUP), 0L, numel, a_row_div, K, N, WV, SK);
+  return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
 // NVFP4 weights: ws = e4m3 [E][K/16][N] (ws_estride bytes), wref = fp32 per-row global multiplier [E][N]
