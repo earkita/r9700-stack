@@ -31,12 +31,18 @@ import os
 import pathlib
 import re
 import sys
+import threading
 import urllib.request
 
 BASE = os.environ.get("EVAL_BASE", "http://localhost:8080") + "/v1/chat/completions"
 MODEL = os.environ.get("EVAL_MODEL", "Qwen3.8")
+REQUEST_TIMEOUT = float(os.environ.get("EVAL_TIMEOUT", "300"))
+if not math.isfinite(REQUEST_TIMEOUT) or REQUEST_TIMEOUT <= 0:
+    raise ValueError("EVAL_TIMEOUT must be a positive finite number of seconds")
 OUT = pathlib.Path(os.environ.get("EVAL_DIR", os.path.expanduser("~/.r9keval")))
 CACHE = pathlib.Path(os.path.expanduser("~/.cache/r9keval"))
+TRANSCRIPT = os.environ.get("EVAL_TRANSCRIPT")
+TRANSCRIPT_LOCK = threading.Lock()
 
 
 def load_gsm8k():
@@ -77,7 +83,15 @@ def ask(q):
                                      else {"enable_thinking": False})}
     req = urllib.request.Request(BASE, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
-    r = json.loads(urllib.request.urlopen(req, timeout=300).read())
+    r = json.loads(urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT).read())
+    if TRANSCRIPT:
+        # Optional evidence only: keep usage, finish reason and reasoning without
+        # changing the text passed to the established scoring/paired comparison.
+        path = pathlib.Path(TRANSCRIPT)
+        with TRANSCRIPT_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a") as f:
+                f.write(json.dumps({"request": body, "response": r}) + "\n")
     return r["choices"][0]["message"]["content"] or ""
 
 
@@ -172,7 +186,10 @@ def main():
         n = int(sys.argv[2]) if len(sys.argv) > 2 else 200
         print(f"Self-consistency: the SAME config twice. Any disagreement is the stack's own noise floor,\n"
               f"and sets the smallest regression this eval can ever detect. n={n}\n")
-        for conc in (1, 8):
+        concurrencies = [int(sys.argv[3])] if len(sys.argv) > 3 else (1, 8)
+        if any(conc < 1 for conc in concurrencies):
+            raise ValueError("Selftest concurrency must be positive")
+        for conc in concurrencies:
             a = run(n, conc)
             check(a, f"selftest conc={conc} run 1")
             b = run(n, conc)
