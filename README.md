@@ -25,6 +25,9 @@ extension points (quantization config, model registry, platform plugin, attentio
 can update vLLM or ROCm without re-porting anything. That constraint was the point of the project: hand-tuned
 kernels normally mean a fork you then maintain forever.
 
+The GLM profile below also uses narrowly scoped compatibility adapters for
+internal APIs. It requires the documented vLLM pin and revalidation on upgrades.
+
 Requirements: 2× or 4× Radeon AI PRO R9700 (gfx1201), ROCm ≥ 10, a released vLLM build, and the model weights.
 
 ### Checkpoint formats
@@ -208,6 +211,41 @@ to be worth. `DRYRUN=1` prints the docker command without starting anything.
 An OpenAI-compatible endpoint comes up on `:8080`. After upgrading, rebuild the kernel library
 (`kernels/build.sh`): the plugin refuses a `libr9k.so` from before v0.2.2. On a first launch of a new configuration,
 restart once (the launch that compiles gets a smaller KV pool).
+
+For GLM, start with the [current profiles, launch instructions and capacity limits](notes/glm-overview.md).
+
+**GLM fallback:** `serve/glm-5.3-flash.sh` is a conservative TP8 / 64k
+Quark MXFP4 baseline candidate, with upstream model/quantization paths and no
+speculative decoding or Qwen fusions. It is not yet a validated model target;
+an optional `R9K_GLM_MOE=w4a4 BUILD_KERNELS=1` C1 candidate preserves Quark
+activation quantization while converting weight fragments inside the grouped
+WMMA kernel.
+For sampling, thinking budgets and cache comparisons, follow the
+[GLM testing guidelines](notes/glm-testing.md).
+
+**GLM C2/C4 profiles:** `serve/glm-5.3-flash-c2.sh` (renamed from
+`glm-5.3-flash-max.sh`) and `serve/glm-5.3-flash-c4.sh` each invoke the shared
+`serve/serve.sh` directly, without chaining through other GLM profiles.
+Docker, mounts, compile caches and checkpoint preflight stay in the shared
+launcher. The GLM profile carries the
+latest DFlash K4/shared FP8 KV/APC configuration, with TP8, NSEQ=2 or 4,
+NBT1024 and 4.125 GiB KV per GPU. `MAXLEN=auto` asks vLLM to fit the maximum
+**single-request** context into this KV budget; it does not guarantee two or four
+full-length requests fit simultaneously. The resolved length and long-context
+correctness still require runtime qualification. Preview with `DRYRUN=1`;
+use `MAXLEN=262144` for the qualified C2 context, `MAXLEN=131072` for C4,
+or `NSEQ=1` for one active sequence. Graph sizes follow NSEQ: 5/10 for C2,
+5/10/15/20 for C4; the bounded indexer workspace also follows NSEQ.
+The scripts require local checkpoints, a built plugin
+checkout/library and the pinned image; it never stops an existing service.
+These two profiles and `glm-5.3-flash.sh` are the only GLM launchers.
+Older DFlash wrapper profiles were removed.
+For the C4 profile's measured C1/C2/C4 decode and separate correctness results,
+see [the profile validation](notes/glm-c4-profile.md).
+
+`R9K_GLM_MOE=w4a16` enables an experimental BF16-activation variant on the
+same MXFP4 weights. Bounded checks pass, but C1/C2 measurements show no
+consistent decode advantage; W4A4 remains the default.
 
 ## What's in it
 

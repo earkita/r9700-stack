@@ -1,5 +1,148 @@
 # Progress log
 
+## 2026-10-01 (GLM FP8 plugin on stock vLLM, clean clone)
+
+- Moved the validated sparse reader into a version-pinned, opt-in plugin
+  adapter; installed vLLM files remain unchanged. Dispatch is scoped to
+  gfx1201, GLM TP8, rope-free latent 512 and E4M3 KV. BF16 keeps upstream
+  dispatch, and both reference images remain available.
+- Built and launched from a fresh `git clone --no-local`, without host
+  libraries. The first startup exposed an outer/text model-config mismatch;
+  fixed in `99a63d1` with constructor and metadata dispatch regressions.
+  The corrected image passed 86 GPU tests, 26 host tests, API checks and
+  32/32 NIAH strict/retrieval/format/completion checks at T=0 and T=1.
+- Bounded BetterBench C1 decode: 49.71 tok/s at 8K and 53.02 at 32K,
+  versus historical source-patched FP8 55.71/54.92. Round time differs by
+  less than 0.2%; observed acceptance is lower in these three-sample runs.
+  No speedup or persistent regression claim. Full suite/soak remain deferred.
+- The clean-clone service remains running, FP8 target / BF16 draft, K7,
+  APC, 64K, HTTP 200, no runtime error matches in its full test log.
+  Evidence: `notes/baselines/glm53-fp8-plugin-validation.json`.
+
+## 2026-10-01 (opt-in GLM C1 W4A4 candidate)
+
+- Extended the existing grouped HIP WMMA kernel to consume original Quark
+  packed weights and per-group activation scales. Quark still performs MXFP4
+  activation QDQ; the rounded values are transported losslessly through FP8
+  operands. No full expert-weight BF16 materialization or checkpoint conversion.
+  Upstream clamp=10, routing weights and output reduction are retained.
+- Opt-in `R9K_GLM_MOE=w4a4`, pinned gfx1201 / GLM / TP8 / C1 / top-8 shapes;
+  other calls use the original path. Twenty numerical/adapter/lifecycle cases
+  pass, plus 11 existing CPU integration tests. The first API attempt failed
+  because model config was queried outside its construction context; fixed in
+  `3a1ba44`, with a regression test. Final API passes, both math answers are 23,
+  both tool-call forms work, and an exact 128-token stream completes.
+- Native BetterBench chat, 1 warmup + 3 measured requests per leg: median
+  decode 5.0669 -> 9.0990 tok/s (1.796x), with the same 200/160/400 completion
+  budgets. **Decode excludes TTFT/prefill.** Median TTFT 963.63 -> 329.39 ms.
+  Preliminary sequential runs, not a full/thermally paired result; every
+  measured request is budget-truncated, not an answer-quality result.
+- Short target-32k prefill: 1 warmup + 2 measured, median actual input 23,508,
+  TTFT 9060.1 ms, 2594.6 tok/s. Close to prior baseline, without a precise
+  regression/speedup claim from these unequal sample sets.
+- Profile confirms all 42 routed MoE layers use the new kernel: 84 expensive
+  standalone dequant launches/step disappear. Remaining dequant 0.664–0.676 ms,
+  new grouped WMMA including weight conversion 3.03–3.16 ms/step. RCCL/waiting
+  and rank-dependent gaps dominate the instrumented trace now; host submission
+  and synchronization need investigation before blaming transfer bandwidth.
+- Evidence and checksums: `bench/results/glm-w4a4-candidate/`.
+  Server `glm53-flash-w4a4-v2` remains running,
+  bounded jobs are finished, full quality/concurrency/soak stay deferred.
+
+## 2026-10-01 (GLM bounded profile review)
+
+- Finished the short profile captured at 21:59 UTC on September 30. All eight
+  traces contain 16 single-token decode steps and 2251 kernel launches/step.
+  MXFP4 weight dequantization consumes 157.27–157.57 ms/step, or 81.89–82.44%
+  of summed kernel time. Routed MoE GEMMs take 7.05–7.11 ms/step; RCCL kernels
+  take 5.84–10.21 ms/step. Internal GPU gaps account for 4.69–5.21% of the span.
+- Pinned emulation dequantizes all 288 experts before applying the selected
+  top-8 IDs. First candidate is selected-expert dequantization for C1 while
+  preserving upstream W4A4 semantics; not implemented or quality-validated.
+  Kernel timings include profiler effects and are not a decode benchmark.
+- Full decode/concurrency/GSM8K remain deferred. Saved all eight traces,
+  checksums, per-rank summaries, request transcripts and server logs under
+  ignored `bench/results/glm-5.3-flash-bringup/`; no performance optimization
+  or speedup claim.
+
+## 2026-09-30 (GLM-5.3-Flash bring-up)
+
+- Added a structural GLM5Next/Quark preflight and a thin TP8 / 65536 / C1 profile
+  over the existing launcher. Qwen defaults remain unchanged. Checkpoint revision
+  `b5688f25491202978c19c4d036eef579f61bbe07`; pinned ROCm 10 vLLM `e97573215`.
+- Audit: GLM uses dynamic **W4A4**, mixed FP8 block-128 overrides, sigmoid/top-8
+  routing over 288 experts, clamped SwiGLU and an ungated shared expert.
+  Existing Qwen W4A8/MoE/shared fusions are not drop-in replacements. Kept
+  upstream loading, emulated Quark MoE, KDA/sparse MLA and RCCL; no performance
+  optimization enabled.
+- Stock attempt: all 62 shards load (21.33 GiB/rank), then the GLM indexer rejects
+  gfx1201 via a CDNA-only AITER predicate. A scoped, version-guarded plugin proxy
+  admits upstream's existing RDNA4 Triton dispatcher without enabling global CK
+  paths or changing any attention kernel. With this adapter TP8 reaches API ready.
+- Checks passed: 11 CPU integration tests, 17 pinned upstream sparse-dispatch
+  tests and 2 GPU FP32 indexer-logit reference cases. Short API contract passes
+  for reasoning/content, streaming, tool calls and JSON arguments. These are
+  bounded checks, not full attention/MoE/model-level correctness evidence.
+- **Baseline blocked:** verified 225 W on all eight GPUs, then ran BetterBench
+  0.6.0 prefill. 2k/8k/16k stages complete; the first 32k-stage request triggers
+  `HSA_STATUS_ERROR_MEMORY_FAULT` across all ranks (19:46:23 UTC). No complete
+  benchmark report, no 64k validation, no soak/quality/optimized A-B claim.
+  Shutdown releases GPU memory but Docker cleanup stalls. Preserve this as a
+  rejected baseline attempt; isolate the fault before proceeding to optimization.
+- Docker cleanup recovered after about two minutes, without a daemon restart.
+  Additional GPU references: 8 passed, 1 strict xfail for upstream Quark decoding
+  reserved E8M0 code 255 as Inf rather than NaN. A full exported-scale scan finds
+  only 117–128 in 36,414 uint8 scale tensors (9,545,711,616 bytes), so this
+  checkpoint does not contain the problematic code. Full MoE/attention numerical
+  equivalence remains unvalidated.
+- Rejected reference: the first indexer comparison rounded GEMM output to BF16,
+  unlike Triton's FP32 accumulation. Explicit FP32 reference passes at the same
+  tolerance. No tolerance relaxation or numerical kernel change was made.
+- **Long-context fault fixed:** synchronous HIP + Python stack sampling localize
+  the write fault to GLM's kpool prefill cache writer. Upstream picks 640-token
+  metadata blocks while storing 128-token pages; an unsplit block table is indexed
+  as if split. A GLM-only backend declaration `[128, 256]` aligns token units,
+  reusing existing metadata and kernels. Eight geometry regression cases pass.
+  Replays of the failing 23,583-token input and an exact 64,000-token input both
+  complete (16 output tokens), with temporary per-rank bounds checks passing.
+  Bounds-check/synchronization code is removed from the shipping profile.
+- Added two W4A4 expert-subset/reference cases and two sparse-MLA output cases,
+  all passing at TP8 dimensions. Pinned upstream KDA/kpool tests at H=8 / kpool=4 /
+  page=32: 26 pass, 1 CUDA-only skip. Unmodified kpool=16 fuzz seed 9 differs by
+  one FP8 byte; retain that limitation rather than loosening its exact test.
+- Started a fresh ordinary baseline after the cache fix. Formal BetterBench,
+  long-generation soak and model-level quality results are still pending.
+- Fresh baseline API contract passes, followed by the complete BetterBench
+  prefill sweep (2 warmups + 8 measured requests at each of five depths), with
+  no failed requests. Median prefill tok/s: 2094.6 / 2481.6 / 2611.6 / 2595.3 /
+  2578.6 for target 2k / 8k / 16k / 32k / 64k. Actual median input lengths are
+  1514 / 5892 / 11799 / 23548 / 47014 tokens; TTFT at the 32k label is 9070.5 ms.
+  Eight samples do not establish p99. Started the 30-minute API soak; full
+  20-pass decode, concurrency, quality and optimization A/B remain pending.
+- **API soak passes:** 35 min 26 s, two cycles / 10 requests, including two
+  4096-token generations and four correct tool calls. All math answers are 23;
+  manual output review finds no obvious repetitive degeneration. No HIP/RCCL/
+  OOM/engine errors or kernel GPU faults/resets; container remains running.
+  This does not prove every internal activation finite.
+- GPU 1 VRAM reaches its 108 C slowdown threshold, with lower core clocks than
+  other ranks. Retained GPU telemetry covers the final ~8 minutes only: restarting
+  amd-smi watch with `--append` overwrote the earlier CSV. Full server/API/CPU
+  evidence remains. Record this limitation and repeat prefill in a warmed state
+  after the running full 20-pass decode, without overwriting the original report.
+- Queued separate NSEQ=16 concurrency, baseline profiling, and two full GSM8K C1
+  runs with paired noise-floor comparison. No results or speedup claimed yet.
+  Existing profiler analysis now measures overlapping intervals correctly and
+  reports per-GPU launch counts (7 CPU tests pass). Optional evaluation response
+  transcripts retain truncation/reasoning metadata without changing scoring.
+- **Validation scope revised:** stopped the incomplete decode benchmark during
+  the code category and disabled the long follow-up queue. Full concurrency and
+  GSM8K are deferred; prioritize a bounded profile of the slow emulation path.
+  Static source audit shows all 288 expert weights are dequantized each forward,
+  although C1 routes to eight experts: 1.6875 GiB of BF16 temporaries per MoE
+  layer/rank, or 70.875 GiB over 42 MoE layers per token/rank. This is a source-
+  derived volume estimate, not a measured time breakdown. A separate profiler
+  instance starts with copied compilation cache; numerical runtime unchanged.
+
 ## 2026-09-18 (overnight session)
 
 ### Findings
