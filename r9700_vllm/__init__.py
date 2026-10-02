@@ -38,6 +38,8 @@ def register_glm() -> None:
     patch_dflash()
     from .compat.glm_moe import patch as patch_moe
     patch_moe()
+    from .compat.glm_sparse_fp8 import patch as patch_sparse_fp8
+    patch_sparse_fp8()
 
 
 def register() -> None:
