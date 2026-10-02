@@ -19,10 +19,11 @@ def main():
                 raise RuntimeError(f"{stage}: unexpected upstream source {path}: {actual}")
 
     verify("before")
-    patch = here / "0001-rocm-rdna4-fp8-sparse-mla.patch"
-    cmd = ["patch", "--batch", "--fuzz=0", "-p1", "-d", str(root), "-i", str(patch)]
-    subprocess.run([*cmd, "--dry-run"], check=True)
-    subprocess.run(cmd, check=True)
+    for name in manifest["patches"]:
+        patch = here / name
+        cmd = ["patch", "--batch", "--fuzz=0", "-p1", "-d", str(root), "-i", str(patch)]
+        subprocess.run([*cmd, "--dry-run"], check=True)
+        subprocess.run(cmd, check=True)
     verify("after")
     print("Applied and verified RDNA4 FP8 sparse MLA patch", flush=True)
 

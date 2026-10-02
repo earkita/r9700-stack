@@ -31,9 +31,9 @@ def test_dispatch(dtype, rdna, rows):
     assert not _use_rocm_sparse_triton(**(args | dict(num_prefills=0, num_decodes=0)))
 
 
-def inputs(rows, scale, sink):
+def inputs(rows, scale, sink, heads=8):
     torch.manual_seed(1701)
-    q = torch.randn(rows, 8, 512, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(rows, heads, 512, device="cuda", dtype=torch.bfloat16)
     kv_scale = torch.tensor(scale, device="cuda", dtype=torch.float32)
     source = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
     kv = (source.float() / kv_scale).to(current_platform.fp8_dtype())[:, None, :]
@@ -42,7 +42,7 @@ def inputs(rows, scale, sink):
     if rows > 1:
         indices[-1] = -1  # Empty row, also with a sink.
     lengths = (indices >= 0).sum(-1, dtype=torch.int32)
-    sinks = torch.randn(8, device="cuda") if sink else None
+    sinks = torch.randn(heads, device="cuda") if sink else None
     return q, kv, kv_scale, indices, lengths, sinks
 
 
@@ -78,8 +78,9 @@ def call(q, kv, kv_scale, indices, lengths, sinks, ragged=False):
 @pytest.mark.parametrize("rows", [1, 8, 16])
 @pytest.mark.parametrize("scale", [.125, 1., 2.5])
 @pytest.mark.parametrize("sink,ragged", [(False, False), (True, True)])
-def test_reader(rows, scale, sink, ragged):
-    args = inputs(rows, scale, sink)
+@pytest.mark.parametrize("heads", [8, 16])
+def test_reader(rows, scale, sink, ragged, heads):
+    args = inputs(rows, scale, sink, heads=heads)
     q_before = args[0].clone()
     actual = call(*args, ragged=ragged)
     expected = reference(*args[:4], args[-1])
@@ -93,7 +94,7 @@ def test_reader(rows, scale, sink, ragged):
 
 def test_graph_replay_reads_changed_scale_and_query():
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import _rocm_sparse_attn_prefill_ragged_triton
-    q, kv, scale, indices, lengths, sinks = inputs(8, .125, True)
+    q, kv, scale, indices, lengths, sinks = inputs(8, .125, True, heads=16)
     # Runtime metadata is preallocated. Boolean indexing here would synchronize
     # to determine an allocation size and is not legal during graph capture.
     flat = indices[indices >= 0]
@@ -167,3 +168,48 @@ def test_backend_keeps_query_bf16(monkeypatch, tuple_query):
     assert forwarded[1].dtype == torch.bfloat16
     assert forwarded[2].dtype == current_platform.fp8_dtype()
     assert forwarded[-1] is True
+
+
+@pytest.mark.parametrize("rows,heads,fp8,rdna,expected", [
+    (1, 16, True, True, 8), (8, 16, True, True, 8),
+    (9, 16, True, True, 4), (8, 32, True, True, 4),
+    (8, 8, True, True, 4), (8, 16, False, True, 4),
+    (8, 16, True, False, 4),
+])
+def test_launch_tuning_is_scoped(monkeypatch, rows, heads, fp8, rdna, expected):
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as ops
+    args = list(inputs(rows, 1., False, heads=heads))
+    if not fp8:
+        args[1] = args[1].to(torch.bfloat16)
+        args[2] = None
+    launches = []
+    class RecordLaunch:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append(kwargs)
+            return launch
+    monkeypatch.setattr(ops, "_ON_RDNA4", rdna)
+    monkeypatch.setattr(ops, "_sparse_attn_prefill_ragged_kernel", RecordLaunch())
+    call(*args, ragged=True)
+    assert len(launches) == 1
+    assert launches[0]["num_warps"] == expected
+    assert launches[0]["BLOCK_K"] == 16
+
+
+@pytest.mark.parametrize("scale_value", [.125, 1., 2.5])
+def test_decode_long_sparse_rows_match_bf16_reference(scale_value):
+    torch.manual_seed(707)
+    q = torch.randn(8, 16, 512, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(32768, 1, 512, device="cuda").to(current_platform.fp8_dtype())
+    scale = torch.tensor(scale_value, device="cuda", dtype=torch.float32)
+    indices = torch.stack([torch.randperm(32768, device="cuda")[:2048] for _ in range(8)]).int()
+    indices[0, -5:] = -1
+    indices[-1] = -1
+    lengths = (indices >= 0).sum(-1, dtype=torch.int32)
+    sinks = torch.randn(16, device="cuda")
+    actual = call(q, kv, scale, indices, lengths, sinks, ragged=True)
+    expected = reference(q, kv, scale, indices, sinks)
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=3e-3)
+    bf16 = call(q, (kv.float() * scale).to(torch.bfloat16), None,
+                indices, lengths, sinks, ragged=True)
+    torch.testing.assert_close(actual, bf16, rtol=0, atol=0)

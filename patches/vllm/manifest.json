@@ -7,7 +7,11 @@
     },
     "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py": {
       "before": "40fccd0466ed53e26c618a5f85b0c120c5ea3ff83c0423027010857bea81c984",
-      "after": "879fbbcb134c967772de4fc07504e8fedd5909f1e04c01550cf10b792324259b"
+      "after": "82aa72032dda6422dfc4b08d25079190eaf480e4fead88134360253e6407071e"
     }
-  }
+  },
+  "patches": [
+    "0001-rocm-rdna4-fp8-sparse-mla.patch",
+    "0002-rocm-rdna4-fp8-decode-reduce-spilling.patch"
+  ]
 }
