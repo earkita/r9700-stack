@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 logger = init_logger("vllm." + __name__)
 
 TESTED = {
+    "glm_dflash": (("e97573215",), "GLM completed auxiliary states and draft cache allocation; vllm#55423/#56983"),
     "glm_head_gemv": (("e97573215",), "GLM C1 head projection via existing FP32-output router GEMV"),
     "glm_paged_logits": (("e97573215",), "GLM tiled indexer cache vs AITER RDNA stage1 token-major reader (#58858)"),
     "glm_mamba_seed": (("e97573215",), "vllm-project/vllm#55601; GLM V2 APC state block units"),

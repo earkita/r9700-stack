@@ -34,6 +34,8 @@ def register_glm() -> None:
     patch_logits()
     from .compat.glm_head_gemv import patch as patch_head_gemv
     patch_head_gemv()
+    from .compat.glm_dflash import patch as patch_dflash
+    patch_dflash()
     from .compat.glm_moe import patch as patch_moe
     patch_moe()
 
