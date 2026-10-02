@@ -188,6 +188,48 @@ hashes and reproduction annotations. No inference or server change occurs.
 
 ## Throughput measurements
 
+### Mandatory comparison protocol
+
+Before running an A/B comparison, save the baseline and candidate identities
+and a frozen protocol. Declare the one intended change; hold the remaining
+conditions constant. Reuse the baseline's actual runner and protocol, not
+just its headline prompt length or sampling settings. Record:
+
+- Exact corpus/case IDs, hashes, tokenizer/template, input/output token counts,
+  EOS policy, sampling, seeds, penalties and effective thinking effort.
+- Concurrency, request order and arrival pattern, scheduler limits, separate
+  kernel warmup, excluded warmup batches and measured repetitions.
+- APC state and preparation: cold/warm, salt reuse, which requests populate the
+  cache, and observed cache hits. A natural-EOS quality request followed by
+  timed prefix reuse is a different protocol from a cold forced-output request
+  followed by its warm repeat. Warm APC alone does not establish equivalence.
+- Client/version, metric definitions, runtime/image/commit, target/drafter
+  identities, speculation settings, GPU power caps, other load and telemetry.
+
+Do not shorten one comparison leg to save time and compare it with a longer
+historical baseline. If a protocol change is necessary, rerun **both** variants
+with that protocol within the authorized scope. Otherwise label the results
+**not comparable** and report them only as separate observations. Smoke tests
+cannot establish a performance improvement, regression or absence of regression.
+Preserve all warmups and failed attempts, marking exclusions by the rule fixed
+before execution; never select the fastest or only passing repetitions.
+
+To reproduce the published [C4 profile measurements](glm-c4-profile.md), use
+the same NSEQ=4 server and per-concurrency natural-EOS quality/cache preparation,
+then one excluded performance warmup and three measured batches, with exactly
+8192 input and 256 output tokens and the documented sampling. Preserve these
+steps independently for C1, C2 and C4 in both variants. Any shorter check is a
+separate smoke protocol, not a replacement for this baseline.
+
+For speculative decode, report acceptance and its counters beside throughput.
+A changed acceptance rate does not establish why it changed. A time-per-step
+estimate derived from aggregate counters is approximate; do not present it as
+a directly measured kernel latency or proof that a kernel caused no regression.
+Show sample counts and spread, and state when evidence is insufficient for a
+causal or performance conclusion.
+
+### Metric definitions and evidence
+
 Use the pinned BetterBench 0.6.0 client and retain its raw results. A custom
 scenario driver must be labelled as such; manual semantic probes are not
 BetterBench quality results. Record exact API prompt/completion counts,
@@ -206,6 +248,14 @@ and scheduling overhead; cached prefill must be labelled separately.
 
 Fixed-output tests may use `ignore_eos=true`, for example 256 output tokens,
 to measure throughput. They cannot establish completed-answer quality.
+For short-answer tasks such as NIAH, retain generated text and record the
+natural answer length separately: forcing 256 tokens after a 16-token answer
+mostly measures artificial continuation. With speculative decoding, changing
+continuations can change acceptance and throughput even on the same version.
+Keep this synthetic test for historical comparisons, but accompany a regression
+investigation with a separately frozen long-generation workload that respects
+EOS, rerunning every compared version. Report truncation and thinking explicitly;
+a bounded thinking sample does not validate the completed answer.
 Do not merge results with different sampling/effort or compare historical
 short-chat and long-context workloads as if only context length changed.
 
