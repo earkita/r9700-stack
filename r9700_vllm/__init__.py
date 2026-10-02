@@ -28,6 +28,10 @@ def register_glm() -> None:
         return
     from .compat.glm_indexer import patch
     patch()
+    from .compat.glm_mamba import patch as patch_mamba
+    patch_mamba()
+    from .compat.glm_paged_logits import patch as patch_logits
+    patch_logits()
 
 
 def register() -> None:
