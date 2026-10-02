@@ -1,0 +1,234 @@
+--- a/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py
+@@ -42,6 +42,11 @@
+ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
++if current_platform.is_rocm():
++    from vllm.platforms.rocm import _ON_RDNA4
++else:
++    _ON_RDNA4 = False
++
+ if TYPE_CHECKING:
+     from vllm.model_executor.models.deepseek_v2 import Indexer
+ logger = init_logger(__name__)
+@@ -56,15 +61,19 @@
+     num_decodes: int,
+     num_decode_tokens: int,
+     max_query_len: int,
++    fp8_triton_supported: bool = _ON_RDNA4,
+ ) -> bool:
+-    """Select the rope-free BF16 path not supported by AITER sparse MLA.
++    """Select the rope-free path not supported by AITER sparse MLA.
+ 
+     The ragged Triton kernel indexes metadata per query token, so multi-token
+     speculative verification rows have the same capability requirements as
+-    plain decode rows.
++    plain decode rows. RDNA4 has no AITER MLA code object, so its standard FP8
++    cache is read by the same Triton path with explicit dequantization.
+     """
++    fp8_cache = kv_cache_dtype.startswith("fp8")
++    standard_fp8_cache = kv_cache_dtype in ("fp8", "fp8_e4m3")
+     return (
+-        not kv_cache_dtype.startswith("fp8")
++        (not fp8_cache or (standard_fp8_cache and fp8_triton_supported))
+         and head_size == kv_lora_rank
+         and (num_prefills > 0 or num_decodes > 0)
+     )
+@@ -777,6 +786,7 @@
+         q: torch.Tensor,  # [sq, heads, d_qk]
+         kv_c_and_k_pe_cache: torch.Tensor,  # [blocks, heads, d_qk]
+         attn_metadata: ROCMAiterMLASparseMetadata,
++        use_triton_sparse: bool,
+     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+         num_tokens = q.shape[0]
+         base_mla_num_heads = AiterMLAHelper.get_actual_mla_num_heads(self.num_heads)
+@@ -801,15 +811,7 @@
+             )
+         )
+ 
+-        if triton_sink_fallback or _use_rocm_sparse_triton(
+-            kv_cache_dtype=self.kv_cache_dtype,
+-            head_size=q.shape[-1],
+-            kv_lora_rank=self.kv_lora_rank,
+-            num_prefills=attn_metadata.num_prefills,
+-            num_decodes=attn_metadata.num_decodes,
+-            num_decode_tokens=attn_metadata.num_decode_tokens,
+-            max_query_len=attn_metadata.max_query_len,
+-        ):
++        if triton_sink_fallback or use_triton_sparse:
+             output = torch.empty(
+                 [num_tokens, q.shape[1], self.kv_lora_rank],
+                 dtype=attn_metadata.attn_out_dtype,
+@@ -835,6 +837,9 @@
+                 output=output,
+                 ragged_indices=attn_metadata.paged_kv_indices,
+                 ragged_indptr=attn_metadata.paged_kv_indptr,
++                kv_scale=(
++                    layer._k_scale if self.kv_cache_dtype.startswith("fp8") else None
++                ),
+             )
+             output = AiterMLAHelper.get_mla_unpadded_o(self.num_heads, output)
+             return output, None
+@@ -986,9 +991,21 @@
+         # MQA 576/512 approach for both prefill and decode
+ 
+         fp8_attention = self.kv_cache_dtype.startswith("fp8")
++        query_head_size = (
++            q[0].shape[-1] + q[1].shape[-1] if isinstance(q, tuple) else q.shape[-1]
++        )
++        use_triton_sparse = _use_rocm_sparse_triton(
++            kv_cache_dtype=self.kv_cache_dtype,
++            head_size=query_head_size,
++            kv_lora_rank=self.kv_lora_rank,
++            num_prefills=attn_metadata.num_prefills,
++            num_decodes=attn_metadata.num_decodes,
++            num_decode_tokens=attn_metadata.num_decode_tokens,
++            max_query_len=attn_metadata.max_query_len,
++        )
+         if isinstance(q, tuple):
+             ql_nope, q_pe = q
+-            if fp8_attention:
++            if fp8_attention and not use_triton_sparse:
+                 q = layer._decode_concat_quant_fp8_op(  # type: ignore[attr-defined]
+                     ql_nope, q_pe, layer._q_scale
+                 )
+@@ -1022,11 +1039,16 @@
+         # write the latent and rope to kv cache
+         if fp8_attention:
+             kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(current_platform.fp8_dtype())
+-            if q.dtype != current_platform.fp8_dtype():
++            if not use_triton_sparse and q.dtype != current_platform.fp8_dtype():
+                 original_q_shape = q.shape
+                 q, _ = ops.scaled_fp8_quant(q.view(q.shape[0], -1), layer._q_scale)
+                 q = q.view(original_q_shape)
++            if use_triton_sparse and q.dtype != torch.bfloat16:
++                raise ValueError(
++                    "RDNA4 Triton FP8 sparse MLA requires a BF16 query, "
++                    f"got {q.dtype}"
++                )
+         mla_padded_q = AiterMLAHelper.get_mla_padded_q(self.num_heads, q)
+         return self._forward_mla(
+-            layer, mla_padded_q, kv_c_and_k_pe_cache, attn_metadata
+-        )
++            layer, mla_padded_q, kv_c_and_k_pe_cache, attn_metadata, use_triton_sparse
++        )
+--- a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+@@ -1852,6 +1852,7 @@
+ def _sparse_attn_prefill_ragged_kernel(
+     q_ptr,
+     kv_ptr,
++    kv_scale_ptr,
+     kv_indices_ptr,
+     kv_indptr_ptr,
+     attn_sink_ptr,
+@@ -1868,6 +1869,7 @@
+     head_dim,
+     num_kv,
+     scale,
++    FP8_KV: tl.constexpr,
+     HAS_ATTN_SINK: tl.constexpr,
+     BLOCK_H: tl.constexpr,
+     BLOCK_D: tl.constexpr,
+@@ -1916,6 +1918,10 @@
+             mask=valid[:, None] & dim_mask[None, :],
+             other=0.0,
+         )
++        if FP8_KV:
++            kv = (
++                kv.to(tl.float32) * tl.load(kv_scale_ptr).to(tl.float32)
++            ).to(tl.bfloat16)
+ 
+         next_k_pos = k_start + BLOCK_K + k_offsets
+         slot = tl.load(
+@@ -3077,6 +3083,7 @@
+     attn_sink: torch.Tensor | None,
+     nope_head_dim: int,
+     rope_head_dim: int,
++    kv_scale: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     assert q.ndim == 3, f"expected q=[sq,h,d], got {q.shape}"
+     assert kv.ndim == 2, f"expected kv=[skv,d], got {kv.shape}"
+@@ -3102,6 +3109,25 @@
+         rope_head_dim,
+         "_rocm_sparse_attn_prefill_ragged_triton",
+     )
++
++    fp8_kv_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
++    fp8_kv = kv.dtype in fp8_kv_dtypes
++    if fp8_kv:
++        if kv.dtype != current_platform.fp8_dtype():
++            raise ValueError("FP8 KV dtype must match the platform FP8 dtype")
++        if q.dtype != torch.bfloat16:
++            raise ValueError("FP8 sparse MLA requires a BF16 query")
++        if kv_scale is None:
++            raise ValueError("FP8 sparse MLA requires kv_scale")
++        if kv_scale.dtype != torch.float32 or kv_scale.numel() != 1:
++            raise ValueError("FP8 sparse MLA requires one float32 kv_scale value")
++        if kv_scale.device != kv.device:
++            raise ValueError("kv_scale must be on the KV cache device")
++        kv_scale_arg = kv_scale
++    else:
++        if kv.dtype not in (torch.bfloat16, torch.float16):
++            raise ValueError(f"Unsupported sparse MLA cache dtype: {kv.dtype}")
++        kv_scale_arg = q  # Unused in the non-FP8 specialization.
+ 
+     block_h = 16
+     block_d = triton.next_power_of_2(head_dim)
+@@ -3111,6 +3137,7 @@
+     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
+         q,
+         kv,
++        kv_scale_arg,
+         indices,
+         indptr,
+         attn_sink,
+@@ -3127,6 +3154,7 @@
+         head_dim,
+         kv.shape[0],
+         float(scale),
++        FP8_KV=fp8_kv,
+         HAS_ATTN_SINK=has_attn_sink,
+         BLOCK_H=block_h,
+         BLOCK_D=block_d,
+@@ -3145,6 +3173,7 @@
+     nope_head_dim: int,
+     rope_head_dim: int,
+     topk_length: torch.Tensor | None = None,
++    kv_scale: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+         indices,
+@@ -3162,6 +3191,7 @@
+         attn_sink=attn_sink,
+         nope_head_dim=nope_head_dim,
+         rope_head_dim=rope_head_dim,
++        kv_scale=kv_scale,
+     )
+ 
+ 
+@@ -3743,6 +3773,7 @@
+     output: torch.Tensor,
+     ragged_indices: torch.Tensor | None = None,
+     ragged_indptr: torch.Tensor | None = None,
++    kv_scale: torch.Tensor | None = None,
+ ) -> None:
+     assert kv.ndim == 3 and kv.shape[1] == 1, (
+         f"ROCm Triton sparse prefill expects kv=[skv,1,d], got {kv.shape}"
+@@ -3790,6 +3821,7 @@
+             attn_sink=None if attn_sink is None else attn_sink[: q.shape[1]],
+             nope_head_dim=nope_head_dim,
+             rope_head_dim=rope_head_dim,
++            kv_scale=kv_scale,
+         )
+     else:
+         assert indices is not None
+@@ -3803,6 +3835,7 @@
+             nope_head_dim=nope_head_dim,
+             rope_head_dim=rope_head_dim,
+             topk_length=topk_length,
++            kv_scale=kv_scale,
+         )
+     output.copy_(output_chunk[..., : output.shape[-1]].to(output.dtype))
+ 
