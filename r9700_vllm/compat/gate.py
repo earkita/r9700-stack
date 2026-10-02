@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 logger = init_logger("vllm." + __name__)
 
 TESTED = {
+    "glm_rdna_indexer": (("e97573215",), "GLM kpool RDNA4 predicate and token-sized cache pages"),
     # patch name: (vLLM commits tested, upstream issue/PR that would retire it)
     "mtp_allowlist": (("dee37d891", "e97573215"), "vllm-project/vllm#55292"),
 }

@@ -22,6 +22,14 @@ def _disabled(name: str) -> bool:
     return name in {s.strip() for s in os.environ.get("R9K_DISABLE", "").split(",") if s.strip()}
 
 
+def register_glm() -> None:
+    """Minimal, explicitly enabled GLM bring-up fixes; no Qwen/kernel registration."""
+    if os.environ.get("R9K_GLM_BASELINE") != "1":
+        return
+    from .compat.glm_indexer import patch
+    patch()
+
+
 def register() -> None:
     from vllm.logger import init_logger
     log = init_logger("vllm.r9700_vllm")
