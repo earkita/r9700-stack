@@ -1,0 +1,7 @@
+.git
+bench/results
+profiling/traces
+**/__pycache__
+**/.pytest_cache
+**/*.so
+**/*.so.*
