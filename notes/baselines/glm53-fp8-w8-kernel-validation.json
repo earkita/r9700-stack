@@ -1,0 +1,423 @@
+{
+  "status": "isolated_kernel_validated; full_model_not_rerun",
+  "image": "r9700/vllm:glm53-fp8-w8-e97573215",
+  "image_id": "sha256:6164fa43c22b04dce470994a2ad02d8ef4e64c0c0a04e345e1c741704063fddf",
+  "source_sha256": "82aa72032dda6422dfc4b08d25079190eaf480e4fead88134360253e6407071e",
+  "gpu": "AMD Radeon AI PRO R9700",
+  "choice": {
+    "num_warps": 8,
+    "block_k": 16,
+    "num_stages": 2,
+    "n_spills_before": 127,
+    "n_spills_after": 24
+  },
+  "gpu_gates": {
+    "passed": 105,
+    "test_image": "sha256:87d5675c56ff4995168532e60b808821f229c81366d5ecd19f482a64d55eb58e",
+    "final_rebuild_comment_only_ast_equal": true
+  },
+  "host_profile_tests_passed": 10,
+  "full_model_rerun": false,
+  "running_runtime_changed": false,
+  "sweep": [
+    {
+      "warps": 4,
+      "block_k": 16,
+      "n_regs": 256,
+      "n_spills": 127,
+      "shared_bytes": 16384,
+      "numerics": [
+        {
+          "scale": 0.125,
+          "exact": true,
+          "max_abs": 0.0
+        },
+        {
+          "scale": 1.0,
+          "exact": true,
+          "max_abs": 0.0
+        },
+        {
+          "scale": 2.5,
+          "exact": true,
+          "max_abs": 0.0
+        }
+      ],
+      "samples_ms": [
+        1.5677309308733258,
+        1.568195052373977,
+        1.5681840563577318
+      ],
+      "median_ms": 1.5681840563577318
+    },
+    {
+      "warps": 8,
+      "block_k": 16,
+      "n_regs": 256,
+      "n_spills": 24,
+      "shared_bytes": 16384,
+      "numerics": [
+        {
+          "scale": 0.125,
+          "exact": true,
+          "max_abs": 0.0
+        },
+        {
+          "scale": 1.0,
+          "exact": true,
+          "max_abs": 0.0
+        },
+        {
+          "scale": 2.5,
+          "exact": true,
+          "max_abs": 0.0
+        }
+      ],
+      "samples_ms": [
+        0.39846709401983965,
+        0.3983929869617045,
+        0.39838110708421276
+      ],
+      "median_ms": 0.3983929869617045
+    },
+    {
+      "warps": 16,
+      "block_k": 16,
+      "n_regs": 245,
+      "n_spills": 0,
+      "shared_bytes": 16384,
+      "numerics": [
+        {
+          "scale": 0.125,
+          "exact": true,
+          "max_abs": 0.0
+        },
+        {
+          "scale": 1.0,
+          "exact": true,
+          "max_abs": 0.0
+        },
+        {
+          "scale": 2.5,
+          "exact": true,
+          "max_abs": 0.0
+        }
+      ],
+      "samples_ms": [
+        0.42366383651207234,
+        0.4237770376534298,
+        0.42358857516584725
+      ],
+      "median_ms": 0.42366383651207234
+    },
+    {
+      "warps": 4,
+      "block_k": 32,
+      "n_regs": 256,
+      "n_spills": 298,
+      "shared_bytes": 32768,
+      "numerics": [
+        {
+          "scale": 0.125,
+          "exact": false,
+          "max_abs": 6.103515625e-05
+        },
+        {
+          "scale": 1.0,
+          "exact": false,
+          "max_abs": 0.0009765625
+        },
+        {
+          "scale": 2.5,
+          "exact": false,
+          "max_abs": 0.0078125
+        }
+      ],
+      "samples_ms": [
+        5.463084411621094,
+        5.500434409247505,
+        5.4080934736463755
+      ],
+      "median_ms": 5.463084411621094
+    },
+    {
+      "warps": 8,
+      "block_k": 32,
+      "n_regs": 256,
+      "n_spills": 210,
+      "shared_bytes": 32768,
+      "numerics": [
+        {
+          "scale": 0.125,
+          "exact": false,
+          "max_abs": 6.103515625e-05
+        },
+        {
+          "scale": 1.0,
+          "exact": false,
+          "max_abs": 0.0009765625
+        },
+        {
+          "scale": 2.5,
+          "exact": false,
+          "max_abs": 0.0078125
+        }
+      ],
+      "samples_ms": [
+        1.1722750527518135,
+        1.1726009005591982,
+        1.1731268655686151
+      ],
+      "median_ms": 1.1726009005591982
+    },
+    {
+      "warps": 16,
+      "block_k": 32,
+      "n_regs": 256,
+      "n_spills": 149,
+      "shared_bytes": 32768,
+      "numerics": [
+        {
+          "scale": 0.125,
+          "exact": false,
+          "max_abs": 6.103515625e-05
+        },
+        {
+          "scale": 1.0,
+          "exact": false,
+          "max_abs": 0.0009765625
+        },
+        {
+          "scale": 2.5,
+          "exact": false,
+          "max_abs": 0.0078125
+        }
+      ],
+      "samples_ms": [
+        0.5170555726729612,
+        0.5169304383629784,
+        0.5169237664405336
+      ],
+      "median_ms": 0.5169304383629784
+    }
+  ],
+  "stage1_sweep": [
+    {
+      "warps": 4,
+      "block_k": 16,
+      "n_regs": 256,
+      "n_spills": 85,
+      "shared_bytes": 16384,
+      "numerics": [
+        {
+          "scale": 0.125,
+          "exact": true,
+          "max_abs": 0.0
+        },
+        {
+          "scale": 1.0,
+          "exact": true,
+          "max_abs": 0.0
+        },
+        {
+          "scale": 2.5,
+          "exact": true,
+          "max_abs": 0.0
+        }
+      ],
+      "samples_ms": [
+        1.2887527465820312,
+        1.2889218380576686,
+        1.2879167857923006
+      ],
+      "median_ms": 1.2887527465820312
+    },
+    {
+      "warps": 8,
+      "block_k": 16,
+      "n_regs": 256,
+      "n_spills": 19,
+      "shared_bytes": 16384,
+      "numerics": [
+        {
+          "scale": 0.125,
+          "exact": true,
+          "max_abs": 0.0
+        },
+        {
+          "scale": 1.0,
+          "exact": true,
+          "max_abs": 0.0
+        },
+        {
+          "scale": 2.5,
+          "exact": true,
+          "max_abs": 0.0
+        }
+      ],
+      "samples_ms": [
+        0.7537188443270597,
+        0.7533836422544538,
+        0.7535152955488725
+      ],
+      "median_ms": 0.7535152955488725
+    },
+    {
+      "warps": 16,
+      "block_k": 16,
+      "n_regs": 220,
+      "n_spills": 0,
+      "shared_bytes": 16384,
+      "numerics": [
+        {
+          "scale": 0.125,
+          "exact": true,
+          "max_abs": 0.0
+        },
+        {
+          "scale": 1.0,
+          "exact": true,
+          "max_abs": 0.0
+        },
+        {
+          "scale": 2.5,
+          "exact": true,
+          "max_abs": 0.0
+        }
+      ],
+      "samples_ms": [
+        0.40560827964593554,
+        0.4055936324694925,
+        0.4055284137568198
+      ],
+      "median_ms": 0.4055936324694925
+    }
+  ],
+  "wrapper": {
+    "scope": "Isolated upstream sparse MLA reader, synthetic equal dequantized KV, K7 verification shape. Resident BF16 server idle; no model restarts. Warm repeated inputs, not end-to-end performance or full root-cause attribution.",
+    "gpu": "AMD Radeon AI PRO R9700",
+    "memory_peak_bytes": 152372736,
+    "server_counters_before": {
+      "vllm:num_requests_running{engine=\"0\",model_name=\"glm-5.3-flash\"}": 0.0,
+      "vllm:num_requests_waiting{engine=\"0\",model_name=\"glm-5.3-flash\"}": 0.0,
+      "vllm:generation_tokens_total{engine=\"0\",model_name=\"glm-5.3-flash\"}": 1153.0
+    },
+    "server_counters_after": {
+      "vllm:num_requests_running{engine=\"0\",model_name=\"glm-5.3-flash\"}": 0.0,
+      "vllm:num_requests_waiting{engine=\"0\",model_name=\"glm-5.3-flash\"}": 0.0,
+      "vllm:generation_tokens_total{engine=\"0\",model_name=\"glm-5.3-flash\"}": 1153.0
+    },
+    "source_sha256": "82aa72032dda6422dfc4b08d25079190eaf480e4fead88134360253e6407071e",
+    "results": [
+      {
+        "context": 8192,
+        "rows": 8,
+        "padded_heads": 16,
+        "latent": 512,
+        "selected_keys_per_row": 2048,
+        "case": "bfloat16-page640",
+        "median_ms": 0.33305048797090175,
+        "samples_ms": [
+          0.33307885092657963,
+          0.33300716297046556,
+          0.33297361123441443,
+          0.3350391980764028,
+          0.33305048797090175
+        ]
+      },
+      {
+        "context": 8192,
+        "rows": 8,
+        "padded_heads": 16,
+        "latent": 512,
+        "selected_keys_per_row": 2048,
+        "case": "float8_e4m3fn-page640",
+        "median_ms": 0.39781885147094725,
+        "samples_ms": [
+          0.39781885147094725,
+          0.4011068058400019,
+          0.39775781631469725,
+          0.3979070068853587,
+          0.39776192019062656
+        ]
+      },
+      {
+        "context": 8192,
+        "rows": 8,
+        "padded_heads": 16,
+        "latent": 512,
+        "selected_keys_per_row": 2048,
+        "case": "float8_e4m3fn-page1152",
+        "median_ms": 0.3982288623145717,
+        "samples_ms": [
+          0.3979626983766131,
+          0.40109308642010355,
+          0.3985882531293491,
+          0.3982288623145717,
+          0.3979610381587859
+        ]
+      },
+      {
+        "context": 32768,
+        "rows": 8,
+        "padded_heads": 16,
+        "latent": 512,
+        "selected_keys_per_row": 2048,
+        "case": "bfloat16-page640",
+        "median_ms": 0.33333769617853937,
+        "samples_ms": [
+          0.3330772322837753,
+          0.33495654865846797,
+          0.33348968142554875,
+          0.33333769617853937,
+          0.3332079011040765
+        ]
+      },
+      {
+        "context": 32768,
+        "rows": 8,
+        "padded_heads": 16,
+        "latent": 512,
+        "selected_keys_per_row": 2048,
+        "case": "float8_e4m3fn-page640",
+        "median_ms": 0.3978889496095719,
+        "samples_ms": [
+          0.397750679139168,
+          0.3985164596001629,
+          0.3978889496095719,
+          0.39817962646484373,
+          0.39768185154084235
+        ]
+      },
+      {
+        "context": 32768,
+        "rows": 8,
+        "padded_heads": 16,
+        "latent": 512,
+        "selected_keys_per_row": 2048,
+        "case": "float8_e4m3fn-page1152",
+        "median_ms": 0.39805447055447485,
+        "samples_ms": [
+          0.3991241362413414,
+          0.3983845297624225,
+          0.39798975298481604,
+          0.39805447055447485,
+          0.3978943859517333
+        ]
+      }
+    ]
+  },
+  "evidence_sha256": {
+    "bench/results/glm-fp8-spill-tuning/tune.py": "030d7189b58094e51cbf231b52cdfff32fdde30d6d7af5ea6de6ef090b00629f",
+    "bench/results/glm-fp8-spill-tuning/sweep.json": "b133c48d53a12208e91f741bc267273ffeaa01deb8b58ed76d39c1cc0d15e082",
+    "bench/results/glm-fp8-spill-tuning/stage1/tune.py": "f4e3b8e9b29ffaf4f66a8ecdd669706067c3f37a033284d7508b9914008936c3",
+    "bench/results/glm-fp8-spill-tuning/stage1/sweep.json": "e46c374aaa67e51d7fdd9a61bd29fb8b7ab47c6fbb6be243f727b262ab3d7a60",
+    "bench/results/glm-fp8-spill-tuning/gpu-gates.log": "b470135471d48c2d9a469a7f520827fdec13864c2357eb0a5941922edb5dec8a",
+    "bench/results/glm-fp8-spill-tuning/build.log": "66ddf33cbd03e342a61b418011d5ca18ccde9cdd7e992f69e111d0bbe374163c",
+    "bench/results/glm-fp8-spill-tuning/comment-only-rebuild.json": "5d43dfc0585c2a2e3375485e36298f00c83aa31963b778baa798b044fd3f6c85",
+    "bench/results/glm-fp8-spill-tuning/wrapper/micro.py": "fba31676fdfc84786e6cac46c45826e7ad7201c68367e32589f5185c27583457",
+    "bench/results/glm-fp8-spill-tuning/wrapper/summary.json": "c1e1e644646bc94da741c4b9154429d1b61ccb2649333f4229d80ec957c75d25",
+    "bench/results/glm-fp8-spill-tuning/wrapper/compiled-kernels.json": "f8fc9efa518691f28045abdced5bf71551cd1a5365f15cfd0c357b2911ea1326",
+    "bench/results/glm-fp8-spill-tuning/wrapper/kernel-1.amdgcn": "83cc65916531105d9aa4d5654ff485c65fef6d6997db41bc22c5d197a06e9790"
+  }
+}
