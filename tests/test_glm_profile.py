@@ -62,5 +62,87 @@ class Detection(unittest.TestCase):
                 inspect_checkpoint(checkpoint(), tp)
 
 
+class Launcher(unittest.TestCase):
+    def launch(self, profile, *assignments, **env):
+        clean = {k: v for k, v in os.environ.items() if not k.startswith(("R9K_", "VLLM_"))}
+        clean.update(DRYRUN="1", REPO=str(ROOT), **env)
+        out = subprocess.check_output(["bash", str(ROOT / "serve" / profile), *assignments], env=clean, text=True)
+        return shlex.split(out)
+
+    def test_dflash_is_separate_and_explicit(self):
+        args = self.launch("glm-5.3-flash-c2.sh", MODEL="/models/local GLM")
+        spec = json.loads(args[args.index("--speculative-config") + 1])
+        self.assertEqual(spec["method"], "dflash")
+        self.assertEqual(spec["num_speculative_tokens"], 4)
+        self.assertEqual(spec["attention_backend"], "TRITON_ATTN")
+        self.assertTrue(spec["disable_eagle_block_drop"])
+        self.assertEqual(spec["draft_tensor_parallel_size"], 8)
+        self.assertEqual(spec["revision"], "bf582e4eacc1810f76656d1811693ff6c6737d2a")
+        self.assertEqual(spec["kv_cache_dtype"], "fp8_e4m3")
+        self.assertEqual(args[args.index("--kv-cache-dtype") + 1], "fp8_e4m3")
+        self.assertEqual(args[args.index("--max-model-len") + 1], "-1")
+        self.assertEqual(args[args.index("--kv-cache-memory") + 1], "4429185024")
+        self.assertIn("r9700/vllm:glm53-plugin-e97573215", args)
+        self.assertIn("R9K_GLM_FP8_SPARSE=1", args)
+        self.assertIn("R9K_GLM_DFLASH=1", args)
+        self.assertIn("R9K_GLM_W4A4_MAX_ROWS=32", args)
+        self.assertIn("R9K_GLM_W4A4_BATCH=packed", args)
+        self.assertIn("R9K_GLM_DFLASH_SHARD_FC=1", args)
+        self.assertNotIn("--no-enable-prefix-caching", args)
+
+    def test_dflash_window_override(self):
+        args = self.launch("glm-5.3-flash-c2.sh", "SPEC=1", "CGSIZES=2")
+        spec = json.loads(args[args.index("--speculative-config") + 1])
+        graphs = json.loads(args[args.index("--compilation-config") + 1])
+        self.assertEqual(spec["num_speculative_tokens"], 1)
+        self.assertEqual(graphs["cudagraph_capture_sizes"], [2])
+
+    def test_dflash_concurrency_profiles(self):
+        for count in (2, 4):
+            args = self.launch(f"glm-5.3-flash-c{count}.sh")
+            spec = json.loads(args[args.index("--speculative-config") + 1])
+            graphs = json.loads(args[args.index("--compilation-config") + 1])
+            self.assertEqual(args[args.index("--max-num-seqs") + 1], str(count))
+            self.assertEqual(graphs["cudagraph_capture_sizes"], list(range(5, 5*count+1, 5)))
+            self.assertEqual(args[args.index("--kv-cache-dtype") + 1], "fp8_e4m3")
+            self.assertEqual(spec["kv_cache_dtype"], "fp8_e4m3")
+            self.assertEqual(spec["num_speculative_tokens"], 4)
+            self.assertEqual(args[args.index("--max-model-len") + 1], "-1")
+            self.assertEqual(args[args.index("--kv-cache-memory") + 1], "4429185024")
+            self.assertNotIn("--no-enable-prefix-caching", args)
+            self.assertIn("r9700/vllm:glm53-plugin-e97573215", args)
+
+    def test_cache_dtype_and_image_isolate_compile_cache(self):
+        def cache_mount(args):
+            return next(x for x in args if x.endswith(":/root/.cache/vllm"))
+        bf16 = self.launch("glm-5.3-flash-c2.sh", "KV_DTYPE=bfloat16")
+        fp8 = self.launch("glm-5.3-flash-c2.sh")
+        patched = self.launch("glm-5.3-flash-c2.sh", "KV_DTYPE=bfloat16", "IMG=patched-image")
+        self.assertNotEqual(cache_mount(bf16), cache_mount(fp8))
+        self.assertNotEqual(cache_mount(bf16), cache_mount(patched))
+
+    def test_baseline_and_local_model(self):
+        args = self.launch("glm-5.3-flash.sh", MODEL="/models/local GLM", MODELS_DIR="/tmp/model store",
+                           MTP="3", DRAFT="/models/draft", R9K_PLATFORM="1")
+        self.assertIn("/models/local GLM", args)
+        self.assertIn("/tmp/model store:/models", args)
+        for key, value in (("--tensor-parallel-size", "8"), ("--max-model-len", "65536"),
+                           ("--max-num-seqs", "1"), ("--reasoning-parser", "glm45"),
+                           ("--tool-call-parser", "glm47"), ("--served-model-name", "glm-5.3-flash")):
+            self.assertEqual(args[args.index(key) + 1], value)
+        for x in ("--enforce-eager", "--disable-custom-all-reduce", "R9K_PLATFORM=0", "VLLM_PLUGINS=r9700_glm"):
+            self.assertIn(x, args)
+        for x in ("--speculative-config", "--cpu-offload-gb", "--chat-template"):
+            self.assertNotIn(x, args)
+
+    def test_qwen_defaults_preserved(self):
+        args = self.launch("serve.sh")
+        for key, value in (("--served-model-name", "Qwen3.8"), ("--tensor-parallel-size", "2"),
+                           ("--reasoning-parser", "qwen3"), ("--tool-call-parser", "qwen3_coder")):
+            self.assertEqual(args[args.index(key) + 1], value)
+        self.assertEqual(json.loads(args[args.index("--speculative-config") + 1]),
+                         {"method": "mtp", "num_speculative_tokens": 3})
+
+
 if __name__ == "__main__":
     unittest.main()
