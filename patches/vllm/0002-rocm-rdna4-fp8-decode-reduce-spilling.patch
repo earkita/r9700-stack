@@ -1,0 +1,36 @@
+--- a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+@@ -22,10 +22,11 @@
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+ if current_platform.is_rocm():
+-    from vllm.platforms.rocm import _ON_GFX942, _ON_GFX950
++    from vllm.platforms.rocm import _ON_GFX942, _ON_GFX950, _ON_RDNA4
+ else:
+     _ON_GFX942 = False
+     _ON_GFX950 = False
++    _ON_RDNA4 = False
+ 
+ logger = init_logger(__name__)
+ 
+@@ -3132,7 +3133,19 @@
+     block_h = 16
+     block_d = triton.next_power_of_2(head_dim)
+     block_k = 16 if head_dim >= 256 else 32
+-    num_warps = 4
++    # The gfx1201 FP8 decoder with H=16/D=512 spills 127 registers at
++    # four warps. Eight warps reduce that to 24 and preserve the reduction
++    # order (BLOCK_K=16). Keep the measured choice local to short decode
++    # batches; BF16, larger batches and other architectures keep defaults.
++    fp8_rdna_decode = (
++        _ON_RDNA4
++        and fp8_kv
++        and 0 < num_queries <= 8
++        and num_heads == 16
++        and head_dim == 512
++        and rope_head_dim == 0
++    )
++    num_warps = 8 if fp8_rdna_decode else 4
+     out = torch.empty_like(q)
+     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
+         q,
