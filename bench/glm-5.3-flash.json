@@ -1,0 +1,7 @@
+{
+  "runs_per_category": 20,
+  "warmup": 3,
+  "concurrency_levels": [1, 2, 4, 8, 16],
+  "prefill_depths": [2000, 8000, 16000, 32000, 64000],
+  "max_model_len": 65536
+}
