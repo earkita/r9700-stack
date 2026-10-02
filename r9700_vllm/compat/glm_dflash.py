@@ -163,11 +163,27 @@ def patch():
     if os.environ.get("R9K_GLM_DFLASH_AUDIT_DIR"):
         from .glm_dflash_audit import install_draft_capture
         install_draft_capture()
-    install_cache_adapters(kv)
+    cache_mode = os.environ.get("R9K_GLM_DFLASH_CACHE", "separate")
+    if cache_mode == "shared":
+        from .glm_shared_cache import install_shared_cache_adapters
+        install_shared_cache_adapters(kv)
+    elif cache_mode == "separate":
+        install_cache_adapters(kv)
+    else:
+        raise ValueError("R9K_GLM_DFLASH_CACHE must be separate or shared")
+    boundary = os.environ.get("R9K_GLM_APC_BOUNDARY", "stock")
+    if boundary == "fixed":
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from .glm_apc import install_boundary_adapter
+        install_boundary_adapter(Scheduler)
+    elif boundary != "stock":
+        raise ValueError("R9K_GLM_APC_BOUNDARY must be stock or fixed")
     for arch, cls in [("Glm5NextForCausalLM", "R9kGlmDFlashForCausalLM"),
                       ("Glm5NextForConditionalGeneration", "R9kGlmDFlashForConditionalGeneration")]:
         ModelRegistry.register_model(arch, f"r9700_vllm.models.glm_dflash:{cls}")
     kv._r9700_glm_dflash = True
     from vllm.logger import init_logger
-    init_logger("vllm.r9700_vllm").info("r9700: experimental GLM DFlash aux-state and independent draft-cache adapters")
+    init_logger("vllm.r9700_vllm").info(
+        "r9700: experimental GLM DFlash aux-state; draft-cache=%s APC-boundary=%s",
+        cache_mode, boundary)
     return True
