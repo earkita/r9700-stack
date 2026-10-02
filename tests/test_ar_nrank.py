@@ -2,6 +2,7 @@
 
 Needs every GPU of the TP group (NOT part of the single-GPU gate suite):
     torchrun --nproc-per-node=4 tests/test_ar_nrank.py            # BENCH=0 to skip the latency table
+    HIDDEN=4096 TOKS=1,2,4,16 torchrun --nproc-per-node=8 tests/test_ar_nrank.py  # GLM
 
 Checks:
   * bit-exact vs an fp32 sum in rank order, rounded once (every rank regenerates every rank's input from seeds)
@@ -54,7 +55,9 @@ def graph_time(fn, reps=50, iters=20):
         g.replay()
     b.record()
     torch.cuda.synchronize()
-    return a.elapsed_time(b) * 1e3 / (reps * iters)
+    elapsed = torch.tensor(a.elapsed_time(b) * 1e3 / (reps * iters), device="cuda")
+    dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+    return elapsed.item()  # The slowest rank determines collective latency.
 
 
 def main():
@@ -62,6 +65,7 @@ def main():
     rank, world = dist.get_rank(), dist.get_world_size()
     torch.cuda.set_device(rank)
     dev = torch.device(f"cuda:{rank}")
+    hidden = int(os.environ.get("HIDDEN", "2560"))
     from r9700_vllm.comm.r9k_ar import R9kAllReduceN
     ar = R9kAllReduceN(dist.group.WORLD, dev)
     assert not ar.disabled, "R9kAllReduceN did not install"
@@ -81,7 +85,7 @@ def main():
         cap = (ar.max1 if mode == 1 else ar.max_bytes)
         for dtype in (torch.bfloat16, torch.float16, torch.float32):
             esz = torch.tensor([], dtype=dtype).element_size()
-            for n in (8, 24, 2560 * 4 - 8, 2560 * 16, 2560 * 64, 2560 * 200 + 8, cap // esz):
+            for n in (8, 24, hidden, hidden * 4 - 8, hidden * 16, hidden * 64, hidden * 200 + 8, cap // esz):
                 if n * esz % 16 or n * esz > cap:
                     continue
                 for nb in (None, 1, 3, 16):
@@ -90,13 +94,13 @@ def main():
                           ar.all_reduce(inp(rank, it, n, dtype, dev), nb=nb, mode=mode),
                           ref(world, it, n, dtype, dev))
     # back-to-back calls with no host sync in between (the double buffer is what keeps them apart)
-    for mode, n in ((1, 2560 * 16), (2, 2560 * 64)):
+    for mode, n in ((1, min(hidden * 16, ar.max1 // 2)), (2, hidden * 64)):
         xs = [inp(rank, 5000 + i, n, torch.bfloat16, dev) for i in range(40)]
         outs = [ar.all_reduce(x, mode=mode) for x in xs]
         for i, o in enumerate(outs):
             check(f"burst mode{mode} {i}", o, ref(world, 5000 + i, n, torch.bfloat16, dev))
     # graph replay: one-shot -> two-shot -> one-shot chained
-    x = torch.empty(2560 * 16, dtype=torch.bfloat16, device=dev)
+    x = torch.zeros(min(hidden * 16, ar.max1 // 2), dtype=torch.bfloat16, device=dev)
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
@@ -129,9 +133,11 @@ def main():
         if rank == 0:
             print(f"{'tokens':>7} {'KiB':>7} {'rccl':>8} {'1-shot':>8} {'2-shot':>8}  (us, best block count; per-nb)")
         for tok in [int(t) for t in os.environ.get("TOKS", "1,4,16,32,64,128,256,1024,4096").split(",")]:
-            n = 2560 * tok
+            n = hidden * tok
             nbytes = n * 2
-            x = torch.randn(n, device=dev).to(torch.bfloat16)
+            # Repeated in-place RCCL sums must not overflow during graph timing.
+            # Correctness above uses changing, nonzero inputs independently.
+            x = torch.zeros(n, device=dev, dtype=torch.bfloat16)
             t_rccl = graph_time(lambda: dist.all_reduce(x))
             res = {}
             for mode, cap in ((1, ar.max1), (2, ar.max_bytes)):
