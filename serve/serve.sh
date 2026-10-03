@@ -31,6 +31,9 @@ fi
 # The plugin's own source is part of the key too: a code change can change weight layouts under the same knobs.
 PSRC=$(find $REPO/r9700_vllm -name '*.py' -print0 | sort -z | xargs -0 cat | md5sum | cut -c1-8)
 CKEY=$( (env | grep -E '^(R9K|VLLM)_' | sort; echo "${MTP-3}${MODEL:+ $MODEL}${DRAFT:+ $DRAFT $SPEC $DRAFT_ATTN $SPEC_EXTRA $DRAFT_KV_DTYPE}${ATTN:+ $ATTN} $KV_DTYPE $IMG $PSRC") | md5sum | cut -c1-10)
+# Keep generated caches inside the mounted checkout, excluded from Git and image builds.
+VLLM_CACHE_DIR="$REPO/.runtime/cache/vllm/$CKEY"
+TRITON_CACHE_DIR="$REPO/.runtime/cache/triton"
 # recommended defaults (VM with >=256 GB RAM): all experts in host memory, LRU cache on every layer, fp8 LM heads
 : ${R9K_EXPERT_CACHE_SLOTS:=270}; : ${R9K_TARGET_LMHEAD:=fp8}; : ${R9K_DRAFT_LMHEAD:=fp8}
 export R9K_EXPERT_CACHE_SLOTS R9K_TARGET_LMHEAD R9K_DRAFT_LMHEAD
@@ -118,8 +121,8 @@ CMD=(docker run -d --name "${NAME:-vllmstock}" --ipc=host --network=host ${PIDNS
   --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
   -e HIP_VISIBLE_DEVICES=${GPUS:-0,1} -e VLLM_ROCM_USE_AITER=0 -e HSA_ENABLE_IPC_MODE_LEGACY=0 \
   -e GPU_MAX_HW_QUEUES=${HWQ:-1} -e HSA_ENABLE_MWAITX=${MWAITX:-1} -e OMP_NUM_THREADS=8 -e R9K_LIB=/opt/r9700/r9700_vllm/kernels/libr9k.so \
-  $DOCKER_ARGS "${MNT[@]}" -v "${MODELS_DIR:-$HOME/models}:/models" -v $HOME/vllmstock-cache-$CKEY:/root/.cache/vllm \
-  -v $HOME/vllmstock-triton:/root/.triton \
+  $DOCKER_ARGS "${MNT[@]}" -v "${MODELS_DIR:-$HOME/models}:/models" -v "$VLLM_CACHE_DIR:/root/.cache/vllm" \
+  -v "$TRITON_CACHE_DIR:/root/.triton" \
   "${ENTRY[@]}" "$IMG" "${PRE[@]}" "${MODEL:-/models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ}" \
   --served-model-name "${SERVED_MODEL_NAME:-Qwen3.8}" --host "${HOST:-0.0.0.0}" --port ${PORT:-8080} \
   --tensor-parallel-size ${TP:-2} --max-model-len ${MAXLEN:-32768} --max-num-seqs ${NSEQ:-4} \
@@ -138,6 +141,7 @@ if [ -n "${MODEL_PREFLIGHT:-}" ]; then
     "$IMG" -m "$MODEL_PREFLIGHT" "$MODEL" --tp "${TP:-2}" || exit $?
 fi
 # REPLACE=0 is useful for profiles that must not interrupt an existing named server.
+mkdir -p "$VLLM_CACHE_DIR" "$TRITON_CACHE_DIR" || exit 1
 if [ "${REPLACE:-1}" = 1 ]; then ${DOCKER_SUDO-sudo} docker rm -f "${NAME:-vllmstock}" 2>/dev/null; fi
 ${DOCKER_SUDO-sudo} "${CMD[@]}" || exit $?
 echo "started stock vLLM + r9700 plugin (offload ${OFFLOAD_GB:-34} GB/rank, maxlen ${MAXLEN:-32768})"

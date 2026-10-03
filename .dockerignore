@@ -1,4 +1,5 @@
 .git
+.runtime
 bench/results
 profiling/traces
 **/__pycache__
