@@ -17,7 +17,6 @@
   No speedup or persistent regression claim. Full suite/soak remain deferred.
 - The clean-clone service remains running, FP8 target / BF16 draft, K7,
   APC, 64K, HTTP 200, no runtime error matches in its full test log.
-  Evidence: `notes/baselines/glm53-fp8-plugin-validation.json`.
 
 ## 2026-10-01 (opt-in GLM C1 W4A4 candidate)
 
