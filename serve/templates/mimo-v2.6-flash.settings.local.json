@@ -1,5 +1,5 @@
 {
-  "apiKeyHelper": "printenv LITELLM_MASTER_KEY",
+  "apiKeyHelper": "python3 \"${R9700_STACK_ROOT:-$HOME/ai/r9700-stack}/serve/claude-litellm-key.py\"",
   "totalTokensReminder": "off",
   "permissions": {
     "defaultMode": "acceptEdits",
