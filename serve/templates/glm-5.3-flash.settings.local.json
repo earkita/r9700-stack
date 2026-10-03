@@ -1,0 +1,30 @@
+{
+  "apiKeyHelper": "printenv LITELLM_MASTER_KEY",
+  "totalTokensReminder": "off",
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Read",
+      "Bash"
+    ]
+  },
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:4000",
+    "ANTHROPIC_MODEL": "glm-5.3-flash-high",
+    "ANTHROPIC_SMALL_FAST_MODEL": "glm-5.3-flash-high",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-5.3-flash-high",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.3-flash-high",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.3-flash-high",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "glm-5.3-flash-high",
+    "DISABLE_PROMPT_CACHING": "1",
+    "CLAUDE_CODE_TODO_REMINDER_MODE": "off",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "CLAUDE_CODE_AUTO_MODE_SERVER": "0",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "524288",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "524288",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "90"
+  },
+  "model": "glm-5.3-flash-high",
+  "effortLevel": "high"
+}

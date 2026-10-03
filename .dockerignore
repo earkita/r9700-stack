@@ -5,3 +5,4 @@ profiling/traces
 **/.pytest_cache
 **/*.so
 **/*.so.*
+secrets*
