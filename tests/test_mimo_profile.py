@@ -13,11 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class MiMoProfile(unittest.TestCase):
-    def command(self, *args):
+    def command(self, *args, profile="mimo-v2.6-flash.sh"):
         env = dict(os.environ, DRYRUN="1")
         return shlex.split(
             subprocess.check_output(
-                ["bash", str(ROOT / "serve/mimo-v2.6-flash.sh"), *args],
+                ["bash", str(ROOT / "serve" / profile), *args],
                 env=env,
                 text=True,
             )
@@ -49,6 +49,18 @@ class MiMoProfile(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             register_mimo()  # does not import vLLM, access GPUs or patch other models
 
+    def test_shared_pool_profiles(self):
+        for n in (2, 4):
+            profile = f"mimo-v2.6-flash-c{n}.sh"
+            cmd = self.command(profile=profile)
+            self.assertEqual(cmd[cmd.index("--max-model-len") + 1], "-1")
+            self.assertEqual(cmd[cmd.index("--max-num-seqs") + 1], str(n))
+            self.assertEqual(cmd[cmd.index("--kv-cache-memory") + 1], "8187281408")
+            self.assertIn("R9K_ARN=1", cmd)
+            override = self.command("MAXLEN=262144", "NSEQ=2", "KVMEM=", profile=profile)
+            self.assertEqual(override[override.index("--max-model-len") + 1], "262144")
+            self.assertNotIn("--kv-cache-memory", override)
+
     def test_exact_ar8_switch(self):
         for enabled in (0, 1):
             cmd = self.command(f"AR8={enabled}")
@@ -75,7 +87,7 @@ class MiMoProfile(unittest.TestCase):
             obj["apiKeyHelper"],
             'python3 "${R9700_STACK_ROOT:-$HOME/ai/r9700-stack}/serve/claude-litellm-key.py"',
         )
-        self.assertEqual(obj["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "131072")
+        self.assertEqual(obj["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "524288")
         self.assertEqual(
             obj["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "mimo-v2.6-flash-fast"
         )

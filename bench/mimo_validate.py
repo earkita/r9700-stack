@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Frozen MiMo C1/C2 benchmark and independent completion/retrieval gates.
+"""Frozen MiMo concurrent benchmark and independent completion/retrieval gates.
 
 Run --freeze with the local checkpoint tokenizer, then --phase on each runtime.
 Bench timings use BetterBench 0.6.0 unchanged. All attempts are retained.
@@ -65,11 +65,11 @@ def freeze(a):
     a.out.mkdir(parents=True, exist_ok=False)
     cases = []
     for kind, lengths in [
-        ("speed", [1024, 32768, 130816]),
-        ("quality", [8192, 32768, 126976]),
+        ("speed", a.bench_lengths),
+        ("quality", a.quality_lengths),
     ]:
         for length in lengths:
-            for client in range(2):
+            for client in range(max(a.concurrency)):
                 key = f"MIMO-KEY-{length}-{client}-C83A"
                 records = [
                     f"Record {i:06d}: routine inspection completed, archive unchanged, maintenance scheduled.\n"
@@ -149,13 +149,14 @@ def freeze(a):
         ignore_eos=False,
         output_tokens=256,
         quality_output_tokens=4096,
-        lengths=[1024, 32768, 130816],
-        concurrency=[1, 2],
+        lengths=a.bench_lengths,
+        quality_lengths=a.quality_lengths,
+        concurrency=a.concurrency,
         warmup_rounds=1,
         measured_rounds=3,
         cache="unique prefix_salt per phase-independent case/round; cold; verify zero hits",
         decode="BetterBench 0.6.0 (completion_tokens-1)/(last-first content-bearing SSE), includes reasoning; report batched chunks",
-        comparison="SPEC=0 versus SPEC=7; same maxlen128K/C2/NBT8192/BF16/eager/225W; quality independent from speed truncation",
+        comparison="Record runtime identities and the declared experimental variable before either leg; match other runtime settings and hardware. Quality is independent from speed truncation.",
     )
     (a.out / "protocol.json").write_text(json.dumps(plan, indent=2) + "\n")
     print("Frozen corpus and protocol:", a.out, flush=True)
@@ -173,6 +174,9 @@ def main():
                    help="Freeze the same length selection for both comparison legs")
     p.add_argument("--bench-cache-namespace", default="",
                    help="Fresh salt namespace for a cold performance comparison")
+    p.add_argument("--concurrency", type=int, nargs="+", choices=[1, 2, 4], default=[1, 2],
+                   help="Freeze the same concurrency selection for compared profiles")
+    p.add_argument("--quality-lengths", type=int, nargs="+", default=[8192, 32768, 126976])
     p.add_argument(
         "--quality-cache-namespace",
         default="",
@@ -368,7 +372,7 @@ def main():
         client._finalize = keep_finalize
         summaries = []
         for length in a.bench_lengths:
-            for concurrency in [1, 2]:
+            for concurrency in a.concurrency:
                 chosen = [
                     c
                     for c in cases
@@ -462,7 +466,7 @@ def main():
                         )
                         / (max(r["end"] for r in rows) - min(r["start"] for r in rows)),
                     )
-                    if concurrency == 2:
+                    if concurrency > 1:
                         assert overlap > 0, "Requests did not decode concurrently"
                     summaries.append(group)
                     (a.out / "groups.json").write_text(json.dumps(summaries, indent=2))
@@ -479,13 +483,14 @@ def main():
         from glm_quality import niah_scores
 
         scores = []
-        for length in [8192, 32768, 126976]:
+        for length in a.quality_lengths:
             chosen = [
                 c
                 for c in cases
                 if c["kind"] == "quality" and c["prompt_tokens"] == length
             ]
-            for concurrency in [1, 2]:
+            for concurrency in a.concurrency:
+                assert len(chosen) >= concurrency, (length, concurrency)
                 before = counters(a.base)
                 barrier = threading.Barrier(concurrency)
 
@@ -509,7 +514,7 @@ def main():
                             case
                             | dict(
                                 scoring="exact",
-                                key_pattern=r"MIMO-KEY-[0-9]+-[01]-C83A",
+                                key_pattern=r"MIMO-KEY-[0-9]+-[0-9]+-C83A",
                             ),
                         ),
                     )

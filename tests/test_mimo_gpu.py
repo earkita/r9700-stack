@@ -70,6 +70,8 @@ class MiMoNumerics(unittest.TestCase):
             ([263], [8]),
             ([263, 139], [8, 8]),
             ([263, 139], [8, 3]),
+            ([263, 139, 513, 179], [8, 8, 8, 8]),
+            ([263, 139, 513, 179], [8, 3, 8, 1]),
             ([96, 139], [64, 8]),
         ]:
             for window in [-1, 127]:
@@ -148,7 +150,7 @@ class MiMoNumerics(unittest.TestCase):
     def test_moe_mimo_shapes(self):
         from test_moe_mxfp4 import run_case
 
-        for rows in (1, 2, 8, 16, 65):
+        for rows in (1, 2, 8, 16, 32, 65):
             self.assertTrue(run_case(8, rows, 8, 512, 4096, 4096, 256, seed=123)[0])
 
 
