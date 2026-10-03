@@ -46,7 +46,7 @@ if not sys.argv[3].isdigit() or not 1 <= int(sys.argv[3]) <= 65535:
     raise SystemExit('PORT must be between 1 and 65535.')
 PY
 fi
-CONFIG=${CONFIG:-$ROOT/proxy/litellm.yaml}
+CONFIG=${CONFIG:-$ROOT/proxy/glm.yaml}
 [[ -f "$CONFIG" ]] || { echo "Missing proxy CONFIG" >&2; exit 2; }
 CMD=(docker run -d --name "$NAME" --restart unless-stopped --network host
   --env-file "$ENV_FILE"

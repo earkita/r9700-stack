@@ -1,19 +1,14 @@
 # GLM C4 profile: C1/C2/C4 decode — 2026-10-02
 
-`serve/glm-5.3-flash-max.sh` was renamed to `serve/glm-5.3-flash-c2.sh`.
-`serve/glm-5.3-flash-c4.sh` is a standalone copy with default NSEQ=4 and
-container name `glm53-flash-c4`. Both call the shared `serve.sh` directly.
-C2 retains its previous settings; C4 changes only NSEQ and the corresponding
-graph sizes from 5/10 to 5/10/15/20. The bounded indexer workspace follows NSEQ
-and index_kpool=4 automatically. README and runnable examples were updated.
+Historical **text-only, NBT1024** measurements. The maintained C2/C4 profiles
+now enable vision with NBT2048; their current settings and separate validation
+are in the [profile overview](glm-overview.md). These results are not a matched
+performance comparison with the current vision configuration.
 
 ## Configuration at measurement time
 
-At completion on 2026-10-02, container `glm53-flash-c4` was left running on
-port 8080. This report is not a live service-status record; see the
-[current profile overview](glm-overview.md) for maintained settings. Previous
-`glm53-flash-max` was stopped with SIGINT and preserved as a fallback.
-All eight GPUs were checked at 225 W. Image
+Container `glm53-flash-c4`, port 8080, NSEQ=4. All eight GPUs were checked at
+225 W. Image
 `r9700/vllm:glm53-plugin-e97573215`, Quark MXFP4 target with packed W4A4,
 BF16 DFlash2 weights, K4, TP8 for target/drafter, NBT1024,
 FULL_DECODE_ONLY, FP8 E4M3 shared target/draft KV, APC enabled.

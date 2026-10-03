@@ -85,7 +85,7 @@ class Launcher(unittest.TestCase):
 
     @unittest.skipIf(yaml is None, "PyYAML is supplied by the LiteLLM image")
     def test_config_has_only_local_routes_and_no_secret(self):
-        config = yaml.safe_load((ROOT / "proxy/litellm.yaml").read_text())
+        config = yaml.safe_load((ROOT / "proxy/glm.yaml").read_text())
         self.assertEqual(config["general_settings"]["master_key"], "os.environ/LITELLM_MASTER_KEY")
         for model in config["model_list"]:
             params = model["litellm_params"]

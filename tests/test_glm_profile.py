@@ -121,6 +121,23 @@ class Launcher(unittest.TestCase):
         self.assertNotEqual(cache_mount(bf16), cache_mount(fp8))
         self.assertNotEqual(cache_mount(bf16), cache_mount(patched))
 
+    def test_vision_limits_and_text_fallback(self):
+        for count in (2, 4):
+            args = self.launch(f"glm-5.3-flash-c{count}.sh")
+            self.assertNotIn("--language-model-only", args)
+            self.assertEqual(args[args.index("--mm-encoder-attn-backend") + 1], "FLASH_ATTN")
+            self.assertIn("FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE", args)
+            limits = json.loads(args[args.index("--limit-mm-per-prompt") + 1])
+            processor = json.loads(args[args.index("--mm-processor-kwargs") + 1])
+            self.assertEqual(limits, {"image": 100, "video": 0})
+            self.assertEqual(processor["max_image_tokens"], 2048)
+            self.assertEqual(processor["max_pixels"], 2 * 28 * 28 * processor["max_image_tokens"])
+            # GLM's square dummy image reports only 2025 tokens. The scheduler
+            # budget must also cover nonsquare images with the full 2048.
+            self.assertGreaterEqual(int(args[args.index("--max-num-batched-tokens") + 1]),
+                                    processor["max_image_tokens"])
+        self.assertIn("--language-model-only", self.launch("glm-5.3-flash.sh"))
+
     def test_baseline_and_local_model(self):
         args = self.launch("glm-5.3-flash.sh", MODEL="/models/local GLM", MODELS_DIR="/tmp/model store",
                            MTP="3", DRAFT="/models/draft", R9K_PLATFORM="1")

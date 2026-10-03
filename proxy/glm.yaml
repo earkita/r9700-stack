@@ -1,4 +1,5 @@
-# Optional local gateway. Both aliases use the same running vLLM deployment.
+# GLM-only gateway. Both aliases use the same running GLM deployment.
+# Select together with BACKEND_MODEL=glm-5.3-flash after starting the GLM backend.
 model_list:
   - model_name: glm-5.3-flash
     litellm_params:
@@ -13,7 +14,8 @@ model_list:
     model_info:
       supports_reasoning: true
       supports_function_calling: true
-      supports_vision: false
+      supports_vision: true # GLM C2/C4; use false with the text-only fallback.
+      max_input_tokens: 524288 # Client declaration; not a per-session KV reservation.
 
   # Native Anthropic route for harnesses using /v1/messages and count_tokens.
   - model_name: glm-5.3-flash-high
@@ -27,7 +29,8 @@ model_list:
     model_info:
       supports_reasoning: true
       supports_function_calling: true
-      supports_vision: false
+      supports_vision: true
+      max_input_tokens: 524288
       supports_low_reasoning_effort: true
       supports_max_reasoning_effort: true
 
