@@ -40,7 +40,7 @@ exec env \
   TP=8 `# Model rozlozony na 8 GPU; drafter tez TP8 (SPEC_EXTRA).` \
   MAXLEN="$MAXLEN" `# auto (-1): maks. JEDNEGO kontekstu; wejscie + wyjscie, takze thinking.` \
   NSEQ="$NSEQ" `# Domyslnie 4 aktywne zadania; auto nie gwarantuje 4 pelnych kontekstow naraz.` \
-  NBT="${NBT:-1024}" `# Budzet tokenow prefill na krok schedulera.` \
+  NBT="${NBT:-2048}" `# Prefill i minimum cache encodera; 2048 pokrywa pelny limit obrazu.` \
   UTIL=0.90 `# Jawny KVMEM ma pierwszenstwo dla rozmiaru KV.` \
   KVMEM="${KVMEM:-4.125}" `# GiB KV na GPU, wspolne dla wszystkich zadan.` \
   KV_DTYPE=fp8_e4m3 `# Format KV modelu glownego.` \
@@ -58,11 +58,13 @@ exec env \
   CGSIZES="$graphs" `# C1: 5; C2: 5,10; C4: 5,10,15,20.` \
   REASONING_PARSER=glm45 `# Oddzielanie thinking od odpowiedzi.` \
   TOOL_CALL_PARSER=glm47 `# Parsowanie wywolan narzedzi.` \
-  LMONLY=--language-model-only `# Tylko tekst.` \
-  EXTRA='--disable-custom-all-reduce' `# Wylacz custom all-reduce vLLM; APC steruje PREFIX_CACHE.` \
+  LMONLY= `# Tekst + obrazy; fallback glm-5.3-flash.sh pozostaje tekstowy.` \
+  `# Do 100 obrazow w calej historii zadania, bez wideo; do 2048 tokenow na obraz.` \
+  `# max_pixels obejmuje 2 powtorzone klatki: 2 * 28 * 28 * 2048; zgodny budzet profilowania.` \
+  EXTRA='--disable-custom-all-reduce --mm-encoder-attn-backend FLASH_ATTN --limit-mm-per-prompt {"image":100,"video":0} --mm-processor-kwargs {"max_image_tokens":2048,"max_pixels":3211264}' \
   ATTN= CHAT_TEMPLATE= OVERLAYS= WRAP= \
   PROF=0 `# Profiler wylaczony.` \
-  DOCKER_ARGS= \
+  DOCKER_ARGS='-e FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE' `# Vision: Flash Attention Triton RDNA4; omija wadliwa sciezke Torch SDPA.` \
   P2P=1 `# Komunikacja GPU-GPU.` \
   HWQ=1 MWAITX=1 PIDNS=--pid=host \
   R9K_GLM_BASELINE=1 R9K_PLATFORM=1 VLLM_PLUGINS=r9700,r9700_glm \

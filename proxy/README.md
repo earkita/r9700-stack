@@ -1,6 +1,6 @@
 # Optional LiteLLM gateway
 
-An independent, CPU-only Docker service in front of an already running GLM
+An independent, CPU-only Docker service in front of an already running GLM or MiMo
 server. It does not install dependencies into vLLM, restart the model, or change
 GPU/KV allocation. The launcher calls Docker directly, with no profile chain.
 
@@ -42,7 +42,7 @@ LiteLLM **1.103.0** is pinned by image digest. Options use `NAME=value`:
 | `BACKEND_BASE` | `http://127.0.0.1:8080`, root URL without `/v1` |
 | `BACKEND_MODEL` | `glm-5.3-flash`, the backend's served model name |
 | `ENV_FILE` | `secrets/litellm.env` in this checkout |
-| `CONFIG` | YAML file; defaults to `proxy/litellm.yaml`, use `proxy/mimo.yaml` for MiMo |
+| `CONFIG` | YAML file; defaults to `proxy/glm.yaml`, use `proxy/mimo.yaml` for MiMo |
 | `IMG` | Override only when validating a new LiteLLM version |
 | `DRYRUN` | `1` prints the launch command, never credential contents |
 
@@ -52,7 +52,7 @@ stop/remove only the proxy and launch it again:
 
 ```bash
 docker logs --tail 100 r9700-litellm
-docker stop --timeout 60 r9700-litellm
+docker stop --signal SIGTERM --timeout -1 r9700-litellm
 docker rm r9700-litellm
 bash serve/litellm.sh
 ```
@@ -92,29 +92,81 @@ Alternatively, the ready-made Claude Code template is
 adapted from the previous GLM deployment. From this checkout:
 
 ```bash
-set -a
-. ./secrets/litellm.env
-set +a
 claude --settings serve/templates/glm-5.3-flash.settings.local.json
 ```
 
-The template's key helper reads `LITELLM_MASTER_KEY` from the environment;
-no credential or path to the old repository is embedded. It preserves the
+The template's key helper reads `LITELLM_MASTER_KEY` from the environment or
+`secrets/litellm.env` in this checkout. It locates the helper under
+`$HOME/ai/r9700-stack`; set `R9700_STACK_ROOT` for another checkout location.
+No credential or path to the old repository is embedded. It preserves the
 previous `acceptEdits` and `Read`/`Bash` permission rules, routes every model
 alias to `glm-5.3-flash-high`, and sets high effort. Its 524288-token window
 with 90% auto-compaction is a client budget, not a KV reservation or a promise
 of four simultaneous 512K sessions. Check the backend's `/v1/models` limit
 before using it with a smaller serving profile. `DISABLE_PROMPT_CACHING=1`
 disables Claude's provider cache controls; it does not disable vLLM APC.
+GLM C2/C4 also accept images, including Claude Code `Read` image tool results.
+The limit is 100 images across the entire request history, not 100 new images
+per turn. The processor resizes each image to at most 2048 image tokens;
+image tokens and delimiters share the context window with text and output.
+Video is disabled. The text-only fallback cannot accept these image requests.
+The proxy's `supports_vision` metadata must match the active backend.
 For a client on another LAN machine, copy the template and replace its
 `ANTHROPIC_BASE_URL` with `http://SERVER_IP:4000`; provide the key on that
-client via `LITELLM_MASTER_KEY`. The template is not installed into your
+client via `LITELLM_MASTER_KEY` with a local helper checkout, or use
+`apiKeyHelper: "printenv LITELLM_MASTER_KEY"` there. The template is not installed into your
 personal or project `.claude` settings automatically.
 
 There is no proxy queue policy or automatic retry/fallback configured. vLLM
 still schedules requests: C4 admits at most four active sequences, and more
 requests can wait there. Proxy aliases do not reserve context, increase KV
-capacity or persist APC to disk. No unvalidated context limit is advertised.
+capacity or persist APC to disk. Declared context windows are client settings,
+not full-length or aggregate capacity qualifications; see each model's results.
+
+## Comparing GLM and MiMo in Claude Code
+
+Each model has its own proxy configuration and client template:
+
+| Backend served name | Proxy config | Claude settings | Reasoning |
+|---|---|---|---|
+| `glm-5.3-flash` | [`glm.yaml`](glm.yaml) | [`glm-5.3-flash.settings.local.json`](../serve/templates/glm-5.3-flash.settings.local.json) | All roles use GLM `high` |
+| `mimo-v2.6-flash-mopd` | [`mimo.yaml`](mimo.yaml) | [`mimo-v2.6-flash.settings.local.json`](../serve/templates/mimo-v2.6-flash.settings.local.json) | Main roles use thinking; Haiku/Small Fast uses fast |
+
+`glm.yaml` replaces the former generic `litellm.yaml`; update any explicit
+`CONFIG` path in local launch commands. The launcher still defaults to GLM.
+The provided C2/C4 GPU profiles share GPUs 0–7 and port 8080: switch models
+sequentially. Changing the Claude template alone does not switch GPU weights.
+Only advertise the aliases of the active backend.
+
+When intentionally switching, finish active requests, gracefully stop the
+current GPU container with `docker stop --signal SIGINT --timeout -1 NAME`,
+and launch the desired model profile on the freed GPUs. Profiles use REPLACE=0;
+an existing stopped container with the same name must be removed before a fresh
+launch. Check `http://127.0.0.1:8080/v1/models` for the expected served name.
+Then stop/remove the proxy as above and run **one** matching command:
+
+```bash
+# GLM backend already ready on 8080:
+bash serve/litellm.sh HOST=0.0.0.0 CONFIG="$PWD/proxy/glm.yaml" BACKEND_MODEL=glm-5.3-flash
+claude --settings "$PWD/serve/templates/glm-5.3-flash.settings.local.json"
+
+# Alternative, MiMo backend already ready on 8080:
+bash serve/litellm.sh HOST=0.0.0.0 CONFIG="$PWD/proxy/mimo.yaml" BACKEND_MODEL=mimo-v2.6-flash-mopd
+claude --settings "$PWD/serve/templates/mimo-v2.6-flash.settings.local.json"
+```
+
+The same local proxy key and port 4000 work for both. GPU launchers are
+`serve/glm-5.3-flash-c2.sh` / `-c4.sh` and
+`serve/mimo-v2.6-flash-c2.sh` / `-c4.sh`. Recreate older containers through these
+profiles when their saved mounts point to retired cache/config paths.
+
+For a manual task comparison, start fresh conversations from the same clean
+project state, use the same prompt, tools, context budget and output budget,
+and record the model and completion/tool errors. The templates retain their
+model-specific reasoning behavior. Haiku/Small Fast differs between templates;
+use main-role tasks for a narrower comparison or report helper usage explicitly.
+Both main templates declare 512K with compaction at 90%; this does not qualify
+512K sessions on both models or promise four full windows concurrently.
 
 ## Local compatibility and checks
 
@@ -138,6 +190,20 @@ It is a bounded integration check, not a model-quality score or throughput
 benchmark. Measure serving performance directly against vLLM; label any proxy
 comparison separately and hold request/cache settings constant.
 
+For GLM C4 vision, run the bounded image contract check (requires Pillow):
+
+```bash
+LITELLM_MASTER_KEY="$(python3 serve/claude-litellm-key.py)" \
+  python3 bench/glm_vision_smoke.py --out bench/results/glm-vision-UNIQUE
+```
+
+This saves synthetic OCR fixtures and every API attempt, checks direct OpenAI,
+proxied OpenAI/Anthropic streaming, local image token counts, a Claude-style
+`Read` image result, four concurrent requests, 100 small images and rejection
+of the 101st image. The 100-image gate does not qualify 100 full-resolution
+images or four simultaneous 100-image sessions.
+It is not a general visual-quality benchmark or a long-context qualification.
+
 CPU configuration/transport tests (the same pinned image as the launcher):
 
 ```bash
@@ -150,7 +216,7 @@ docker run --rm --network none -e LITELLM_LOCAL_MODEL_COST_MAP=True \
 Upstream references: [vLLM provider](https://docs.litellm.ai/docs/providers/vllm),
 [Anthropic Messages](https://docs.litellm.ai/docs/anthropic_unified).
 
-## Bounded validation (2026-10-03)
+## Initial text-only gateway validation (2026-10-03)
 
 On the existing GLM C4 server: all 12 live contract checks and all six CPU
 gates passed. Token counts matched the backend for both plain and tool-bearing
@@ -169,7 +235,8 @@ these truncated generations do not validate completed-answer quality.
 
 Local evidence is under `bench/results/litellm-integration-20261003/`, excluded
 from Git: full transcripts, frozen comparison protocol, every timing attempt,
-transport captures, source hashes and final service metrics. The proxy remains
-running; the GPU server was not restarted during integration.
+transport captures, source hashes and final service metrics. The GPU server
+was not restarted during that integration test. These are historical results;
+check `/v1/models` for the currently served backend.
 
 MiMo uses its own aliases and template; see [the MiMo profile](../notes/mimo.md).
