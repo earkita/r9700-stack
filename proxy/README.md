@@ -42,6 +42,7 @@ LiteLLM **1.103.0** is pinned by image digest. Options use `NAME=value`:
 | `BACKEND_BASE` | `http://127.0.0.1:8080`, root URL without `/v1` |
 | `BACKEND_MODEL` | `glm-5.3-flash`, the backend's served model name |
 | `ENV_FILE` | `secrets/litellm.env` in this checkout |
+| `CONFIG` | YAML file; defaults to `proxy/litellm.yaml`, use `proxy/mimo.yaml` for MiMo |
 | `IMG` | Override only when validating a new LiteLLM version |
 | `DRYRUN` | `1` prints the launch command, never credential contents |
 
@@ -170,3 +171,5 @@ Local evidence is under `bench/results/litellm-integration-20261003/`, excluded
 from Git: full transcripts, frozen comparison protocol, every timing attempt,
 transport captures, source hashes and final service metrics. The proxy remains
 running; the GPU server was not restarted during integration.
+
+MiMo uses its own aliases and template; see [the MiMo profile](../notes/mimo.md).

@@ -51,6 +51,9 @@ def main():
     ap.add_argument("--base", default="http://127.0.0.1:4000")
     ap.add_argument("--backend", default="http://127.0.0.1:8080")
     ap.add_argument("--backend-model", default="glm-5.3-flash")
+    ap.add_argument("--openai-model", default="glm-5.3-flash")
+    ap.add_argument("--anthropic-model", default="glm-5.3-flash-high")
+    ap.add_argument("--family", choices=["glm", "mimo"], default="glm")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
     key = os.environ["LITELLM_MASTER_KEY"]
@@ -99,12 +102,16 @@ def main():
     passed("authentication required")
 
     prompt = "What is 19 + 4? Reply with only the number."
-    common = dict(model="glm-5.3-flash", temperature=0, max_tokens=1024,
+    common = dict(model=args.openai_model, temperature=0, max_tokens=1024,
                   messages=[dict(role="user", content=prompt)],
-                  chat_template_kwargs=dict(reasoning_effort="high"))
+                  chat_template_kwargs=(dict(enable_thinking=False) if args.family == "mimo" else dict(reasoning_effort="high")))
     tool = dict(type="function", function=dict(name="lookup_file", description="Read a file",
                 parameters=dict(type="object", properties=dict(path=dict(type="string")),
                                 required=["path"], additionalProperties=False)))
+    tool_prompt = ("Use lookup_file to read README.md, then report the status code recorded in that file."
+                   if args.family == "mimo" else "Use lookup_file to read README.md.")
+    tool_result = ("README.md\nStatus code: LOCAL_OK" if args.family == "mimo"
+                   else "The file contains the code LOCAL_OK. Report that code.")
     for stream in (False, True):
         body = common | dict(stream=stream)
         if stream:
@@ -115,7 +122,7 @@ def main():
         assert re.fullmatch(r"23\.?", text.strip()) and finish == "stop", res
         assert res["usage"]["completion_tokens"] > 0
         passed(f"OpenAI answer, stream={stream}")
-        body.update(messages=[dict(role="user", content="Use lookup_file to read README.md.")],
+        body.update(messages=[dict(role="user", content=tool_prompt)],
                     tools=[tool], tool_choice="auto", max_tokens=4096)
         res = call(f"openai-tool-{stream}", "/v1/chat/completions", body)
         finish = res["finish_reason"] if stream else res["choices"][0]["finish_reason"]
@@ -126,14 +133,14 @@ def main():
         if not stream:
             assistant = res["choices"][0]["message"]
             body.update(messages=body["messages"] + [assistant, dict(role="tool",
-                        tool_call_id=calls[0]["id"], content="The file contains the code LOCAL_OK. Report that code.")])
+                        tool_call_id=calls[0]["id"], content=tool_result)])
             follow = call("openai-tool-result", "/v1/chat/completions", body)
             assert "LOCAL_OK" in follow["choices"][0]["message"]["content"]
             assert follow["choices"][0]["finish_reason"] == "stop"
             passed("OpenAI tool round trip")
         passed(f"OpenAI tool call, stream={stream}")
 
-    common = dict(model="glm-5.3-flash-high", max_tokens=4096, temperature=1,
+    common = dict(model=args.anthropic_model, max_tokens=4096, temperature=1,
                   thinking=dict(type="enabled", budget_tokens=2048),
                   messages=[dict(role="user", content="Find the smallest positive integer with remainders "
                                  "2 modulo 3, 3 modulo 5, and 2 modulo 7. Reason carefully, then answer.")])
@@ -146,7 +153,7 @@ def main():
         if stream:
             assert res["stream_completed"]
         passed(f"Anthropic thinking/answer, stream={stream}")
-        body = common | dict(stream=stream, messages=[dict(role="user", content="Use lookup_file to read README.md.")],
+        body = common | dict(stream=stream, messages=[dict(role="user", content=tool_prompt)],
                              tools=[dict(name="lookup_file", description="Read a file", input_schema=tool["function"]["parameters"])])
         res = call(f"anthropic-tool-{stream}", "/v1/messages", body)
         calls = [b for b in res["content"] if b["type"] == "tool_use"]
@@ -157,14 +164,14 @@ def main():
         # Echo the actual thinking/signature/tool blocks, as a harness does.
         body.update(stream=False, messages=body["messages"] + [dict(role="assistant", content=res["content"]),
             dict(role="user", content=[dict(type="tool_result", tool_use_id=calls[0]["id"],
-                 content="The file contains the code LOCAL_OK. Report that code.")])])
+                 content=tool_result)])])
         follow = call(f"anthropic-tool-result-{stream}", "/v1/messages", body)
         assert follow["stop_reason"] == "end_turn" and any(
             b["type"] == "text" and "LOCAL_OK" in b["text"] for b in follow["content"]), follow
         passed(f"Anthropic tool round trip, streamed call={stream}")
 
     for tools in ([], [dict(name="lookup_file", description="Read a file", input_schema=tool["function"]["parameters"])]):
-        body = dict(model="glm-5.3-flash-high", messages=common["messages"], tools=tools)
+        body = dict(model=args.anthropic_model, messages=common["messages"], tools=tools)
         proxied = call("count-proxy", "/v1/messages/count_tokens", body)
         direct = call("count-direct", "/v1/messages/count_tokens", body | dict(model=args.backend_model), direct=True)
         assert proxied["input_tokens"] == direct["input_tokens"] > 0, (proxied, direct)

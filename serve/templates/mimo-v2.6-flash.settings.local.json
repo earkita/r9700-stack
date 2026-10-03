@@ -1,0 +1,30 @@
+{
+  "apiKeyHelper": "printenv LITELLM_MASTER_KEY",
+  "totalTokensReminder": "off",
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Read",
+      "Bash"
+    ]
+  },
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:4000",
+    "ANTHROPIC_MODEL": "mimo-v2.6-flash",
+    "ANTHROPIC_SMALL_FAST_MODEL": "mimo-v2.6-flash-fast",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "mimo-v2.6-flash-fast",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "mimo-v2.6-flash",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "mimo-v2.6-flash",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "mimo-v2.6-flash",
+    "DISABLE_PROMPT_CACHING": "1",
+    "CLAUDE_CODE_TODO_REMINDER_MODE": "off",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "CLAUDE_CODE_AUTO_MODE_SERVER": "0",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "131072",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "131072",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "90"
+  },
+  "model": "mimo-v2.6-flash",
+  "effortLevel": "high"
+}
