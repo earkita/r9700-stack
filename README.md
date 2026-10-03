@@ -1,5 +1,7 @@
 # r9700-stack
 
+Optional MiMo deployment: [MiMo-V2.6-Flash-MOPD on 8× R9700](notes/mimo.md).
+
 Optional local API gateway: [LiteLLM setup](proxy/README.md) for OpenAI and
 Anthropic-compatible clients, running separately from the GPU server.
 
