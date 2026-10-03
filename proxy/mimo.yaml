@@ -14,7 +14,7 @@ model_list:
       supports_reasoning: true
       supports_function_calling: true
       supports_vision: false
-      max_input_tokens: 131072
+      max_input_tokens: 524288 # Main alias; metadata, not a shared-KV reservation.
   - model_name: mimo-v2.6-flash-fast
     litellm_params:
       model: os.environ/LITELLM_ANTHROPIC_MODEL

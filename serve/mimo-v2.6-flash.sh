@@ -1,6 +1,8 @@
 #!/bin/bash
 # MiMo-V2.6-Flash-MOPD: TP8, text/tools, C2, BF16 KV and DFlash K7.
 # SPEC=0 disables DFlash for the matched control. MAXLEN includes input + output.
+# KVMEM=<GiB per GPU> fixes the shared KV budget; KVMEM= restores automatic sizing.
+# A fixed KV budget overrides UTIL for cache sizing, independently of MAXLEN/NSEQ.
 set -e
 serve_dir=$(dirname "$(realpath "$0")")
 SPEC=${SPEC:-7}
