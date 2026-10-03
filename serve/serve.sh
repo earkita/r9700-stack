@@ -5,6 +5,7 @@
 # Knobs: MODEL (path inside the container, /models/...), OFFLOAD_GB (per rank, 0 = none), MAXLEN, EAGER=1, MTP=n, DRAFT=/models/x SPEC=n, ATTN=, DRAFT_ATTN=, KVMEM=GiB, KV_DTYPE=, DRAFT_KV_DTYPE=, CHAT_TEMPLATE=, SPEC_EXTRA=, UTIL, NBT, NSEQ, P2P=1, HWQ=, MWAITX=, CGMODE=, OVERLAYS=..., EXTRA="...",
 #   GPUS=0,1 (HIP ordinals), TP=2 (4 = our N-rank P2P all-reduce <= 512 KB, RCCL above; R9K_ARN=0 for RCCL only), PORT=8080, NAME=vllmstock (two servers
 #   side by side need distinct GPUS/PORT/NAME), DOCKER_ARGS="-e NCCL_DEBUG=INFO ..." (extra docker run args),
+#   FP8_CONFIG_DIR=/host/path (optional block-FP8 launch configs, pinned Python 3.12 image).
 # plus every R9K_* plugin knob (forwarded). WRAP=rocprof / PROF=1 for profiling.
 IMG=${IMG:-r9700/vllm:dev}
 REPO=${REPO:-$HOME/r9700-build/repo}
@@ -12,6 +13,17 @@ REPO=${REPO:-$HOME/r9700-build/repo}
 # on this box -> no RCCL P2P -> SHM transport, whose proxy round-trips cost ~1-2 ms per all-reduce inside HIP graphs
 # (130 ms/step with 99 all-reduces). tcclaviger's image runs =0.
 MNT=(-v $REPO:/opt/r9700)
+# Optional block-FP8 launch configurations for the pinned Python 3.12 image.
+# Mount individual files so the image's other tuned shapes remain available.
+FP8_CONFIG_HASH=
+if [ -n "${FP8_CONFIG_DIR:-}" ]; then
+  fp8_configs=("$FP8_CONFIG_DIR"/N=*,dtype=fp8_w8a8,block_shape=*.json)
+  [ -f "${fp8_configs[0]}" ] || { echo "No block-FP8 configs in $FP8_CONFIG_DIR" >&2; exit 1; }
+  for f in "${fp8_configs[@]}"; do
+    MNT+=(-v "$(realpath "$f"):/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/utils/configs/$(basename "$f"):ro")
+  done
+  FP8_CONFIG_HASH=$(cat "${fp8_configs[@]}" | sha256sum | cut -c1-16)
+fi
 # Host-topology overlays (NOT the product; binary replacements for specific broken hosts). OVERLAYS=a,b sources
 # overlay/<name>/overlay.sh, which appends to MNT. VM100 on the .100 PLX box needs OVERLAYS=emulated-switch.
 for o in ${OVERLAYS//,/ }; do
@@ -30,7 +42,7 @@ fi
 # with different weight layouts fails at runtime ("wrong number of dimensions").
 # The plugin's own source is part of the key too: a code change can change weight layouts under the same knobs.
 PSRC=$(find $REPO/r9700_vllm -name '*.py' -print0 | sort -z | xargs -0 cat | md5sum | cut -c1-8)
-CKEY=$( (env | grep -E '^(R9K|VLLM)_' | sort; echo "${MTP-3}${MODEL:+ $MODEL}${DRAFT:+ $DRAFT $SPEC $DRAFT_ATTN $SPEC_EXTRA $DRAFT_KV_DTYPE}${ATTN:+ $ATTN} $KV_DTYPE $IMG $PSRC") | md5sum | cut -c1-10)
+CKEY=$( (env | grep -E '^(R9K|VLLM)_' | sort; echo "${MTP-3}${MODEL:+ $MODEL}${DRAFT:+ $DRAFT $SPEC $DRAFT_ATTN $SPEC_EXTRA $DRAFT_KV_DTYPE}${ATTN:+ $ATTN} $KV_DTYPE $IMG $PSRC${FP8_CONFIG_HASH:+ $FP8_CONFIG_HASH}") | md5sum | cut -c1-10)
 # Keep generated caches inside the mounted checkout, excluded from Git and image builds.
 VLLM_CACHE_DIR="$REPO/.runtime/cache/vllm/$CKEY"
 TRITON_CACHE_DIR="$REPO/.runtime/cache/triton"

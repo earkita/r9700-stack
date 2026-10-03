@@ -1,9 +1,16 @@
 # r9700-stack
 
-Optional MiMo deployment: [MiMo-V2.6-Flash-MOPD on 8× R9700](notes/mimo.md).
+Additional model deployments on 8× R9700:
+[GLM-5.3-Flash](notes/glm-overview.md) and
+[MiMo-V2.6-Flash-MOPD](notes/mimo.md).
 
 Optional local API gateway: [LiteLLM setup](proxy/README.md) for OpenAI and
 Anthropic-compatible clients, running separately from the GPU server.
+
+The shared `serve/serve.sh` stores generated caches inside the mounted checkout:
+`.runtime/cache/vllm/<configuration-hash>/` and `.runtime/cache/triton/`.
+The `.runtime/` directory is excluded from Git and Docker build contexts.
+Benchmark transcripts and generated fixtures belong in ignored `bench/results/`.
 
 Tuned GPU kernels and a vLLM plugin that make **Qwen3.8** run fast on **AMD Radeon AI PRO R9700** cards
 (gfx1201 / RDNA4).
@@ -219,34 +226,23 @@ restart once (the launch that compiles gets a smaller KV pool).
 
 For GLM, start with the [current profiles, launch instructions and capacity limits](notes/glm-overview.md).
 
-**GLM fallback:** `serve/glm-5.3-flash.sh` is a conservative TP8 / 64k
-Quark MXFP4 baseline candidate, with upstream model/quantization paths and no
-speculative decoding or Qwen fusions. It is not yet a validated model target;
-an optional `R9K_GLM_MOE=w4a4 BUILD_KERNELS=1` C1 candidate preserves Quark
-activation quantization while converting weight fragments inside the grouped
-WMMA kernel.
-For sampling, thinking budgets and cache comparisons, follow the
-[GLM testing guidelines](notes/glm-testing.md).
+**GLM profiles:** `serve/glm-5.3-flash-c2.sh` and `serve/glm-5.3-flash-c4.sh`
+call `serve/serve.sh` directly. They use TP8, DFlash K4, shared FP8 KV/APC,
+NBT2048 and 4.125 GiB KV per GPU, with two/four active requests. Vision allows
+100 images across each request's entire history, up to 2048 tokens per image.
+`MAXLEN=auto` sizes the maximum **single-request** context; active requests
+share the cache. The current C4 vision start reports 700416 tokens; Claude
+Code's template declares 524288. These are limits, not full-context quality
+qualifications. Preview with `DRYRUN=1`.
 
-**GLM C2/C4 profiles:** `serve/glm-5.3-flash-c2.sh` (renamed from
-`glm-5.3-flash-max.sh`) and `serve/glm-5.3-flash-c4.sh` each invoke the shared
-`serve/serve.sh` directly, without chaining through other GLM profiles.
-Docker, mounts, compile caches and checkpoint preflight stay in the shared
-launcher. The GLM profile carries the
-latest DFlash K4/shared FP8 KV/APC configuration, with TP8, NSEQ=2 or 4,
-NBT1024 and 4.125 GiB KV per GPU. `MAXLEN=auto` asks vLLM to fit the maximum
-**single-request** context into this KV budget; it does not guarantee two or four
-full-length requests fit simultaneously. The resolved length and long-context
-correctness still require runtime qualification. Preview with `DRYRUN=1`;
-use `MAXLEN=262144` for the qualified C2 context, `MAXLEN=131072` for C4,
-or `NSEQ=1` for one active sequence. Graph sizes follow NSEQ: 5/10 for C2,
-5/10/15/20 for C4; the bounded indexer workspace also follows NSEQ.
-The scripts require local checkpoints, a built plugin
-checkout/library and the pinned image; it never stops an existing service.
-These two profiles and `glm-5.3-flash.sh` are the only GLM launchers.
-Older DFlash wrapper profiles were removed.
-For the C4 profile's measured C1/C2/C4 decode and separate correctness results,
-see [the profile validation](notes/glm-c4-profile.md).
+`serve/glm-5.3-flash.sh` remains the conservative text-only TP8 / 64K fallback,
+without speculation. All profiles require their corresponding checkpoints,
+image and plugin library; they do not stop an existing server.
+See [current settings and validation](notes/glm-overview.md), the
+[historical text-only C1/C2/C4 measurements](notes/glm-c4-profile.md) and
+[testing guidelines](notes/glm-testing.md). Dense FP8 tuning is opt-in through
+`FP8_CONFIG_DIR="$PWD/tuning/configs/glm"`; it has not established a repeatable
+whole-model speedup.
 
 `R9K_GLM_MOE=w4a16` enables an experimental BF16-activation variant on the
 same MXFP4 weights. Bounded checks pass, but C1/C2 measurements show no

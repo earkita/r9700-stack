@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import tempfile
 import unittest
 
 from r9700_vllm.models.glm5_next import inspect_checkpoint, is_glm5_next
@@ -137,6 +138,32 @@ class Launcher(unittest.TestCase):
             self.assertGreaterEqual(int(args[args.index("--max-num-batched-tokens") + 1]),
                                     processor["max_image_tokens"])
         self.assertIn("--language-model-only", self.launch("glm-5.3-flash.sh"))
+
+    def test_optional_fp8_configs_are_individual_readonly_mounts(self):
+        plain = self.launch("glm-5.3-flash-c4.sh", "FP8_CONFIG_DIR=")
+        tuned = self.launch("glm-5.3-flash-c4.sh",
+                            f"FP8_CONFIG_DIR={ROOT / 'tuning/configs/glm'}")
+        mounts = [x for x in tuned if "/quantization/utils/configs/" in x]
+        self.assertEqual(len(mounts), 2)
+        self.assertTrue(all(x.endswith(".json:ro") for x in mounts))
+        self.assertFalse(any("/quantization/utils/configs/" in x for x in plain))
+        # Tuning must not change any model/scheduler/sampling arguments.
+        image = "r9700/vllm:glm53-plugin-e97573215"
+        self.assertEqual(plain[plain.index(image):], tuned[tuned.index(image):])
+
+    def test_fp8_config_content_invalidates_compile_cache(self):
+        def cache_mount(args):
+            return next(x for x in args if x.endswith(":/root/.cache/vllm"))
+        with tempfile.TemporaryDirectory(prefix="fp8 configs ") as folder:
+            source = next((ROOT / "tuning/configs/glm").glob("N=*.json"))
+            config = Path(folder) / source.name
+            config.write_text(source.read_text())
+            before = self.launch("glm-5.3-flash-c4.sh", f"FP8_CONFIG_DIR={folder}")
+            data = json.loads(config.read_text())
+            data["1"]["num_warps"] = 4
+            config.write_text(json.dumps(data))
+            after = self.launch("glm-5.3-flash-c4.sh", f"FP8_CONFIG_DIR={folder}")
+            self.assertNotEqual(cache_mount(before), cache_mount(after))
 
     def test_baseline_and_local_model(self):
         args = self.launch("glm-5.3-flash.sh", MODEL="/models/local GLM", MODELS_DIR="/tmp/model store",
