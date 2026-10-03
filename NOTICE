@@ -122,3 +122,11 @@ See CREDITS.md for the third-party components, and notes/independence.md for the
 provenance of the kernels -- what was replaced with original work, what each
 piece is measurably worth, and which constants are generated from published
 format specifications rather than authored.
+
+MiMo DiffKV adaptations -- Apache-2.0
+    r9700_vllm/attn/mimo_diffkv.py
+    r9700_vllm/attn/mimo_diffkv_ops.py
+    Copyright contributors to the vLLM project. Original SPDX headers retained.
+    Derived from vLLM dee37d891 and the local my-llm MiMo ROCm port (patch
+    0004-port-diffbot-diffkv-fp8-and-verify-to-rocm.patch); this copy removes
+    FP8 KV support and isolates BF16 prefill/verification in the opt-in plugin.

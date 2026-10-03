@@ -85,7 +85,8 @@ def main():
         cap = (ar.max1 if mode == 1 else ar.max_bytes)
         for dtype in (torch.bfloat16, torch.float16, torch.float32):
             esz = torch.tensor([], dtype=dtype).element_size()
-            for n in (8, 24, hidden, hidden * 4 - 8, hidden * 16, hidden * 64, hidden * 200 + 8, cap // esz):
+            for n in (8, 24, hidden, hidden * 4 - 8, hidden * 8, hidden * 16,
+                      hidden * 32, hidden * 64, hidden * 200 + 8, cap // esz):
                 if n * esz % 16 or n * esz > cap:
                     continue
                 for nb in (None, 1, 3, 16):

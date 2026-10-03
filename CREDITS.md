@@ -35,3 +35,12 @@ Provenance of the kernels themselves -- including which constants are generated 
 specifications rather than authored, and how each replacement was written -- is recorded in
 [notes/independence.md](notes/independence.md). `tools/gen_kmag.py --check` regenerates the folded-unpack table
 from the OCP e2m1 and e4m3 specifications and verifies it against the checked-in copy.
+
+### MiMo BF16 DiffKV and native MXFP4 adapter
+
+The MiMo backend/ops retain vLLM's Apache-2.0 headers. They adapt vLLM
+`dee37d89115db4c94a820a79a78a7828e141c910` and the local `my-llm` recipe
+`vllm_mimov26r9700_v0.1` patches `0003-route-native-mxfp4-moe-to-r9700.patch`
+and `0004-port-diffbot-diffkv-fp8-and-verify-to-rocm.patch`. This integration
+uses a unique quantization name, BF16-only KV and pinned MiMo-scoped adapters;
+it does not copy the CUDA Diffbot kernels or replace the Xiaomi checkpoint.

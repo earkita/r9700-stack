@@ -13,6 +13,7 @@ requires-python = ">=3.10"
 [project.entry-points."vllm.general_plugins"]
 r9700 = "r9700_vllm:register"
 r9700_glm = "r9700_vllm:register_glm"
+r9700_mimo = "r9700_vllm:register_mimo"
 
 [project.entry-points."vllm.platform_plugins"]
 r9700 = "r9700_vllm.platform:detect"
