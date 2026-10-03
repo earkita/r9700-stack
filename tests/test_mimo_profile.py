@@ -71,7 +71,10 @@ class MiMoProfile(unittest.TestCase):
         obj = json.loads(
             (ROOT / "serve/templates/mimo-v2.6-flash.settings.local.json").read_text()
         )
-        self.assertEqual(obj["apiKeyHelper"], "printenv LITELLM_MASTER_KEY")
+        self.assertEqual(
+            obj["apiKeyHelper"],
+            'python3 "${R9700_STACK_ROOT:-$HOME/ai/r9700-stack}/serve/claude-litellm-key.py"',
+        )
         self.assertEqual(obj["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "131072")
         self.assertEqual(
             obj["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "mimo-v2.6-flash-fast"
