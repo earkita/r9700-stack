@@ -1,0 +1,45 @@
+# Optional local gateway. Both aliases use the same running vLLM deployment.
+model_list:
+  - model_name: glm-5.3-flash
+    litellm_params:
+      model: os.environ/LITELLM_OPENAI_MODEL
+      api_base: os.environ/LITELLM_OPENAI_BASE
+      api_key: os.environ/LITELLM_BACKEND_KEY
+      temperature: 1.0
+      top_p: 0.95
+      extra_body:
+        chat_template_kwargs:
+          reasoning_effort: high
+    model_info:
+      supports_reasoning: true
+      supports_function_calling: true
+      supports_vision: false
+
+  # Native Anthropic route for harnesses using /v1/messages and count_tokens.
+  - model_name: glm-5.3-flash-high
+    litellm_params:
+      model: os.environ/LITELLM_ANTHROPIC_MODEL
+      api_base: os.environ/LITELLM_BACKEND_BASE
+      api_key: os.environ/LITELLM_BACKEND_KEY
+      reasoning_effort: high
+      temperature: 1.0
+      top_p: 0.95
+    model_info:
+      supports_reasoning: true
+      supports_function_calling: true
+      supports_vision: false
+      supports_low_reasoning_effort: true
+      supports_max_reasoning_effort: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+router_settings:
+  num_retries: 0
+  timeout: 1800
+
+litellm_settings:
+  drop_params: false
+  telemetry: false
+  callbacks:
+    - litellm_hooks.local_backend

@@ -1,5 +1,8 @@
 # r9700-stack
 
+Optional local API gateway: [LiteLLM setup](proxy/README.md) for OpenAI and
+Anthropic-compatible clients, running separately from the GPU server.
+
 Tuned GPU kernels and a vLLM plugin that make **Qwen3.8** run fast on **AMD Radeon AI PRO R9700** cards
 (gfx1201 / RDNA4).
 
