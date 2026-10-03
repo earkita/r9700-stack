@@ -78,3 +78,10 @@ def register() -> None:
             done.append("patch:mtp_allowlist")
     plat = type(current_platform).__name__
     log.info("r9700_vllm %s registered: %s (platform %s)", __version__, ", ".join(done) or "nothing", plat)
+
+
+def register_mimo() -> None:
+    """Opt-in, pinned MiMo adapters, isolated from GLM and Qwen."""
+    if os.environ.get("R9K_MIMO") == "1":
+        from .compat.mimo import register
+        register()

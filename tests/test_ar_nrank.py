@@ -85,7 +85,8 @@ def main():
         cap = (ar.max1 if mode == 1 else ar.max_bytes)
         for dtype in (torch.bfloat16, torch.float16, torch.float32):
             esz = torch.tensor([], dtype=dtype).element_size()
-            for n in (8, 24, hidden, hidden * 4 - 8, hidden * 16, hidden * 64, hidden * 200 + 8, cap // esz):
+            for n in (8, 24, hidden, hidden * 4 - 8, hidden * 8, hidden * 16,
+                      hidden * 32, hidden * 64, hidden * 200 + 8, cap // esz):
                 if n * esz % 16 or n * esz > cap:
                     continue
                 for nb in (None, 1, 3, 16):
@@ -94,7 +95,8 @@ def main():
                           ar.all_reduce(inp(rank, it, n, dtype, dev), nb=nb, mode=mode),
                           ref(world, it, n, dtype, dev))
     # back-to-back calls with no host sync in between (the double buffer is what keeps them apart)
-    for mode, n in ((1, min(hidden * 16, ar.max1 // 2)), (2, hidden * 64)):
+    for mode, n in ((1, min(hidden * 16, ar.max1 // 2)),
+                    (2, min(hidden * 64, ar.max_bytes // 2))):
         xs = [inp(rank, 5000 + i, n, torch.bfloat16, dev) for i in range(40)]
         outs = [ar.all_reduce(x, mode=mode) for x in xs]
         for i, o in enumerate(outs):
