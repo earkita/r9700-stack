@@ -59,6 +59,15 @@ class Launcher(unittest.TestCase):
             self.assertFalse(any(a in args for a in ("--privileged", "--device", "--gpus")))
             self.assertNotIn("LITELLM_BACKEND_KEY=EMPTY", args)  # must honor the file's backend key
 
+    def test_mimo_config_mount(self):
+        output = subprocess.check_output(
+            ['bash', str(ROOT/'serve/litellm.sh'), 'DRYRUN=1',
+             f'CONFIG={ROOT}/proxy/mimo.yaml', 'BACKEND_MODEL=mimo-v2.6-flash-mopd'], text=True)
+        args = shlex.split(output)
+        self.assertIn(str(ROOT/'proxy/mimo.yaml')+':/opt/r9700-config.yaml:ro', args)
+        self.assertIn('LITELLM_OPENAI_MODEL=hosted_vllm/mimo-v2.6-flash-mopd', args)
+        self.assertEqual(args[args.index('--config')+1], '/opt/r9700-config.yaml')
+
     def test_unknown_option_rejected(self):
         r = subprocess.run(["bash", str(ROOT / "serve/litellm.sh"), "UNSUPPORTED=secret"],
                            capture_output=True, text=True)

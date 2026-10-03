@@ -1,0 +1,42 @@
+# MiMo-only aliases for the active MiMo backend; do not advertise inactive GLM.
+model_list:
+  - model_name: mimo-v2.6-flash
+    litellm_params:
+      model: os.environ/LITELLM_ANTHROPIC_MODEL
+      api_base: os.environ/LITELLM_BACKEND_BASE
+      api_key: os.environ/LITELLM_BACKEND_KEY
+      temperature: 1.0
+      top_p: 0.95
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: true
+    model_info:
+      supports_reasoning: true
+      supports_function_calling: true
+      supports_vision: false
+      max_input_tokens: 131072
+  - model_name: mimo-v2.6-flash-fast
+    litellm_params:
+      model: os.environ/LITELLM_ANTHROPIC_MODEL
+      api_base: os.environ/LITELLM_BACKEND_BASE
+      api_key: os.environ/LITELLM_BACKEND_KEY
+      temperature: 1.0
+      top_p: 0.95
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
+    model_info:
+      supports_reasoning: false
+      supports_function_calling: true
+      supports_vision: false
+      max_input_tokens: 131072
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+router_settings:
+  num_retries: 0
+  timeout: 1800
+litellm_settings:
+  drop_params: false
+  telemetry: false
+  callbacks:
+    - mimo_hooks.local_backend

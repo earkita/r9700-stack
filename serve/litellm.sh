@@ -1,10 +1,10 @@
 #!/bin/bash
-# Optional CPU-only gateway for an already running GLM vLLM server (Linux).
+# Optional CPU-only gateway for an already running vLLM server (Linux).
 # Usage: bash serve/litellm.sh [NAME=value ...]; DRYRUN=1 prints no secrets.
 set -euo pipefail
 for arg in "$@"; do
   case "$arg" in
-    NAME=*|IMG=*|HOST=*|PORT=*|BACKEND_BASE=*|BACKEND_MODEL=*|ENV_FILE=*|DRYRUN=*) export "$arg" ;;
+    NAME=*|IMG=*|HOST=*|PORT=*|BACKEND_BASE=*|BACKEND_MODEL=*|ENV_FILE=*|CONFIG=*|DRYRUN=*) export "$arg" ;;
     *) echo "Unsupported option: ${arg%%=*}" >&2; exit 2 ;;
   esac
 done
@@ -46,6 +46,8 @@ if not sys.argv[3].isdigit() or not 1 <= int(sys.argv[3]) <= 65535:
     raise SystemExit('PORT must be between 1 and 65535.')
 PY
 fi
+CONFIG=${CONFIG:-$ROOT/proxy/litellm.yaml}
+[[ -f "$CONFIG" ]] || { echo "Missing proxy CONFIG" >&2; exit 2; }
 CMD=(docker run -d --name "$NAME" --restart unless-stopped --network host
   --env-file "$ENV_FILE"
   -e "LITELLM_BACKEND_BASE=$BACKEND_BASE"
@@ -56,7 +58,8 @@ CMD=(docker run -d --name "$NAME" --restart unless-stopped --network host
   -e LITELLM_LOCAL_MODEL_COST_MAP=True
   -e DO_NOT_TRACK=true
   -v "$ROOT/proxy:/opt/r9700-proxy:ro"
-  "$IMG" --config /opt/r9700-proxy/litellm.yaml --host "$HOST" --port "$PORT")
+  -v "$(realpath "$CONFIG"):/opt/r9700-config.yaml:ro"
+  "$IMG" --config /opt/r9700-config.yaml --host "$HOST" --port "$PORT")
 if [[ ${DRYRUN:-0} == 1 ]]; then
   printf '%q ' "${CMD[@]}"; printf '\n'
 else
