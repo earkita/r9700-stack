@@ -1,8 +1,16 @@
-# DeepSeek V4.1 Flash: stage 0 audit
+# DeepSeek V4.1 Flash: audit and correctness candidate
 
 Status (2026-10-04): **not qualified to serve on gfx1201**. No model load,
 GPU kernel test, service replacement or throughput benchmark has been performed.
-GLM remains running. This commit adds only a CPU audit and the implementation plan.
+GLM remains running. Stage-1 prerequisites are being prepared separately.
+
+Selected DeepSeek build (approved 2026-10-04):
+`vllm/vllm-openai-rocm:nightly-rocm100-18f8f96025b556071eb627076f94df560fbd3a22`,
+digest `sha256:ccf5ae13df46441de7945890fa93ffd869aadbd2987ebd01dd918cfaf6f34b49`.
+Registry publication: 2026-10-04 05:41 UTC. This revision contains #57071 and
+637 commits after our existing pin. Use the common Dockerfile's `BASE` argument
+for a separate DeepSeek image; keep existing GLM/MiMo images and pins intact.
+Build with `bash docker/build-deepseek.sh`; qualification results are recorded below.
 
 Checkpoint: `amd/DeepSeek-V4.1-Flash-Quark-MXFP4`.
 The [AMD model card](https://huggingface.co/amd/DeepSeek-V4.1-Flash-Quark-MXFP4)
@@ -85,6 +93,22 @@ tuning. Do not depend on swap to hold pinned model weights.
 
 ## Confirmed blocker in pinned vLLM
 
+**Upstream update:** [PR #57071](https://github.com/vllm-project/vllm/pull/57071),
+merged 2026-09-26 as `5840d95284fe3ae9f56f2366074f58d277d69ad8`, fixes this
+dispatch and adds Quark MXFP8 block-scale expansion, VL quant mappings and
+Engram scale-name mapping. Verified present in main
+`155488d853a0bc42df227dbfc74005b3fd488e94`, absent from v0.30.0 and our pin.
+Prefer this upstream implementation (audited backport or separate pinned image)
+over creating a parallel quantization adapter. The observations below describe
+our currently installed version, not latest main.
+
+The PR's end-to-end validation used MI355X/gfx950. Latest main selects a native
+MXFP8 linear kernel only for gfx95x; other ROCm GPUs fall back to
+`EmulationMxfp8LinearKernel`. That fallback dequantizes weights to BF16 and calls
+`F.linear`; it does not itself quantize activations. Therefore block-layout
+support is fixed upstream, but gfx1201 activation semantics, memory cost and
+full-model correctness still require validation. No runtime upgrade was made.
+
 Audit target: vLLM `e9757321527ca1ecd514c07c1418dd2c53da3d19`, the existing image.
 It contains `DeepseekV41ForCausalLM`, ROCm attention, Engram, DSpark, tokenizer,
 reasoning and tool parsers. Registration alone does not establish compatibility.
@@ -102,12 +126,78 @@ explicit_quark: deepseek_v4_fp8
 translated_weight_block: [128, 128]
 ```
 
-Merely passing `--quantization quark` does not prevent this override. The stock
+On the old pin, merely passing `--quantization quark` does not prevent this override. The stock
 Quark W8A8 per-block matcher also only accepts 128×128/group-128, so bypassing
-the override is insufficient. Implement a version- and model-scoped quantization
-adapter retaining all Quark semantics; validate tiny layers against explicit QDQ
-before any full model load. Do not silently reinterpret the checkpoint as W4A16
-or the MiMo MXFP4×FP8 scheme.
+the override is insufficient. The newer image supplies the complete upstream
+fix; validate tiny layers against explicit QDQ before any full model load. Do
+not silently reinterpret the checkpoint as W4A16 or the MiMo MXFP4×FP8 scheme.
+
+## Stage-1 candidate
+
+`serve/deepseek-v4.1-flash.sh` calls the shared launcher directly: TP8/C1/8K,
+512-token prefill chunks, eager, no APC or speculation, stock RCCL, 10 GiB expert
+offload per rank. This is an experimental correctness profile, not a qualified
+production configuration. Set `MODELS_DIR` to the parent checkpoint directory
+when using a different storage mount. Inspect without launching:
+
+```bash
+DRYRUN=1 bash serve/deepseek-v4.1-flash.sh
+```
+
+Only `r9700_deepseek` is enabled. `r9700_deepseek_quark` inherits upstream
+Quark loading and MoE dispatch. On MXFP8 linears using the BF16 emulation backend,
+it applies upstream group-32 activation QDQ first; native MXFP8 execution and
+other quantization schemes are unchanged. Registration requires ROCm, gfx1201
+and vLLM `18f8f960`. There are no new compute kernels.
+
+Engram uses upstream `use_thp=true`, with private exact-size mapped host storage.
+Huge-page coverage is best effort. A scoped guard aborts if host registration
+falls back to the power-of-two pinned allocator. Expert UVA offload reuses that
+same upstream allocator inside a DeepSeek-only initialization scope, replacing
+only its pinning operation. The scope restores Torch even on failure. It does
+not change placement or the forward path. GPU registration, view lifetime and
+peak RAM still need hardware verification before model loading.
+
+The backbone has 5.049 GiB of FP8 linear values outside the Engram tables. Default
+load-time BF16 dequantization adds approximately that much persistent storage
+(0.631 GiB/rank under ideal TP8 division), plus expanded scales and load-time
+temporaries. Add this to the earlier storage-only estimate; it is not measured VRAM.
+
+CPU checks in `tests/test_deepseek_quark.py` cover real-checkpoint dispatch when
+`DEEPSEEK_MODEL_CONFIG` points to its config, scale expansion before TP8 slicing,
+activation rounding, model isolation, exact-size expert copies and allocation
+failure guards. GPU capability
+checks are mocked in these CPU tests, so passing them cannot qualify GPU serving.
+
+## Preparation results (2026-10-04)
+
+* The separate image built successfully from the digest above, including the
+  unchanged gfx1201 HIP library. Existing GLM/MiMo base pins are unchanged.
+* Final image suite: **20/20 PASS** (8 audit + 12 Quark/allocation tests),
+  run from files embedded in the image without a repository bind mount.
+  The Quark tests used the local checkpoint
+  configuration, without GPU devices. The initial test-harness failure (AMD
+  imports probing GPU metadata) and subsequent attempts are retained locally.
+* The MXFP8 numerical fixture exposes a difference in stock emulation with
+  identity weights; the adapter matches explicit group-32 activation QDQ exactly,
+  including zero inputs. This is not a full-model accuracy test.
+* Dry-run: TP8, 8192 context, C1, 10 GiB/rank expert offload, eager, no draft,
+  no EP, explicit private Engram allocation. No DeepSeek server was started.
+* Evidence: ignored `bench/results/deepseek-stage1/`; image logs under
+  `.runtime/deepseek/`. Do not interpret build success or mocked CPU checks as
+  GPU qualification, memory-capacity validation or a speed result.
+
+Reproduce the CPU suite inside the candidate image without exposing GPUs:
+
+```bash
+docker run --rm --entrypoint python3 \
+  -e R9K_PLATFORM=0 -e VLLM_PLUGINS= -e PYTHONDONTWRITEBYTECODE=1 \
+  r9700/vllm:deepseek-v41-18f8f960 \
+  -m unittest discover -s /opt/r9700/tests -p 'test_deepseek_*.py'
+```
+
+The real-checkpoint override test additionally needs a read-only mount of its
+`config.json` and `DEEPSEEK_MODEL_CONFIG` pointing to that container path.
 
 ## Reuse and missing work
 
@@ -117,14 +207,15 @@ or the MiMo MXFP4×FP8 scheme.
 | Expert correctness | Quark OCP MX emulation + existing QDQ helpers | Scoped quant dispatch, TP8 geometry, clamp/routing tests, temporary-memory budget |
 | Expert optimization | `moe/w4a4.py`, packed GEMV and HIP entry points | Validate hidden 5120, I=288, E=384, top-6; retain strict GLM gates |
 | Dense attention FP8 | Existing upstream quantization building blocks | Preserve block-32/E8M0 weights AND activation scales; no silent requantization |
-| Host allocation | `utils/hostmem.py:pinned_empty`, UVA helpers | Engram allocates via `torch.empty(pin_memory=True)`, which `exact_pinning()` does not intercept; add a scoped allocation adapter |
+| Host allocation | Upstream exact mmap/registration allocator; stack construction-scope pattern | Engram and expert guards implemented; HIP/UVA and actual RSS remain unverified |
 | Offload/cache | Existing vLLM expert offloader and `moe/cache.py` concepts | Prove Quark layout compatibility, single-copy ownership, per-rank byte budget before LRU/hot-cold |
 | Attention/indexer | Upstream ROCm sparse Triton fallback | Validate CSA2/cache sharing and 448+64 geometry; inspect gfx950-only/AITER gates and `fp8_ds_mla` cache assumptions |
 | Collectives | RCCL first; existing custom AR later | Isolated A/B only after baseline |
 | Serving/bench | Shared `serve.sh`, existing benchmark protocol | Explicit settings; its generic 34 GiB/rank offload default is not this model's budget |
 
 No existing kernels or model registrations are changed by stage 0.
-Neither the dense path nor sparse attention is yet numerically qualified here.
+Dense activation rounding has CPU reference coverage; GPU dense execution and
+sparse attention are not yet numerically qualified here.
 
 ## Lessons from the 8×5090 reference
 
@@ -146,7 +237,8 @@ with our decode-only rate. Preserve our frozen A/B methodology.
 
 ## Implementation gates and commit boundaries
 
-1. **Correctness prerequisites:** scoped quant adapter; exact Engram allocation;
+1. **Correctness prerequisites:** adopt upstream #57071 and validate its gfx1201
+   fallback, adding only missing scoped adaptations; exact Engram allocation;
    QDQ/scale, TP8 sharding, UVA lookup and sparse-attention microtests. Separate
    correctness commits from performance work. Fail clearly on unsupported layout.
 2. **Stage 1 load:** one explicit profile calling `serve.sh`; TP8, 8K then 16K,
@@ -165,6 +257,6 @@ with our decode-only rate. Preserve our frozen A/B methodology.
 7. **Stages 9–10:** DSpark K3/K5 (optional K1/K7), acceptance by position, draft
    cost and memory; only then select a qualified profile.
 
-There is intentionally no serving command or throughput result yet. Stage 0
-establishes storage geometry and a memory budget; full runtime footprint and
-the final offload amount remain measurements to obtain in stage 1.
+The profile is a launch candidate, not a recommendation. There is no throughput
+result yet. Full runtime footprint and the final offload amount remain
+measurements to obtain in stage 1.

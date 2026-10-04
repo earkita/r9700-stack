@@ -174,10 +174,11 @@ def audit(root, tp=8, offload_gib=80):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path)
+    parser.add_argument("--tp", type=int, default=8)
     parser.add_argument("--expert-offload-gib", type=float, default=80,
                         help="Total across all eight ranks, NOT per GPU")
     args = parser.parse_args()
-    print(json.dumps(audit(args.model, offload_gib=args.expert_offload_gib), indent=2))
+    print(json.dumps(audit(args.model, tp=args.tp, offload_gib=args.expert_offload_gib), indent=2))
 
 
 if __name__ == "__main__":

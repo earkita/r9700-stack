@@ -85,3 +85,10 @@ def register_mimo() -> None:
     if os.environ.get("R9K_MIMO") == "1":
         from .compat.mimo import register
         register()
+
+
+def register_deepseek() -> None:
+    """Separate-image, opt-in DeepSeek correctness adapters."""
+    if os.environ.get("R9K_DEEPSEEK") == "1":
+        from .compat.deepseek import register
+        register()
