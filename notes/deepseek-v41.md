@@ -1,8 +1,10 @@
 # DeepSeek V4.1 Flash: audit and correctness candidate
 
-Status (2026-10-04): **not qualified to serve on gfx1201**. No model load,
-GPU kernel test, service replacement or throughput benchmark has been performed.
-GLM remains running. Stage-1 prerequisites are being prepared separately.
+Status (2026-10-04): **not yet qualified to serve on gfx1201**. GPU microtests
+have passed. The first full TP8 load reached memory profiling but failed on a
+BF16 MoE workspace allocation. A second attempt loaded all eight ranks but
+failed at the sparse indexer architecture gate. Stage-1 serving is not qualified;
+there is no throughput baseline.
 
 Selected DeepSeek build (approved 2026-10-04):
 `vllm/vllm-openai-rocm:nightly-rocm100-18f8f96025b556071eb627076f94df560fbd3a22`,
@@ -155,8 +157,9 @@ Huge-page coverage is best effort. A scoped guard aborts if host registration
 falls back to the power-of-two pinned allocator. Expert UVA offload reuses that
 same upstream allocator inside a DeepSeek-only initialization scope, replacing
 only its pinning operation. The scope restores Torch even on failure. It does
-not change placement or the forward path. GPU registration, view lifetime and
-peak RAM still need hardware verification before model loading.
+not change placement or the forward path. GPU registration and view lifetime
+passed the microtests below. Full-load memory observations and remaining runtime
+blockers are recorded separately.
 
 The backbone has 5.049 GiB of FP8 linear values outside the Engram tables. Default
 load-time BF16 dequantization adds approximately that much persistent storage
@@ -199,6 +202,54 @@ docker run --rm --entrypoint python3 \
 The real-checkpoint override test additionally needs a read-only mount of its
 `config.json` and `DEEPSEEK_MODEL_CONFIG` pointing to that container path.
 
+## GPU checks and full-load attempts
+
+`tests/test_deepseek_gpu.py` is opt-in (`R9700_DEEPSEEK_GPU_TEST=1`) and loads no
+checkpoint. Six tests passed in the candidate image on gfx1201:
+
+* MXFP8 group-32 activation QDQ vs an independent CPU reference for 1/8/16/512
+  rows, width 5120, including zeros and different exponent groups: exact match.
+* Emulated linear adapter vs FP32 reference using quantized activations
+  (`atol=.02`, `rtol=.01`).
+* Exact host allocation/UVA reads on all eight cards, retaining the GPU view
+  after dropping explicit host references.
+* The actual vLLM UVA expert offloader, including values, markers and byte count.
+* Sparse attention prefill/decode with 448+64 dimensions, 8 local heads,
+  1/2/8/16 rows, unequal lengths, attention sinks and SWA + compressed segments
+  (`atol=.03`, `rtol=.02`). This does not qualify complete CSA2 model state.
+* The model's actual C++ SWA writer crossing a 128-token page boundary, with
+  identity RoPE, vs independently decoded FP8/E8M0/BF16 records: exact match.
+
+Full-load attempt 1: TP8/C1/8K, NBT512, expert offload 10 GiB/rank, utilization
+0.94. All eight workers loaded the checkpoint, reporting **26.86 GiB model
+memory per rank**. Actual expert offload rounded up to **10.04 GiB/rank** at
+parameter boundaries; Engram used two approximately 11.80 GiB host shards per
+rank. Minimum sampled host MemAvailable was **25.42 GiB**; system swap filled
+during loading, so this is not a claim of a swap-free host or a production-safe
+memory margin. GPU usage is sampled every 5 seconds and can miss brief peaks.
+
+The run failed before API readiness in
+`OCP_MXQuantizationEmulationTritonExperts.apply -> _dequantize_weights(w2)`:
+allocating **1.05 GiB** of BF16 expert values with only **472–498 MiB free**.
+This is a real GPU OOM during profiling, not a retrieval/format failure, and no
+text or speed result exists for this run. Reading all 48 shards did not mean
+loading was complete; stack captures showed subsequent expert tensor copies.
+
+Attempt 2 keeps arithmetic and 8K/C1 fixed, with 11.5 GiB/rank offload and 0.97
+utilization. A monitor sends SIGINT if host MemAvailable drops below 8 GiB.
+All eight ranks loaded at **25.18 GiB/rank**, down from 26.86 GiB/rank.
+The run reached a different fatal error in `SparseAttnIndexer.forward_hip`:
+`Sparse attention indexer ROCm path requires AITER or a supported native
+architecture (gfx950/gfx11).` The native gate excludes gfx1201 with AITER disabled.
+This is separate from the attention kernels exercised by the tiny tests. Do not
+remove the gate without validating the downstream indexer path and cache layout.
+There was no API readiness, generated answer or throughput measurement. Reaching
+this gate does not prove the complete memory profile fits. Both attempts are
+retained in ignored `bench/results/deepseek-stage1/` alongside every microtest
+attempt. The original GLM container was restarted after the second failure.
+`max_parallel_loading_workers` is ignored by this vLLM pin; it cannot be relied
+on to serialize loading.
+
 ## Reuse and missing work
 
 | Area | Reuse | Required gate/adaptation |
@@ -207,15 +258,15 @@ The real-checkpoint override test additionally needs a read-only mount of its
 | Expert correctness | Quark OCP MX emulation + existing QDQ helpers | Scoped quant dispatch, TP8 geometry, clamp/routing tests, temporary-memory budget |
 | Expert optimization | `moe/w4a4.py`, packed GEMV and HIP entry points | Validate hidden 5120, I=288, E=384, top-6; retain strict GLM gates |
 | Dense attention FP8 | Existing upstream quantization building blocks | Preserve block-32/E8M0 weights AND activation scales; no silent requantization |
-| Host allocation | Upstream exact mmap/registration allocator; stack construction-scope pattern | Engram and expert guards implemented; HIP/UVA and actual RSS remain unverified |
+| Host allocation | Upstream exact mmap/registration allocator; stack construction-scope pattern | Engram/expert guards and HIP/UVA microtests passed; full serving remains blocked |
 | Offload/cache | Existing vLLM expert offloader and `moe/cache.py` concepts | Prove Quark layout compatibility, single-copy ownership, per-rank byte budget before LRU/hot-cold |
 | Attention/indexer | Upstream ROCm sparse Triton fallback | Validate CSA2/cache sharing and 448+64 geometry; inspect gfx950-only/AITER gates and `fp8_ds_mla` cache assumptions |
 | Collectives | RCCL first; existing custom AR later | Isolated A/B only after baseline |
 | Serving/bench | Shared `serve.sh`, existing benchmark protocol | Explicit settings; its generic 34 GiB/rank offload default is not this model's budget |
 
 No existing kernels or model registrations are changed by stage 0.
-Dense activation rounding has CPU reference coverage; GPU dense execution and
-sparse attention are not yet numerically qualified here.
+Dense activation rounding and small GPU dense/sparse-attention cases have
+reference coverage. Full-model execution and the sparse indexer remain unqualified.
 
 ## Lessons from the 8×5090 reference
 
