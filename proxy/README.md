@@ -63,6 +63,7 @@ bash serve/litellm.sh
 |---|---|---|
 | OpenAI chat completions | `http://127.0.0.1:4000/v1` | `glm-5.3-flash` |
 | Anthropic Messages / harness | `http://127.0.0.1:4000` | `glm-5.3-flash-high` |
+| Claude Code Haiku / Small Fast | `http://127.0.0.1:4000` | `glm-5.3-flash-fast` |
 
 These aliases select API routes to the **same model**, not independent GPU
 workers. Default sampling is temperature 1 / top-p 0.95, with high reasoning
@@ -71,6 +72,14 @@ effort. Requests can supply sampling overrides. The OpenAI alias sends GLM's
 Messages handling. GLM's `high`/`low`/`max` semantics are described in
 [the testing guide](../notes/glm-testing.md). Do not use Qwen's
 `enable_thinking=false` to disable GLM thinking.
+
+The `fast` alias selects GLM's **Low** template effort on the same backend;
+it is not a smaller model and does not guarantee a particular latency. The scoped
+`glm_hooks` adapter preserves `chat_template_kwargs.reasoning_effort=low` through
+the native Anthropic route, including when the client supplies high effort.
+Local token counting uses the same Low template. Main roles keep their existing
+`high` route. This role split
+does not configure Claude Code's auto-mode classifier or its timeout.
 
 For a local Anthropic-compatible harness, load the generated file in its shell:
 
@@ -83,8 +92,8 @@ export ANTHROPIC_AUTH_TOKEN="$LITELLM_MASTER_KEY"
 export ANTHROPIC_MODEL=glm-5.3-flash-high
 export ANTHROPIC_DEFAULT_OPUS_MODEL=glm-5.3-flash-high
 export ANTHROPIC_DEFAULT_SONNET_MODEL=glm-5.3-flash-high
-export ANTHROPIC_DEFAULT_HAIKU_MODEL=glm-5.3-flash-high
-export ANTHROPIC_SMALL_FAST_MODEL=glm-5.3-flash-high
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=glm-5.3-flash-fast
+export ANTHROPIC_SMALL_FAST_MODEL=glm-5.3-flash-fast
 ```
 
 Alternatively, the ready-made Claude Code template is
@@ -99,8 +108,9 @@ The template's key helper reads `LITELLM_MASTER_KEY` from the environment or
 `secrets/litellm.env` in this checkout. It locates the helper under
 `$HOME/ai/r9700-stack`; set `R9700_STACK_ROOT` for another checkout location.
 No credential or path to the old repository is embedded. It preserves the
-previous `acceptEdits` and `Read`/`Bash` permission rules, routes every model
-alias to `glm-5.3-flash-high`, and sets high effort. Its 524288-token window
+previous `acceptEdits` and `Read`/`Bash` permission rules, routes main roles to
+`glm-5.3-flash-high` and Haiku/Small Fast to `glm-5.3-flash-fast`, and keeps high
+client effort for main tasks. Its 524288-token window
 with 90% auto-compaction is a client budget, not a KV reservation or a promise
 of four simultaneous 512K sessions. Check the backend's `/v1/models` limit
 before using it with a smaller serving profile. `DISABLE_PROMPT_CACHING=1`
