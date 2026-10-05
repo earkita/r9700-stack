@@ -1,13 +1,14 @@
 """Opt-in DeepSeek Quark correctness fallback on the separately pinned image.
 
-Upstream owns checkpoint loading and every MoE path. Only the MXFP8 linear
-emulation fallback needs activation QDQ: upstream's native MX kernel performs
-it, but EmulationMxfp8LinearKernel feeds BF16 activations directly to F.linear.
+Upstream owns checkpoint loading. MXFP8 linear emulation needs activation QDQ;
+MXFP4 linear emulation needs row padding for Quark's 64-element launch boundary.
+Routed MoE dispatch is handled separately by the scoped compatibility adapter.
 """
 
 import torch
 
 from vllm.config import get_current_vllm_config
+from vllm.model_executor.kernels.linear.mxfp4.emulation import EmulationMxfp4LinearKernel
 from vllm.model_executor.kernels.linear.mxfp8.emulation import EmulationMxfp8LinearKernel
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig, QuarkLinearMethod
@@ -15,11 +16,28 @@ from vllm.model_executor.layers.quantization.quark.schemes import QuarkOCP_MX
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     _mxfp8_e4m3_quantize_torch, dequant_mxfp8_to_bf16, mxfp8_e4m3_quantize,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic, kMxfp8Static
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kMxfp4Dynamic, kMxfp4Static, kMxfp8Dynamic, kMxfp8Static,
+)
 
 
 class DeepseekQuarkLinearMethod(QuarkLinearMethod):
     def apply(self, layer, x, bias=None):
+        kernel = layer.scheme.ocp_mx_linear
+        if (isinstance(kernel, EmulationMxfp4LinearKernel)
+                and layer.scheme.activation_quant_key == kMxfp4Dynamic
+                and x.numel() % 64):
+            if x.dtype != torch.bfloat16 or x.shape[-1] % 32:
+                raise ValueError("DeepSeek MXFP4 emulation requires BF16, group-32 inputs")
+            # TP8 shared-expert down_proj has K=288. Odd row counts satisfy
+            # MXFP4's group-32 math but violate Quark HIP's 64-element launch.
+            # Append a whole zero row, then discard its result. Original groups,
+            # scales, weights and bias are unchanged; no global kernel patch.
+            shape = x.shape
+            flat = x.reshape(-1, shape[-1])
+            padded = torch.cat((flat, flat.new_zeros(1, shape[-1])), dim=0)
+            result = super().apply(layer, padded, bias)
+            return result[:-1].reshape(*shape[:-1], result.shape[-1])
         if isinstance(layer.scheme.ocp_mx_linear, EmulationMxfp8LinearKernel):
             if x.dtype != torch.bfloat16 or x.shape[-1] % 32:
                 raise ValueError("DeepSeek MXFP8 emulation requires BF16, group-32 inputs")
@@ -56,7 +74,7 @@ class DeepseekQuarkConfig(QuarkConfig):
         method = super().get_quant_method(layer, prefix)
         scheme = getattr(layer, "scheme", None)
         if (isinstance(method, QuarkLinearMethod) and isinstance(scheme, QuarkOCP_MX)
-                and scheme.weight_quant_key == kMxfp8Static
-                and scheme.activation_quant_key == kMxfp8Dynamic):
+                and (scheme.weight_quant_key, scheme.activation_quant_key) in (
+                    (kMxfp8Static, kMxfp8Dynamic), (kMxfp4Static, kMxfp4Dynamic))):
             return DeepseekQuarkLinearMethod(self)
         return method

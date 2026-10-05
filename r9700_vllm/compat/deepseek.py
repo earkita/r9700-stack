@@ -30,17 +30,60 @@ def install_engram_guard():
     engram._allocate_huge_page_storage = allocate
 
 
-def install_expert_pinning():
-    """Use the same upstream exact allocator during DeepSeek UVA offloading.
+def offload_parameters(offloader, module, prefix, allocate, accelerator_view):
+    """One exact host allocation and one copy per selected parameter.
 
-    Like the stack's exact_pinning construction scope, this temporarily replaces
-    Tensor.pin_memory during single-threaded worker initialization. It does not
-    change expert placement, copies, forward execution or other models.
+    Allocator and view functions are explicit to test selection/accounting
+    without GPU allocation. No pageable intermediate or global Torch patch.
     """
+    import os
+    import re
+    first_layer = int(os.environ.get("R9K_DEEPSEEK_OFFLOAD_FIRST_LAYER", "0"))
+    if not 0 <= first_layer < 40:
+        raise ValueError("DeepSeek first offload layer must be in [0,39]")
+    prefix = prefix.rstrip(".") + "." if prefix else ""
+    matrices_only = os.environ.get("R9K_DEEPSEEK_OFFLOAD_MATRICES", "0") == "1"
+    for name, parameter in module.named_parameters():
+        if first_layer:
+            match = re.search(r"(?:^|\.)layers\.(\d+)\.", prefix + name)
+            if not match or not first_layer <= int(match[1]) < 40:
+                continue
+        if matrices_only and (name.rsplit(".", 1)[-1] not in ("w13_weight", "w2_weight")
+                              or "experts" not in (prefix + name).split(".")):
+            continue
+        if offloader.cpu_offload_bytes >= offloader.cpu_offload_max_bytes:
+            break
+        if getattr(parameter, "_vllm_is_uva_offloaded", False):
+            continue
+        if offloader.cpu_offload_params and not any(
+            f".{part}." in f".{prefix}{name}."
+            for part in offloader.cpu_offload_params
+        ):
+            continue
+        size = parameter.numel() * parameter.element_size()
+        if not size:
+            continue
+        storage = allocate(size)
+        if storage is None:
+            raise RuntimeError("DeepSeek expert registration failed; refusing rounded fallback")
+        host = storage.view(parameter.dtype).view(parameter.shape)
+        host.copy_(parameter.detach())
+        parameter.data = accelerator_view(host)
+        # Keep a CPU alias of the SAME allocation for checkpoint loading.
+        # copy_ through the accelerator alias otherwise invokes HIP even for
+        # a destination that physically lives in host RAM.
+        parameter._r9700_host_view = host
+        parameter._vllm_is_uva_offloaded = True
+        parameter._r9700_host_bytes = size
+        offloader.cpu_offload_bytes += size
+
+
+def install_expert_pinning():
+    """DeepSeek-only single-copy exact allocation; keep upstream forward path."""
     from functools import wraps
-    import torch
     from vllm.model_executor.offloader.uva import UVAOffloader
     from vllm.models.deepseek_v41.common import engram
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
     original = UVAOffloader._maybe_offload_to_cpu
     if getattr(original, "_r9700_deepseek_exact", False) is True:
@@ -52,26 +95,12 @@ def install_expert_pinning():
             return original(self, module, prefix)
         if not self.pin_memory or not self.uva_offloading:
             raise RuntimeError("DeepSeek expert offload requires pinned UVA storage")
-        stock = torch.Tensor.pin_memory
-
-        def pin(tensor, *args, **kwargs):
-            if tensor.device.type != "cpu":
-                return stock(tensor, *args, **kwargs)
-            if tensor.numel() == 0:
-                return tensor
-            packed = engram._allocate_huge_page_storage(tensor.numel() * tensor.element_size())
-            if packed is None:
-                raise RuntimeError("DeepSeek expert registration failed; refusing rounded pinned fallback")
-            # Views retain the upstream allocator's registration and mmap owner.
-            result = packed.view(tensor.dtype).view(tensor.shape)
-            result.copy_(tensor)
-            return result
-
-        torch.Tensor.pin_memory = pin
-        try:
-            return original(self, module, prefix)
-        finally:
-            torch.Tensor.pin_memory = stock
+        first = next(module.parameters(), None)
+        if first is None or first.device.type == "cpu":
+            return module
+        offload_parameters(self, module, prefix, engram._allocate_huge_page_storage,
+                           get_accelerator_view_from_cpu_tensor)
+        return module
 
     offload._r9700_deepseek_exact = True
     UVAOffloader._maybe_offload_to_cpu = offload
@@ -88,5 +117,21 @@ def register():
     if arch != "gfx1201":
         raise RuntimeError("DeepSeek adapter is scoped to gfx1201")
     from ..quant import deepseek  # noqa: F401
+    from .deepseek_dspark import install as install_dspark
+    install_dspark()
     install_engram_guard()
     install_expert_pinning()
+    from .deepseek_loading import install_optimized_loading
+    install_optimized_loading()
+    from .deepseek_indexer import install
+    install()
+    from .deepseek_loading import install as install_loading
+    install_loading()
+    from .deepseek_moe import install as install_moe
+    install_moe()
+
+    from ..moe.deepseek_expert_profile import install as install_profile
+    install_profile()
+
+    from ..moe.deepseek_placement import install as install_placement
+    install_placement()

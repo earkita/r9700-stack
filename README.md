@@ -1,5 +1,12 @@
 # r9700-stack
 
+> **Experimental branch: `experimental/deepseek-v4.1-flash`.**
+> DeepSeek V4.1 Flash support is work in progress, not qualified for agent use.
+> Thinking/tool-call correctness and DSpark startup remain unresolved; bounded
+> kernel and API checks do not establish production stability or performance.
+> See [DeepSeek status and evidence](notes/deepseek-v41.md).
+> The pre-experiment branch is `feature/mimo-v2.6-flash` (`fcee46a`).
+
 Additional model deployments on 8× R9700:
 [GLM-5.3-Flash](notes/glm-overview.md) and
 [MiMo-V2.6-Flash-MOPD](notes/mimo.md).

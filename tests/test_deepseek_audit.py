@@ -7,11 +7,26 @@ import tempfile
 import unittest
 
 from r9700_vllm.models.deepseek_audit import (
-    GIB, check_scales, component, memory_estimates, read_headers,
+    GIB, check_scales, component, memory_estimates, read_headers, check_packed_geometry,
 )
 
 
 class DeepseekAudit(unittest.TestCase):
+    def test_packed_target_and_draft_geometry(self):
+        text = dict(hidden_size=5120, moe_intermediate_size=2304,
+                    num_hidden_layers=40, n_routed_experts=384,
+                    num_experts_per_tok=6, hidden_act="silu")
+        check_packed_geometry(text)
+        with self.assertRaisesRegex(ValueError, "num_nextn_predict_layers"):
+            check_packed_geometry(text, draft=True)
+        text.update(num_nextn_predict_layers=3, dspark_block_size=5,
+                    dspark_n_routed_experts=128, dspark_num_experts_per_tok=3,
+                    dspark_target_layer_ids=[37, 38, 39])
+        check_packed_geometry(text, draft=True)
+        text['dspark_n_routed_experts'] = 384
+        with self.assertRaisesRegex(ValueError, "dspark_n_routed_experts"):
+            check_packed_geometry(text, draft=True)
+
     def read(self, tensors, payload=b"\0" * 4):
         metadata = json.dumps(tensors).encode()
         with tempfile.TemporaryDirectory() as directory:

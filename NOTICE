@@ -130,3 +130,11 @@ MiMo DiffKV adaptations -- Apache-2.0
     Derived from vLLM dee37d891 and the local my-llm MiMo ROCm port (patch
     0004-port-diffbot-diffkv-fp8-and-verify-to-rocm.patch); this copy removes
     FP8 KV support and isolates BF16 prefill/verification in the opt-in plugin.
+
+DeepSeek partial-residency adaptation -- Apache-2.0
+    r9700_vllm/moe/csrc/deepseek_residency.cpp
+    Derived from the vllm_dsv41_opt plugin in
+    https://github.com/devin-lai/DeepSeek-V4.1-Flash-Accel
+    commit 4a4e88ec2cdcf2fc7c802e1f6b7c943d897770c8.
+    Original Apache-2.0 SPDX header retained; see this repository's LICENSE.
+    Changes port CUDA VMM to HIP, add device guards and partial-failure cleanup.

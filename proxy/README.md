@@ -180,6 +180,39 @@ Both main templates declare 512K with compaction at 90%; this does not qualify
 
 ## Local compatibility and checks
 
+### DeepSeek Claude Code template
+
+[`deepseek-v4.1-flash.settings.local.json`](../serve/templates/deepseek-v4.1-flash.settings.local.json)
+targets the local proxy on port 4000. Main roles use `deepseek-v4.1-flash`
+with high reasoning; Haiku/Small Fast use `deepseek-v4.1-flash-fast` with low
+reasoning and thinking enabled. Both aliases use the same model. It reuses
+the credential helper and main-task `high` client effort. No fixed client context window is
+declared; per-client context limits are to be configured in LiteLLM.
+
+[`deepseek.yaml`](deepseek.yaml) supplies both aliases. Its scoped
+`deepseek_hooks` adapter pins the configured effort even when the client
+sends high effort or disabled thinking for a helper. Local token counting
+uses the same template settings. No tool-stream rewriting is installed.
+This template alone does not switch the proxy or GPU server. After stopping
+and removing the previous proxy as described above, select the DeepSeek
+configuration and validate Messages, tools, streaming and local token counting:
+
+```bash
+bash serve/litellm.sh HOST=0.0.0.0 CONFIG="$PWD/proxy/deepseek.yaml" BACKEND_MODEL=deepseek-v4.1-flash
+claude --settings "$PWD/serve/templates/deepseek-v4.1-flash.settings.local.json"
+```
+
+On 2026-10-05 the proxy was switched to this configuration on `0.0.0.0:4000`
+without restarting the GPU server. A bounded live smoke check passed alias
+discovery, authentication, local token counts matching vLLM for both aliases,
+and a fast-alias Anthropic stream with thinking and a correct completed answer
+(`end_turn`). Evidence: `bench/results/deepseek-proxy-switch/` (ignored).
+This check does not qualify tool round trips or long-context requests. The
+running backend still reported an 8192-token limit; the profile's newer auto
+context setting had not been deployed.
+
+### Shared proxy checks
+
 `litellm_hooks.py` contains one narrowly scoped compatibility fix: LiteLLM
 1.103.0's Anthropic token counter hardcodes the remote Anthropic endpoint.
 The hook sends it to this deployment's local `/v1/messages/count_tokens`.

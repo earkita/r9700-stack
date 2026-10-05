@@ -5,6 +5,7 @@ from collections import defaultdict
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import struct
 
@@ -109,6 +110,22 @@ def memory_estimates(groups, tables, tp, offload_gib):
     }
 
 
+def check_packed_geometry(text, draft=False):
+    """Fail before GPU allocation when the scoped packed kernel cannot apply."""
+    expected = {
+        "hidden_size": 5120, "moe_intermediate_size": 2304,
+        "num_hidden_layers": 40, "n_routed_experts": 384,
+        "num_experts_per_tok": 6, "hidden_act": "silu",
+    }
+    if draft:
+        expected.update(num_nextn_predict_layers=3, dspark_block_size=5,
+                        dspark_n_routed_experts=128, dspark_num_experts_per_tok=3,
+                        dspark_target_layer_ids=[37, 38, 39])
+    for name, value in expected.items():
+        if text.get(name) != value:
+            raise ValueError(f"Packed DeepSeek geometry requires {name}={value!r}")
+
+
 def audit(root, tp=8, offload_gib=80):
     root = Path(root).resolve()
     config_raw = (root / "config.json").read_bytes()
@@ -117,6 +134,8 @@ def audit(root, tp=8, offload_gib=80):
     if cfg.get("model_type") != "deepseek_v41" or tp != 8:
         raise ValueError("This audit supports DeepSeek V4.1 at TP8 only")
     text = cfg["text_config"]
+    if os.environ.get("R9K_DEEPSEEK_MOE") == "w4a4":
+        check_packed_geometry(text, draft=os.environ.get("R9K_DEEPSEEK_DSPARK") == "1")
     for key in ("hidden_size", "moe_intermediate_size", "num_attention_heads"):
         if text[key] % tp:
             raise ValueError(f"Cannot evenly shard {key} at TP{tp}")
@@ -175,10 +194,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path)
     parser.add_argument("--tp", type=int, default=8)
-    parser.add_argument("--expert-offload-gib", type=float, default=80,
+    parser.add_argument("--expert-offload-gib", type=float, default=None,
                         help="Total across all eight ranks, NOT per GPU")
     args = parser.parse_args()
-    print(json.dumps(audit(args.model, tp=args.tp, offload_gib=args.expert_offload_gib), indent=2))
+    offload = args.expert_offload_gib
+    if offload is None:
+        offload = float(os.environ.get("R9700_PREFLIGHT_OFFLOAD_GB", "10")) * args.tp
+    print(json.dumps(audit(args.model, tp=args.tp, offload_gib=offload), indent=2))
 
 
 if __name__ == "__main__":

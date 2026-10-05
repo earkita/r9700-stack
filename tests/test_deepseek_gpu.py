@@ -25,6 +25,24 @@ def qdq_reference(x):
             * scale[..., None]).reshape(shape).to(torch.bfloat16)
 
 
+def mxfp4_hip_reference(x):
+    """CPU reference for Quark HIP's BF16 scale rounding and FP4 ties-to-even."""
+    blocks = x.cpu().reshape(-1, 32)
+    maximum = blocks.abs().amax(-1)
+    # Round max's BF16 mantissa before selecting the power-of-two E8M0 scale.
+    exponent = ((maximum.view(torch.int16).int() + 32) & 0x7f80) // 128 - 127 - 2
+    scale = torch.exp2(exponent.clamp(-127, 127).float())
+    normalized = blocks.float() / scale[:, None]
+    lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6.])
+    distance = (normalized.abs()[..., None] - lut).abs()
+    codes = torch.arange(8)
+    # At an exact midpoint prefer the code with even low mantissa bit.
+    priority = codes + torch.where(codes % 2 == 0, 0, 8)
+    nearest = torch.where(distance == distance.amin(-1, keepdim=True),
+                          priority, 99).argmin(-1)
+    return (normalized.sign() * lut[nearest] * scale[:, None]).reshape_as(x).bfloat16()
+
+
 def packed_cache(seed):
     """Independent fp8_ds_mla encoder: data records, then per-block scales."""
     g = torch.Generator().manual_seed(seed)
@@ -107,6 +125,48 @@ class DeepseekGPU(unittest.TestCase):
                 actual = method.apply(layer, x.cuda()).cpu().float()
                 torch.testing.assert_close(actual, expected, atol=.02, rtol=.01)
 
+    def test_shared_mxfp4_odd_rows(self):
+        from quark.torch.kernel.mx.hip import qdq_mxfp4_hip
+        from vllm.model_executor.kernels.linear.mxfp4.base import MxFp4LinearLayerConfig
+        from vllm.model_executor.kernels.linear.mxfp4.emulation import EmulationMxfp4LinearKernel
+        from vllm.model_executor.layers.quantization.quark.schemes import QuarkOCP_MX
+        from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Static, kMxfp4Dynamic
+        from r9700_vllm.quant.deepseek import DeepseekQuarkLinearMethod
+        from test_glm_numerics import unpack_reference
+        torch.manual_seed(41017)
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(torch.randint(256, (5120, 144),
+            device="cuda", dtype=torch.uint8), False)
+        layer.weight_scale = torch.nn.Parameter(torch.randint(119, 123, (5120, 9),
+            device="cuda", dtype=torch.uint8), False)
+        layer.scheme = QuarkOCP_MX(kMxfp4Static, kMxfp4Dynamic)
+        layer.scheme.ocp_mx_linear = EmulationMxfp4LinearKernel(
+            MxFp4LinearLayerConfig(activation_quant_key=kMxfp4Dynamic))
+        method = DeepseekQuarkLinearMethod.__new__(DeepseekQuarkLinearMethod)
+        weight = unpack_reference(layer.weight, layer.weight_scale)
+        bias = torch.randn(5120, device="cuda", dtype=torch.bfloat16) / 16
+        # Reproduce the real 17-token prompt failure before testing the adapter.
+        with self.assertRaisesRegex(RuntimeError, "multiple of 64"):
+            layer.scheme.apply_weights(layer, torch.ones(17, 288,
+                device="cuda", dtype=torch.bfloat16))
+        for rows in (1, 2, 3, 8, 17, 31, 128, 511, 512):
+            for with_bias in (False, True):
+                with self.subTest(rows=rows, bias=with_bias):
+                    x = torch.randn(rows, 288, device="cuda", dtype=torch.bfloat16)
+                    x[0, :32] = 0
+                    x[:, 32:64] *= 64
+                    b = bias if with_bias else None
+                    qdq = mxfp4_hip_reference(x).cuda()
+                    # An independent even-row stock call must agree exactly
+                    # with the CPU reference, including each original row.
+                    stock_qdq = qdq_mxfp4_hip(torch.cat((x, x), dim=0))[:rows]
+                    torch.testing.assert_close(stock_qdq, qdq, atol=0, rtol=0)
+                    expected = torch.nn.functional.linear(qdq.float(), weight,
+                        b.float() if b is not None else None).bfloat16()
+                    actual = method.apply(layer, x, b)
+                    self.assertEqual(actual.shape, (rows, 5120))
+                    torch.testing.assert_close(actual, expected, atol=.03, rtol=.01)
+
     def test_exact_uva_all_devices(self):
         from vllm.models.deepseek_v41.common.engram import _allocate_huge_page_storage
         from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
@@ -146,6 +206,67 @@ class DeepseekGPU(unittest.TestCase):
         self.assertEqual(offloader.cpu_offload_bytes, expected.numel() * expected.element_size())
         actual = (module.experts.weight + 0).cpu()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_host_expert_tp8_copies_match_stock_bytes(self):
+        from r9700_vllm.compat.deepseek import offload_parameters
+        from r9700_vllm.compat.deepseek_loading import load_host_expert
+        from r9700_vllm.compat.deepseek_load_buffer import BufferedLoadCopies
+        from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+        from vllm.model_executor.layers.fused_moe.routed_experts import FusedMoeWeightScaleSupported
+        from vllm.models.deepseek_v41.common.engram import _allocate_huge_page_storage
+        from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+        layer = RoutedExperts.__new__(RoutedExperts)
+        torch.nn.Module.__init__(layer)
+        layer.quant_config = None
+        layer.quant_method = SimpleNamespace()
+        layer.expert_map_manager = SimpleNamespace(map_global_to_local=lambda n: n)
+        generator = torch.Generator().manual_seed(410512)
+        for rank in range(8):
+            layer.moe_config = SimpleNamespace(tp_rank=rank, is_act_and_mul=True,
+                tp_shard_with_padding=False, moe_parallel_config=SimpleNamespace(tp_size=8))
+            # Real TP8 dimensions, two experts including an untouched sentinel.
+            for scale in (False, True):
+                for projection in ('w13', 'w2'):
+                    with self.subTest(rank=rank, scale=scale, projection=projection):
+                        width = (160 if scale else 2560) if projection == 'w13' else (9 if scale else 144)
+                        shape = (2, 576 if projection == 'w13' else 5120, width)
+                        initial = torch.full(shape, 37, dtype=torch.uint8, device='cuda')
+                        stock = torch.nn.Parameter(initial.clone(), False)
+                        buffered = torch.nn.Parameter(initial.clone(), False)
+                        module = torch.nn.Module()
+                        module.register_parameter('weight', torch.nn.Parameter(initial, False))
+                        budget = SimpleNamespace(cpu_offload_bytes=0, cpu_offload_max_bytes=1,
+                                                 cpu_offload_params=set())
+                        offload_parameters(budget, module, '', _allocate_huge_page_storage,
+                                           get_accelerator_view_from_cpu_tensor)
+                        candidate = module.weight
+                        stock.quant_method = candidate.quant_method = FusedMoeWeightScaleSupported.GROUP.value
+                        buffered.quant_method = stock.quant_method
+                        pointer = candidate.data_ptr()
+                        name = projection + ('_weight_scale' if scale else '_weight')
+                        for shard in (('w1', 'w3') if projection == 'w13' else ('w2',)):
+                            src_shape = (2304, width) if projection == 'w13' else (5120, width * 8)
+                            src = torch.randint(0, 256, src_shape, dtype=torch.uint8, generator=generator)
+                            args = dict(shard_id=shard, expert_id=1, return_success=True)
+                            self.assertTrue(RoutedExperts.weight_loader(layer, stock, src, name, **args))
+                            with BufferedLoadCopies(64 * 1024) as staging:
+                                self.assertTrue(RoutedExperts.weight_loader(
+                                    layer, buffered, src, name, **args))
+                                self.assertGreater(staging.copies, 0)
+                                count = staging.copies
+                                self.assertTrue(load_host_expert(RoutedExperts.weight_loader, layer,
+                                                                candidate, src, name, **args))
+                                self.assertEqual(staging.copies, count)  # host path unchanged
+                        torch.cuda.synchronize()
+                        self.assertEqual(candidate.data_ptr(), pointer)
+                        self.assertEqual(candidate.device.type, 'cuda')
+                        torch.testing.assert_close(candidate.cpu(), stock.cpu(), rtol=0, atol=0)
+                        torch.testing.assert_close(buffered.cpu(), stock.cpu(), rtol=0, atol=0)
+                        torch.testing.assert_close(candidate._r9700_host_view, stock.cpu(), rtol=0, atol=0)
+                        self.assertTrue(torch.all(candidate._r9700_host_view[0] == 37))
+                        # Keep the tiny test bounded even on allocators with delayed GC.
+                        del stock, buffered, candidate, module, initial
+                        gc.collect()
 
     def test_sparse_attention(self):
         from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
