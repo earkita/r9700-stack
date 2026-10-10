@@ -9,6 +9,17 @@ Anthropic-compatible clients, running separately from the GPU server.
 
 The shared `serve/serve.sh` stores generated caches inside the mounted checkout:
 `.runtime/cache/vllm/<configuration-hash>/` and `.runtime/cache/triton/`.
+
+GLM C2/C4 also expose `KV_CACHE_DIR`, defaulting to `/mnt/ai/cache/` on the host,
+mounted at `/kv-cache` in the container. Override it like other profile settings:
+`bash serve/baseline-earkita/glm-5.3-flash-c4.sh KV_CACHE_DIR=/mnt/other/kv-cache`.
+An empty `KV_CACHE_DIR=` disables this mount. GLM C2/C4 can opt into the
+experimental LMCache service with `KV_OFFLOAD=lmcache`; it remains off by default
+and passed bounded C1/C4 functional checks, including filesystem restoration
+after clearing GPU/RAM caches. Long-context capacity and performance remain
+unqualified. Both endpoints require the scoped geometry/completion adapters.
+See [GLM offload status](notes/glm-overview.md#experimental-nvme-prefix-cache).
+Compilation caches remain in `.runtime/cache/`.
 The `.runtime/` directory is excluded from Git and Docker build contexts.
 Benchmark transcripts and generated fixtures belong in ignored `bench/results/`.
 
@@ -226,7 +237,7 @@ restart once (the launch that compiles gets a smaller KV pool).
 
 For GLM, start with the [current profiles, launch instructions and capacity limits](notes/glm-overview.md).
 
-**GLM profiles:** `serve/glm-5.3-flash-c2.sh` and `serve/glm-5.3-flash-c4.sh`
+**GLM profiles:** `serve/baseline-earkita/glm-5.3-flash-c2.sh` and `serve/baseline-earkita/glm-5.3-flash-c4.sh`
 call `serve/serve.sh` directly. They use TP8, DFlash K4, shared FP8 KV/APC,
 NBT2048 and 4.125 GiB KV per GPU, with two/four active requests. Vision allows
 100 images across each request's entire history, up to 2048 tokens per image.
@@ -235,7 +246,7 @@ share the cache. The current C4 vision start reports 700416 tokens; Claude
 Code's template declares 524288. These are limits, not full-context quality
 qualifications. Preview with `DRYRUN=1`.
 
-`serve/glm-5.3-flash.sh` remains the conservative text-only TP8 / 64K fallback,
+`serve/baseline-earkita/glm-5.3-flash.sh` remains the conservative text-only TP8 / 64K fallback,
 without speculation. All profiles require their corresponding checkpoints,
 image and plugin library; they do not stop an existing server.
 See [current settings and validation](notes/glm-overview.md), the

@@ -6,6 +6,8 @@
 #   GPUS=0,1 (HIP ordinals), TP=2 (4 = our N-rank P2P all-reduce <= 512 KB, RCCL above; R9K_ARN=0 for RCCL only), PORT=8080, NAME=vllmstock (two servers
 #   side by side need distinct GPUS/PORT/NAME), DOCKER_ARGS="-e NCCL_DEBUG=INFO ..." (extra docker run args),
 #   FP8_CONFIG_DIR=/host/path (optional block-FP8 launch configs, pinned Python 3.12 image).
+#   KV_CACHE_DIR=/host/path (optional writable mount at /kv-cache; does not enable a KV offload backend).
+#   KV_TRANSFER_CONFIG=<JSON> (optional vLLM connector config; cache service is started separately).
 # plus every R9K_* plugin knob (forwarded). WRAP=rocprof / PROF=1 for profiling.
 IMG=${IMG:-r9700/vllm:dev}
 REPO=${REPO:-$HOME/r9700-build/repo}
@@ -13,6 +15,14 @@ REPO=${REPO:-$HOME/r9700-build/repo}
 # on this box -> no RCCL P2P -> SHM transport, whose proxy round-trips cost ~1-2 ms per all-reduce inside HIP graphs
 # (130 ms/step with 99 all-reduces). tcclaviger's image runs =0.
 MNT=(-v $REPO:/opt/r9700)
+# Storage location only: the model's KV connector must be configured separately.
+if [ -n "${KV_CACHE_DIR:-}" ]; then
+  case "$KV_CACHE_DIR" in
+    /*) ;;
+    *) echo 'KV_CACHE_DIR must be an absolute host path.' >&2; exit 2 ;;
+  esac
+  MNT+=(-v "$KV_CACHE_DIR:/kv-cache")
+fi
 # Optional block-FP8 launch configurations for the pinned Python 3.12 image.
 # Mount individual files so the image's other tuned shapes remain available.
 FP8_CONFIG_HASH=
@@ -54,6 +64,7 @@ for v in $(env | grep -o '^R9K_[A-Z0-9_]*'); do MNT+=(-e "$v=${!v}"); done
 # and every VLLM_* variable (stock vLLM env knobs, e.g. VLLM_KV_CACHE_LAYOUT)
 for v in $(env | grep -o '^VLLM_[A-Z0-9_]*'); do MNT+=(-e "$v=${!v}"); done
 ARGS=()
+[ -z "${KV_TRANSFER_CONFIG:-}" ] || ARGS+=(--kv-transfer-config "$KV_TRANSFER_CONFIG")
 # ATTN=<backend> (e.g. TRITON_ATTN) for the target; DRAFT_ATTN=<backend> for a separate drafter (must support
 # full cudagraphs or vLLM runs the draft eagerly)
 [ -n "$ATTN" ] && ARGS+=(--attention-backend "$ATTN")
@@ -146,6 +157,7 @@ CMD=(docker run -d --name "${NAME:-vllmstock}" --ipc=host --network=host ${PIDNS
 if [ "${DRYRUN:-0}" = 1 ]; then
   printf '%q ' "${CMD[@]}"; echo; exit 0
 fi
+[ -z "${KV_CACHE_DIR:-}" ] || mkdir -p "$KV_CACHE_DIR" || exit 1
 # Opt-in structural checkpoint check, in the runtime's Python environment. No GPU allocation.
 if [ -n "${MODEL_PREFLIGHT:-}" ]; then
   ${DOCKER_SUDO-sudo} docker run --rm --entrypoint python3 "${MNT[@]}" \

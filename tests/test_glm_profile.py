@@ -67,8 +67,21 @@ class Launcher(unittest.TestCase):
     def launch(self, profile, *assignments, **env):
         clean = {k: v for k, v in os.environ.items() if not k.startswith(("R9K_", "VLLM_"))}
         clean.update(DRYRUN="1", REPO=str(ROOT), **env)
-        out = subprocess.check_output(["bash", str(ROOT / "serve" / profile), *assignments], env=clean, text=True)
+        out = subprocess.check_output(["bash", str(ROOT / "serve" / ("baseline-earkita" if profile.startswith("glm-") else "") / profile), *assignments], env=clean, text=True)
         return shlex.split(out)
+
+    def test_lmcache_matches_model_ipc_environment(self):
+        # Cross-container ROCm IPC needs host networking as well as IPC/PID;
+        # the image's legacy=1 default cannot be inherited by the cache server.
+        cache = shlex.split(subprocess.check_output(
+            ["bash", str(ROOT / "serve/glm-kv-cache.sh"), "DRYRUN=1"],
+            text=True))
+        for count in (2, 4):
+            model = self.launch(f"glm-5.3-flash-c{count}.sh", "KV_OFFLOAD=lmcache")
+            for flag in ("--network=host", "--ipc=host", "--pid=host",
+                         "HSA_ENABLE_IPC_MODE_LEGACY=0"):
+                self.assertIn(flag, cache)
+                self.assertIn(flag, model)
 
     def test_dflash_is_separate_and_explicit(self):
         args = self.launch("glm-5.3-flash-c2.sh", MODEL="/models/local GLM")

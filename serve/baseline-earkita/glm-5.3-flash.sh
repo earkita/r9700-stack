@@ -6,9 +6,10 @@
 # Experimental C1 W4A4: pass R9K_GLM_MOE=w4a4 BUILD_KERNELS=1 (stock by default).
 # Opt-in C1 graph: also pass EAGER=0 CGMODE=FULL_DECODE_ONLY CGSIZES=1 KVMEM=1.25.
 # See notes/glm-testing.md for validation requirements.
+serve_dir=$(dirname "$(dirname "$(realpath "$0")")")
 exec env \
   IMG="${IMG:-r9700/vllm:dev}" \
-  REPO="${REPO:-$(dirname "$(dirname "$(realpath "$0")")")}" \
+  REPO="${REPO:-$(dirname "$serve_dir")}" \
   MODEL="${MODEL:-amd/GLM-5.3-Flash-Quark-MXFP4}" \
   MODEL_PREFLIGHT=r9700_vllm.models.glm5_next \
   SERVED_MODEL_NAME=glm-5.3-flash NAME="${NAME:-glm53-flash-baseline}" REPLACE=0 \
@@ -20,4 +21,4 @@ exec env \
   R9K_EXPERT_CACHE_SLOTS=0 R9K_TARGET_LMHEAD=stock R9K_DRAFT_LMHEAD=stock \
   VLLM_ROCM_USE_AITER=1 UTIL="${UTIL:-0.90}" \
   EXTRA="--disable-custom-all-reduce ${EXTRA:-}" \
-  "$@" bash "$(dirname "$(realpath "$0")")/serve.sh"
+  "$@" bash "$serve_dir/serve.sh"

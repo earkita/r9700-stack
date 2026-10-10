@@ -10,9 +10,9 @@ Only these three GLM launchers are maintained. Each invokes the shared
 
 | Profile | Role | Active sequences | Context limit | Speculation |
 |---|---|---:|---|---|
-| [glm-5.3-flash-c2.sh](../serve/glm-5.3-flash-c2.sh) | Two concurrent requests | 2 | auto | DFlash K4 |
-| [glm-5.3-flash-c4.sh](../serve/glm-5.3-flash-c4.sh) | Four concurrent requests | 4 | auto | DFlash K4 |
-| [glm-5.3-flash.sh](../serve/glm-5.3-flash.sh) | Conservative fallback | 1 | 65536 | Off |
+| [glm-5.3-flash-c2.sh](../serve/baseline-earkita/glm-5.3-flash-c2.sh) | Two concurrent requests | 2 | auto | DFlash K4 |
+| [glm-5.3-flash-c4.sh](../serve/baseline-earkita/glm-5.3-flash-c4.sh) | Four concurrent requests | 4 | auto | DFlash K4 |
+| [glm-5.3-flash.sh](../serve/baseline-earkita/glm-5.3-flash.sh) | Conservative fallback | 1 | 65536 | Off |
 
 C2/C4 share these defaults:
 
@@ -130,8 +130,8 @@ results are stored in the ignored evidence directory above.
 Run from the repository root. Preview without starting a service:
 
 ```bash
-bash serve/glm-5.3-flash-c2.sh DRYRUN=1
-bash serve/glm-5.3-flash-c4.sh DRYRUN=1
+bash serve/baseline-earkita/glm-5.3-flash-c2.sh DRYRUN=1
+bash serve/baseline-earkita/glm-5.3-flash-c4.sh DRYRUN=1
 ```
 
 C2/C4 expect local target/draft checkpoints under `/mnt/ai/models/glm` by
@@ -144,10 +144,10 @@ Build the image from the repository root with
 On idle GPUs and a free API port:
 
 ```bash
-bash serve/glm-5.3-flash-c4.sh
+bash serve/baseline-earkita/glm-5.3-flash-c4.sh
 # Alternatively, the qualified fixed context settings:
-# bash serve/glm-5.3-flash-c2.sh MAXLEN=262144
-# bash serve/glm-5.3-flash-c4.sh MAXLEN=131072
+# bash serve/baseline-earkita/glm-5.3-flash-c2.sh MAXLEN=262144
+# bash serve/baseline-earkita/glm-5.3-flash-c4.sh MAXLEN=131072
 ```
 
 These are alternatives, not services to run together on the same GPUs/port.
@@ -180,3 +180,149 @@ strict match, semantic retrieval, output compliance and completion results.
 
 W4A16 and FULL_AND_PIECEWISE remain experiments, not defaults. Their bounded
 comparisons did not establish a consistent speed improvement.
+
+## Experimental NVMe prefix cache
+
+**Current status (2026-10-10): bounded functional checks passed; opt-in only.**
+The scoped adapters fix registration/cache geometry and replace HIP event
+handles with acknowledgements sent only after local GPU completion. Memory IPC
+and native copy kernels are retained. Both endpoints must use this completion
+protocol; it sacrifices transfer/compute overlap. Earlier trials caused memory
+faults and left HIP devices 1/3 unresponsive. After the administrator reset PCI
+e6:00.0/ec:00.0, both recovered and the corrected path passed the checks below.
+The precise driver/event failure has not been established by these checks.
+
+- Small native STORE probes passed on all eight GPUs; 14 CPU adapter tests
+  passed inside the pinned image (host suite: 24 passed, 3 skipped).
+- C1 cold/warm answers passed strict match, retrieval, format and completion.
+  The first cold prompt produced 72 files (667,395,072 bytes).
+- The model was stopped/restarted to discard GPU APC; LMCache L1 was explicitly
+  cleared and its memory-usage counter verified at zero. Files remained intact.
+  Repeating the 4246-token prompt restored **3456 tokens** and returned the
+  correct key. `fs_native` completed a load and vLLM recorded 3456 external hits.
+- Four distinct key prompts passed after restoration: strict 4/4, retrieval
+  4/4, format 4/4, completion 4/4, runtime errors 0. The final isolated C4 run
+  added 10,368 external hit tokens; no preemptions occurred. An earlier C4 run
+  overlapped the proxy smoke and is retained separately as mixed-load evidence.
+- LiteLLM OpenAI streaming and Anthropic streaming tool-call/image tool-result
+  checks passed. These used short histories, not restoration of image prefixes.
+
+Evidence and the frozen functional protocol are in ignored
+`bench/results/glm-ipc-fix-20261010/post-reset/`. GLM, the cache service and
+LiteLLM were left running. This is not a performance comparison, long-context
+qualification, acceptance-regression test, cache-daemon restart test, or a
+50-session capacity claim. The following paragraphs retain earlier failures.
+
+
+Startup qualification on 2026-10-10 **failed** before serving requests. LMCache
+0.5.3 calls the removed vLLM `get_kv_cache_layout()` helper; the pinned runtime
+uses `CacheConfig.get_resolved_kv_cache_layout()` instead. LMCache catches the
+import error and supplies no layout hint, causing cache registration to fail
+with `Unsupported kv_layout: none. Only NHD and HND are supported.` The cache
+service itself started, including its native filesystem adapter, but no disk
+store/reload or model correctness test passed. A compatibility adapter and
+full functional qualification were still required at that point. Evidence is
+in ignored `bench/results/glm-kv-offload-20261010/`.
+
+The original GLM container was restored with GPU APC; its health endpoint and
+completed-answer smoke checks directly and through LiteLLM passed. These are
+rollback checks, not offload qualification or a performance comparison. Offload is
+opt-in (`KV_OFFLOAD=lmcache`) in the C2/C4 profiles; `0`
+retains the existing launch. The shared launcher only forwards the optional
+`KV_TRANSFER_CONFIG` JSON; it does not start or manage a cache service.
+
+The subsequent 0.5.5 trial also **failed startup**, but passed the layout stage.
+`docker/Dockerfile.glm-lmcache` builds source commit
+`05a013b29da78cf2321b9b46ec5039dde2fb0bb0` with HIP code for gfx1201 on the
+qualified GLM image. It preserves torch 2.12.0+rocm10.0.0, Triton and vLLM;
+only LMCache and its build helper grpcio-tools are installed with `--no-deps`.
+The extension imports, four real vLLM layout mappings and all 21 upstream
+layout-discovery tests passed. At live registration, the cache server raised
+`hipErrorInvalidDevicePointer` in `torch.UntypedStorage._new_shared_cuda`,
+followed by a worker registration timeout. No inference or NVMe restoration
+test ran. The initial cache service inherited `HSA_ENABLE_IPC_MODE_LEGACY=1`,
+whereas the model used `=0`. The launcher now explicitly uses `=0` on both sides.
+The initial standalone probes also failed with `=0`, but omitted host networking:
+they did **not** reproduce the corrected service configuration. A 16-KiB tensor
+transfer subsequently passed both within one container and between containers
+sharing host network, IPC and PID namespaces. Adding ptrace/seccomp privileges
+without sharing the network namespace did not fix the failing probe. The probe
+interrupted by stopping its producer remains inconclusive.
+Evidence and the fixed prompt corpus are in ignored
+`bench/results/glm-kv-offload-055-20261010/`; corrected IPC probes are in
+`bench/results/glm-ipc-fix-20261010/`. Keep host networking and the non-legacy
+IPC setting aligned between the two services. A successful tensor probe alone
+does not qualify model cache restoration.
+
+The corrected IPC settings passed live TP8 registration. With the unmodified
+0.5.5 connector, C1/C4 answers and proxy streaming/tools/vision passed, but no
+cache objects were stored: the non-cacheable eight-token circular scratch group
+prevented the minimum stored span from reaching one 1152-token chunk. After
+adding the scoped geometry adapter, the first cold answer passed but the cache
+process hit a GPU memory-access fault on STORE; no filesystem restore passed
+in that attempt. CPU geometry tests and isolated eight-GPU transfers pass, including
+padded hybrid groups, compressed indexer state and IPC offsets above 4 GiB.
+These are diagnostic results, not qualification of GLM offload or a speed claim.
+Evidence: `bench/results/glm-ipc-fix-20261010/geometry-adapter/` (ignored).
+
+`serve/glm-kv-cache.sh` prepares a separate LMCache multiprocess service using
+the experimental `glm53-lmcache055` image. It checks the pinned vLLM and LMCache
+versions before initializing transfers. Use this same image for the candidate
+model. No vLLM patch or model-weight offload is involved. The profile selects
+`r9700_vllm.compat.glm_lmcache.GlmLMCacheMPConnector`, a version-guarded
+adapter over the upstream multiprocess connector. It excludes non-cacheable
+`KpoolTailSpec` scratch from external transfers and re-views MLA/indexer kernel
+pages as logical scheduler pages without copying or changing model allocations.
+The indexer retains its one-state-per-four-tokens compression.
+
+| Launcher setting | Default | Meaning |
+|---|---|---|
+| `KV_CACHE_DIR` | `/mnt/ai/cache/` | Host storage, mounted at `/kv-cache` |
+| `KV_CACHE_NAMESPACE` | `glm53-e975-fp8-dflash-k4-v2` | Disk subdirectory; choose a new one after changing weights, cache layout, kernels, or precision |
+| `KV_CACHE_RAM_GB` | `16` | LMCache L1 budget in GiB, total, plus process/transfer overhead; lazy allocation starts at 1 GiB |
+| `KV_CACHE_CHUNK` | `1152` | Token chunk span from the current GLM startup block-size log; must match runtime geometry |
+| `KV_CACHE_PORT` | `5555` | Local ZMQ port; set the same value in service and model launchers |
+| `KV_CACHE_METRICS_PORT` | `9091` | LMCache metrics port |
+| `KV_CACHE_IO_WORKERS` | `4` | Native filesystem I/O workers |
+
+The service uses separate object groups, RAM LRU, and the `fs_native` disk
+adapter. Disk I/O initially uses the OS page cache (`use_odirect=false`), so
+measurements must not label every external-cache hit a physical NVMe read.
+RAM LRU is not a disk quota: this script does **not** impose a total disk-space
+limit or promise retention of all sessions. Decide the disk budget/eviction
+policy before a long-running rollout. All cache files stay below the selected
+namespace; nothing is automatically deleted.
+
+Experimental commands for the tested configuration,
+on idle GPUs and with the existing model stopped:
+
+```bash
+# Start the cache service first; an existing container name fails without removal.
+docker build -f docker/Dockerfile.glm-lmcache -t r9700/vllm:glm53-lmcache055 .
+bash serve/glm-kv-cache.sh KV_CACHE_DIR=/mnt/ai/cache/ KV_CACHE_RAM_GB=16
+
+# Start GLM with offload. This does not stop/replace the currently running GLM.
+bash serve/baseline-earkita/glm-5.3-flash-c4.sh KV_OFFLOAD=lmcache KV_CACHE_PORT=5555 IMG=r9700/vllm:glm53-lmcache055
+# C2 uses the same KV_OFFLOAD switch.
+```
+
+Both launchers support `DRYRUN=1` without starting containers or creating cache
+directories. Stopping/removing the cache service is a separate, explicit action;
+it must not be stopped while a model using its connector is serving. Returning
+to `KV_OFFLOAD=0` requires relaunching the model and leaves stored files intact.
+
+Broader qualification is still required for long contexts, image-prefix
+restoration and long-running cache eviction. The 0.5.3
+connector required `block_size <= NBT < 2 * block_size` for Mamba `align` mode;
+0.5.5 retains the lower bound. The observed block size 1152 and current
+NBT2048 satisfy both checks. Do not
+disable the hybrid cache manager or remove geometry checks to force startup.
+On upgrades, repeat the disk-backed hit after eviction from GPU and RAM and
+the C1/C4 and proxy checks. DFlash acceptance/performance comparisons require
+the matched protocol in `glm-testing.md`; this functional smoke does not
+establish absence of a performance regression.
+
+References: [LMCache hybrid groups](https://docs.lmcache.ai/mp/hybrid_models.html),
+[native filesystem adapter](https://docs.lmcache.ai/mp/l2_storage/fs_native.html),
+[GLM recipe](https://docs.lmcache.ai/recipes/glm5_3.html). The GLM recipe explicitly
+does not validate the Flash variant or our DFlash combination.

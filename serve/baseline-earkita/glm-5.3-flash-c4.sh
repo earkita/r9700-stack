@@ -6,10 +6,14 @@
 # Rozmiary grafow musza odpowiadac liczbie sekwencji; uwzglednij tez argumenty CLI.
 NSEQ=${NSEQ:-4}
 MAXLEN=${MAXLEN:-auto}
+KV_OFFLOAD=${KV_OFFLOAD:-0} # 0 = APC w VRAM; lmcache = eksperymentalny RAM + NVMe.
+KV_CACHE_PORT=${KV_CACHE_PORT:-5555} # Port osobno uruchamianego serve/glm-kv-cache.sh.
 for arg in "$@"; do
   case "$arg" in
     NSEQ=*) NSEQ=${arg#*=} ;;
     MAXLEN=*) MAXLEN=${arg#*=} ;;
+    KV_OFFLOAD=*) KV_OFFLOAD=${arg#*=} ;;
+    KV_CACHE_PORT=*) KV_CACHE_PORT=${arg#*=} ;;
   esac
 done
 case "$NSEQ" in
@@ -19,7 +23,16 @@ case "$NSEQ" in
   *) echo 'NSEQ must be 1, 2 or 4.' >&2; exit 2 ;;
 esac
 [ "$MAXLEN" = auto ] && MAXLEN=-1
-serve_dir=$(dirname "$(realpath "$0")")
+serve_dir=$(dirname "$(dirname "$(realpath "$0")")")
+kv_args=()
+case "$KV_OFFLOAD" in
+  0) ;;
+  lmcache)
+    kv_config=$(python3 "$serve_dir/glm_kv_transfer.py" "$KV_CACHE_PORT") || exit $?
+    kv_args=("KV_TRANSFER_CONFIG=$kv_config")
+    ;;
+  *) echo 'KV_OFFLOAD must be 0 or lmcache.' >&2; exit 2 ;;
+esac
 
 exec env \
   REPO="${REPO:-$(dirname "$serve_dir")}" `# Katalog pluginu na hoscie.` \
@@ -46,7 +59,8 @@ exec env \
   KV_DTYPE=fp8_e4m3 `# Format KV modelu glownego.` \
   DRAFT_KV_DTYPE=fp8_e4m3 `# Format KV draftera; jego wagi pozostaja BF16.` \
   PREFIX_CACHE=1 `# APC: ponowne wykorzystanie wspolnych prefiksow.` \
-  OFFLOAD_GB=0 `# Wagi pozostaja na GPU; offload KV tez nie jest skonfigurowany.` \
+  KV_CACHE_DIR="${KV_CACHE_DIR-/mnt/ai/cache/}" `# Katalog NVMe; ten sam podaj osobnemu launcherowi glm-kv-cache.sh.` \
+  OFFLOAD_GB=0 `# Wagi pozostaja na GPU; KV_OFFLOAD dotyczy tylko cache prefiksow.` \
   MTP= `# Wbudowane MTP wylaczone; korzystamy z DFlash.` \
   EAGER=0 `# Uzywaj grafow, zamiast wymuszac eager.` \
   SPEC=4 `# K4: drafter proponuje 4 tokeny na krok.` \
@@ -83,6 +97,6 @@ exec env \
   R9K_ARN_MAX_KB=16 R9K_AR4=0 R9K_AR_QUANT=0 \
   R9K_EXPERT_CACHE_SLOTS=0 `# Bez cache ekspertow offloadowanych z CPU.` \
   R9K_TARGET_LMHEAD=stock R9K_DRAFT_LMHEAD=stock \
-  "$@" \
+  "$@" "${kv_args[@]}" \
   MAXLEN="$MAXLEN" \
   bash "$serve_dir/serve.sh"

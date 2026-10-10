@@ -1,0 +1,20 @@
+# Experimental NVMe cache image; keep the qualified GLM image for rollback.
+# Build: docker build -f docker/Dockerfile.glm-lmcache -t r9700/vllm:glm53-lmcache055 .
+ARG BASE=r9700/vllm:glm53-plugin-e97573215
+FROM ${BASE}
+# LMCache v0.5.5, pinned to source rather than a moving tag or CUDA wheel.
+ARG LMCACHE_COMMIT=05a013b29da78cf2321b9b46ec5039dde2fb0bb0
+ARG MAX_JOBS=4
+RUN python3 -c 'import importlib.metadata as m,json; from pathlib import Path; Path("/tmp/glm-runtime.json").write_text(json.dumps({p:m.version(p) for p in ("torch","vllm","triton")}))' \
+ && pip install --no-deps grpcio-tools==1.78.0 \
+ && mkdir -p /tmp/lmcache-src \
+ && curl -fL "https://api.github.com/repos/LMCache/LMCache/tarball/${LMCACHE_COMMIT}" -o /tmp/lmcache.tar.gz \
+ && tar -xzf /tmp/lmcache.tar.gz --strip-components=1 -C /tmp/lmcache-src \
+ && cd /tmp/lmcache-src \
+ && BUILD_WITH_HIP=1 CXX=hipcc PYTORCH_ROCM_ARCH=gfx1201 \
+    HIPCC_COMPILE_FLAGS_APPEND=--offload-arch=gfx1201 MAX_JOBS=${MAX_JOBS} \
+    SETUPTOOLS_SCM_PRETEND_VERSION=0.5.5 \
+    pip install --no-deps --no-build-isolation . \
+ && cd / \
+ && python3 -c 'import importlib.metadata as m,json; from pathlib import Path; old=json.loads(Path("/tmp/glm-runtime.json").read_text()); assert old=={p:m.version(p) for p in old}; assert m.version("lmcache")=="0.5.5"; import lmcache.cuda_ops; print("GLM runtime unchanged; LMCache HIP extension imports")' \
+ && rm -rf /tmp/lmcache-src /tmp/lmcache.tar.gz /tmp/glm-runtime.json
