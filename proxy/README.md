@@ -10,7 +10,7 @@ OpenAI / Anthropic client -> 127.0.0.1:4000 -> vLLM :8080
 
 ## Start
 
-Start a GLM profile first, for example `serve/glm-5.3-flash-c4.sh`. Create a
+Start a GLM profile first, for example `serve/baseline-earkita/glm-5.3-flash-c4.sh`. Create a
 local credential file once, from the repository root:
 
 ```bash
@@ -166,8 +166,8 @@ claude --settings "$PWD/serve/templates/mimo-v2.6-flash.settings.local.json"
 ```
 
 The same local proxy key and port 4000 work for both. GPU launchers are
-`serve/glm-5.3-flash-c2.sh` / `-c4.sh` and
-`serve/mimo-v2.6-flash-c2.sh` / `-c4.sh`. Recreate older containers through these
+`serve/baseline-earkita/glm-5.3-flash-c2.sh` / `-c4.sh` and
+`serve/baseline-earkita/mimo-v2.6-flash-c2.sh` / `-c4.sh`. Recreate older containers through these
 profiles when their saved mounts point to retired cache/config paths.
 
 For a manual task comparison, start fresh conversations from the same clean

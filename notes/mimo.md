@@ -17,9 +17,9 @@ All three profiles call the common `serve.sh` directly:
 
 ```bash
 docker build -f docker/Dockerfile -t r9700/vllm:mimo-e97573215 .
-bash serve/mimo-v2.6-flash-c4.sh DRYRUN=1
+bash serve/baseline-earkita/mimo-v2.6-flash-c4.sh DRYRUN=1
 # After gracefully stopping the previous GPU server:
-bash serve/mimo-v2.6-flash-c4.sh
+bash serve/baseline-earkita/mimo-v2.6-flash-c4.sh
 ```
 
 The Dockerfile pins vLLM `e9757321527ca1ecd514c07c1418dd2c53da3d19` on ROCm 10.
@@ -35,8 +35,8 @@ RCCL, original scales (`R9K_FOLD=0`) and DFlash K7. `SPEC=0` selects the control
 `MAXLEN=32768` is the initial bring-up limit. Text and tools only. Configured
 context and actual concurrent capacity are separate claims.
 
-For a shared, explicitly sized cache, use `serve/mimo-v2.6-flash-c2.sh` or
-`serve/mimo-v2.6-flash-c4.sh`. Each independently calls `serve.sh`; neither
+For a shared, explicitly sized cache, use `serve/baseline-earkita/mimo-v2.6-flash-c2.sh` or
+`serve/baseline-earkita/mimo-v2.6-flash-c4.sh`. Each independently calls `serve.sh`; neither
 chains through another model profile. They default to two/four active requests,
 `MAXLEN=auto`, 7.625 GiB KV per GPU and exact AR8. DFlash K7, BF16 KV and eager
 execution remain enabled. `auto` determines the maximum **single** request;
@@ -60,7 +60,7 @@ Confirm all eight ranks log `8-rank P2P all-reduce installed` before measuring;
 the communicator can fall back to RCCL if initialization fails.
 
 ```bash
-bash serve/mimo-v2.6-flash.sh AR8=1
+bash serve/baseline-earkita/mimo-v2.6-flash.sh AR8=1
 ```
 
 The pinned vLLM already supplies TP4→TP8 QKV sharding and the MiMo-compatible
@@ -269,7 +269,7 @@ qualification performed with RCCL.
 The allocation search established an explicit `KVMEM=7.625` GiB per GPU
 (61 GiB across eight cards), compared with 6.596 GiB from automatic sizing.
 The fallback profile's default remains automatic; reproduce the tested budget with
-`bash serve/mimo-v2.6-flash.sh AR8=1 KVMEM=7.625` when replacing the server.
+`bash serve/baseline-earkita/mimo-v2.6-flash.sh AR8=1 KVMEM=7.625` when replacing the server.
 Explicit KV bytes override utilization-based cache sizing. This search kept
 MAXLEN=131072 and NSEQ=2; client/proxy declarations were unchanged during that search.
 The recreated runtime uses the repository's `.runtime/cache/` mounts.
