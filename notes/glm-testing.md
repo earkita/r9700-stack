@@ -5,6 +5,62 @@ and runtime described in [the current profile overview](glm-overview.md). Keep A
 contract, throughput, numerical regression and completed-answer quality
 results separate. Passing one does not qualify the others.
 
+## Earkita automated baseline
+
+The versioned [earkita standard](../bench/baseline-earkita/README.md) defines
+C1/C2/C4 × 8K/32K/128K × low/high/max × cold/RAM/disk, with pinned sampling,
+BetterBench, cache-source proofs and separate completed-answer NIAH checks.
+`bash bench/baseline-earkita/glm.sh` prepares and executes it unattended against
+an explicitly prepared, exclusive benchmark deployment. It does not start or
+restart production. Read its setup requirements before execution; a missing
+reset endpoint or insufficient cache fails preflight rather than changing the
+protocol. Raw results stay in ignored `bench/results/`.
+
+## Mandatory PCIe preflight (all models)
+
+Before every GPU/runtime test or benchmark series, verify the connections of
+**all participating GPUs**, not just GPU 0. CPU-only unit tests and documentation
+checks do not need GPU inspection. Save a timestamped snapshot with the test
+protocol in its ignored `bench/results/<run>/` directory, including:
+
+- GPU identity and PCI domain:bus:device.function (BDF), mapped to HIP ordinal
+  and TP/EP worker rank. Do not assume AMD-SMI IDs equal HIP ordinals.
+- PCIe topology: root ports, bridges/switches, shared upstream links and NUMA
+  nodes. Check upstream link limits as well as the GPU endpoint; eight x16
+  endpoints do not imply eight independent x16 paths to the CPU.
+- Maximum supported and currently negotiated link speed (GT/s / generation)
+  and width (x4/x8/x16 etc.), for the endpoints and relevant upstream bridges.
+- Idle readings and readings during the **already planned** warmup or test,
+  plus the expected configuration and any discrepancies. Power saving may
+  reduce idle link speed; do not diagnose degradation from idle speed alone.
+
+Example read-only captures (choose a fresh run directory):
+
+```bash
+RUN_DIR=bench/results/<run>/pcie-before
+mkdir -p "$RUN_DIR"
+date -u +%FT%TZ > "$RUN_DIR/timestamp.txt"
+amd-smi list --json > "$RUN_DIR/amd-smi-devices.json"
+amd-smi metric --pcie --json > "$RUN_DIR/amd-smi-pcie-idle.json"
+lspci -Dtv > "$RUN_DIR/topology.txt"
+lspci -Dvv > "$RUN_DIR/pci-details.txt"
+```
+
+Record the runtime's HIP-to-BDF/worker mapping alongside these captures. Read
+`LnkCap` and `LnkSta` in `lspci` output; PCI sysfs also exposes
+`max_link_speed`, `max_link_width`, `current_link_speed`, `current_link_width`
+and `numa_node`. Repeat the link readings during warmup/test into separate
+files. Missing fields or insufficient permissions are **unknown**, not PASS;
+obtain the missing evidence before accepting the hardware preflight.
+
+Recheck after a reboot, GPU reset, slot/cabling/BIOS change, or runtime device-map
+change, and before each comparison variant. Report unexpected downtraining,
+shared-uplink differences or changed GPU ordering before interpreting speed.
+Resolve them or label the affected performance results **not comparable**;
+do not attribute a slowdown to a kernel/model change without this check. An
+explicit PCIe experiment must declare the link change as its experimental
+variable. This requirement does not authorize extra stress tests or restarts.
+
 ## Sampling and thinking
 
 The local checkpoint at `/mnt/ai/models/glm/GLM-5.3-Flash-Quark-MXFP4`,

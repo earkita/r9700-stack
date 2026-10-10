@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--lengths", type=int, nargs="+", default=[8192, 32768])
     parser.add_argument("--depths", type=int, nargs="+", default=[5, 35, 65, 95])
+    parser.add_argument("--effort", choices=["low", "high", "max"], default="high")
     parser.add_argument("--records", type=int, default=2048,
                         help="Background records available; use 4096 for 128K")
     args = parser.parse_args()
@@ -48,7 +49,7 @@ def main():
 
             def render(msgs, tokenize=True):
                 return tokenizer.apply_chat_template(msgs, tokenize=tokenize,
-                            add_generation_prompt=True, reasoning_effort="high", return_dict=False)
+                            add_generation_prompt=True, reasoning_effort=args.effort, return_dict=False)
 
             lo, hi = 0, len(records)
             while lo < hi:
@@ -84,7 +85,7 @@ def main():
     (args.out / "corpus.json").write_text(corpus)
     (args.out / "manifest.json").write_text(json.dumps({
         "design": "Single explicit needle in coherent numbered archive records; no inference during preparation",
-        "thinking": "high", "tokenizer": args.model, "cases": manifest,
+        "thinking": args.effort, "tokenizer": args.model, "cases": manifest,
         "corpus_sha256": hashlib.sha256(corpus.encode()).hexdigest(),
     }, indent=2) + "\n")
 

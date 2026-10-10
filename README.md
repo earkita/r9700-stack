@@ -5,6 +5,8 @@ Optional MiMo deployment: [MiMo-V2.6-Flash-MOPD on 8× R9700](notes/mimo.md).
 Optional local API gateway: [LiteLLM setup](proxy/README.md) for OpenAI and
 Anthropic-compatible clients, running separately from the GPU server.
 
+GLM C4 with NVMe prefix cache: [`serve/baseline-earkita/glm-5.3-flash-c4-lmcache.sh`](serve/baseline-earkita/glm-5.3-flash-c4-lmcache.sh) starts the cache service and model; `DRYRUN=1` previews both. The [earkita benchmark suite](bench/baseline-earkita/README.md) records prefill, decode, and cache behavior in a dedicated session.
+
 Tuned GPU kernels and a vLLM plugin that make **Qwen3.8** run fast on **AMD Radeon AI PRO R9700** cards
 (gfx1201 / RDNA4) on **stock vLLM and stock ROCm**. No fork, no patched source, no vendored binaries: everything
 loads at runtime through vLLM's own extension points, so vLLM and ROCm update underneath it.
