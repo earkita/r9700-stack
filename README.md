@@ -19,6 +19,9 @@ and passed bounded C1/C4 functional checks, including filesystem restoration
 after clearing GPU/RAM caches. Long-context capacity and performance remain
 unqualified. Both endpoints require the scoped geometry/completion adapters.
 See [GLM offload status](notes/glm-overview.md#experimental-nvme-prefix-cache).
+The dedicated `serve/baseline-earkita/glm-5.3-flash-c4-lmcache.sh` profile selects
+the connector and candidate image by default and starts the cache service before
+launching GLM. Use `DRYRUN=1` to preview both containers.
 Compilation caches remain in `.runtime/cache/`.
 The `.runtime/` directory is excluded from Git and Docker build contexts.
 Benchmark transcripts and generated fixtures belong in ignored `bench/results/`.
@@ -254,6 +257,11 @@ See [current settings and validation](notes/glm-overview.md), the
 [testing guidelines](notes/glm-testing.md). Dense FP8 tuning is opt-in through
 `FP8_CONFIG_DIR="$PWD/tuning/configs/glm"`; it has not established a repeatable
 whole-model speedup.
+
+The [automated earkita baseline suite](bench/baseline-earkita/README.md) records
+prefill/TTFT and decode for C1/C2/C4, 8K/32K/128K, low/high/max reasoning and
+cold/RAM/disk cache, with separate NIAH correctness fields. It requires a
+dedicated benchmark session and never restarts production automatically.
 
 `R9K_GLM_MOE=w4a16` enables an experimental BF16-activation variant on the
 same MXFP4 weights. Bounded checks pass, but C1/C2 measurements show no

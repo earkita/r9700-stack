@@ -5,13 +5,14 @@ record their own settings; check the running API for live service status.
 
 ## Profiles
 
-Only these three GLM launchers are maintained. Each invokes the shared
+These four GLM launchers are maintained. Each invokes the shared
 [`serve.sh`](../serve/serve.sh) directly.
 
 | Profile | Role | Active sequences | Context limit | Speculation |
 |---|---|---:|---|---|
 | [glm-5.3-flash-c2.sh](../serve/baseline-earkita/glm-5.3-flash-c2.sh) | Two concurrent requests | 2 | auto | DFlash K4 |
 | [glm-5.3-flash-c4.sh](../serve/baseline-earkita/glm-5.3-flash-c4.sh) | Four concurrent requests | 4 | auto | DFlash K4 |
+| [glm-5.3-flash-c4-lmcache.sh](../serve/baseline-earkita/glm-5.3-flash-c4-lmcache.sh) | Experimental C4 with RAM/NVMe prefix cache | 4 | auto | DFlash K4 |
 | [glm-5.3-flash.sh](../serve/baseline-earkita/glm-5.3-flash.sh) | Conservative fallback | 1 | 65536 | Off |
 
 C2/C4 share these defaults:
@@ -32,6 +33,13 @@ C2/C4 share these defaults:
 The fallback retains stock model/quantization paths, eager execution and APC
 off. Its default image is `r9700/vllm:dev` and model is a Hub ID; it does not
 inherit the C2/C4 image or local model paths.
+
+The separate `c4-lmcache` profile uses the C4 settings with
+`KV_OFFLOAD=lmcache`, image `r9700/vllm:glm53-lmcache055`, and container name
+`glm53-flash-c4-lmcache`. It starts the separate cache service first (container
+`glm53-kv-cache-c4`, override with `KV_CACHE_NAME`), waits for its transfer server
+to be ready, then calls `serve.sh` directly. Its offload validation covers short C1/C4
+prompts; the `auto` context limit is not a long-context qualification.
 
 ### Vision qualification (2026-10-03)
 
@@ -178,6 +186,11 @@ For all new measurements, follow [GLM testing](glm-testing.md): explicit
 temperature/thinking, exact token counts, decode excluding TTFT, and separate
 strict match, semantic retrieval, output compliance and completion results.
 
+The [automated earkita baseline](../bench/baseline-earkita/README.md) fixes the
+C1/C2/C4 × 8K/32K/128K × low/high/max matrix with cold, RAM and disk cache
+proofs. It runs unattended on a dedicated benchmark deployment and preserves
+all attempts; adding the runner does not qualify the untested full matrix.
+
 W4A16 and FULL_AND_PIECEWISE remain experiments, not defaults. Their bounded
 comparisons did not establish a consistent speed improvement.
 
@@ -297,14 +310,22 @@ Experimental commands for the tested configuration,
 on idle GPUs and with the existing model stopped:
 
 ```bash
-# Start the cache service first; an existing container name fails without removal.
+# Build once if the candidate image is not already available.
 docker build -f docker/Dockerfile.glm-lmcache -t r9700/vllm:glm53-lmcache055 .
-bash serve/glm-kv-cache.sh KV_CACHE_DIR=/mnt/ai/cache/ KV_CACHE_RAM_GB=16
 
-# Start GLM with offload. This does not stop/replace the currently running GLM.
-bash serve/baseline-earkita/glm-5.3-flash-c4.sh KV_OFFLOAD=lmcache KV_CACHE_PORT=5555 IMG=r9700/vllm:glm53-lmcache055
-# C2 uses the same KV_OFFLOAD switch.
+# One command starts cache, waits for it, then launches the model.
+bash serve/baseline-earkita/glm-5.3-flash-c4-lmcache.sh KV_CACHE_DIR=/mnt/ai/cache/ KV_CACHE_RAM_GB=16
+# Preview both commands without starting anything:
+bash serve/baseline-earkita/glm-5.3-flash-c4-lmcache.sh DRYRUN=1
 ```
+
+The combined profile does not replace existing containers. If starting GLM's
+container fails, it stops only the cache container created by that invocation.
+Model loading/warmup is asynchronous after launch; check the API health endpoint
+for model readiness. Existing services and stored files are not removed.
+For separate lifecycle management (including C2), `serve/glm-kv-cache.sh` remains
+available alongside the original profile's `KV_OFFLOAD=lmcache` switch and
+candidate `IMG` setting.
 
 Both launchers support `DRYRUN=1` without starting containers or creating cache
 directories. Stopping/removing the cache service is a separate, explicit action;
