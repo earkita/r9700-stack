@@ -104,6 +104,13 @@ class Launcher(unittest.TestCase):
         self.assertIn("R9K_GLM_DFLASH_SHARD_FC=1", args)
         self.assertNotIn("--no-enable-prefix-caching", args)
 
+    def test_upstream_all_gather_requires_explicit_opt_in(self):
+        for profile in ("glm-5.3-flash-c2.sh", "glm-5.3-flash-c4.sh",
+                        "glm-5.3-flash-c4-lmcache.sh"):
+            with self.subTest(profile=profile):
+                self.assertIn("R9K_AG=0", self.launch(profile))
+                self.assertIn("R9K_AG=1", self.launch(profile, "R9K_AG=1"))
+
     def test_dflash_window_override(self):
         args = self.launch("glm-5.3-flash-c2.sh", "SPEC=1", "CGSIZES=2")
         spec = json.loads(args[args.index("--speculative-config") + 1])
