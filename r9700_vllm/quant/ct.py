@@ -47,7 +47,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
 )
 
 from ..moe.experts import R9700Mxfp4Experts, r9k_available
-from ..moe import prep
+from ..moe import fold, prep
 
 logger = init_logger("vllm." + __name__)
 
@@ -95,6 +95,8 @@ class R9kMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod):
             moe_quant_config=self.moe_quant_config, moe_config=self.moe, experts_cls=R9700Mxfp4Experts,
             mxfp4_backend=self.mxfp4_backend, routing_tables=layer._expert_routing_tables())
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+        self.moe_kernel.fused_experts.r9k_layer = layer     # where moe/route.py leaves the routing tables
+        fold.alias(self.moe_kernel)                          # no finalize copy: experts write the output
         prep.maybe_attach_cache(self, layer)
 
 
@@ -233,11 +235,21 @@ _HYB_LAYERS: dict = {}      # registration index -> (layer, stock apply_weights 
 _DISPATCH_DONE = False
 
 
+# Above the decode cap: stock's Triton block GEMM, or (R9K_FP8_BLOCK_PREFILL=r9k) our LDS-tiled exact block-scaled
+# kernel on the same operands (kernels/fp8.py gemm_fp8_block_tiled; per-token-group-128 activations from
+# quant_group128_fp8). Same math as stock up to summation order.
+_PREFILL_R9K = os.environ.get("R9K_FP8_BLOCK_PREFILL", "stock") == "r9k"
+
+
 def _fp8_block_dispatch(x: torch.Tensor, lid: int) -> torch.Tensor:
     layer, stock_apply, maxm = _HYB_LAYERS[lid]
     if x.shape[0] <= maxm:
         from .. import ops
         return ops.fp8_block_linear(x, *layer._r9k_fp8b)
+    if _PREFILL_R9K:
+        from ..kernels import fp8 as F8
+        x2 = x if x.dtype == torch.bfloat16 and x.stride(1) == 1 else x.to(torch.bfloat16).contiguous()
+        return F8.gemm_fp8_block_tiled(*F8.quant_group128_fp8(x2), *layer._r9k_fp8b)
     return stock_apply(layer, x, None)
 
 

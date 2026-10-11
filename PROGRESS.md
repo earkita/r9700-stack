@@ -1,5 +1,23 @@
 # Progress log
 
+## 2026-10-07 (evening): prefill kernels, the KV cache, and two things that did not pay
+
+- **Fused fp8 hyper-connection up GEMM + gate mix** on the tiled WMMA kernel: 268-298 us vs the 665-674 us bf16
+  pair a layer at 4096 rows; +4% 8k prefill in serving (7,044-7,069 vs 6,769), decode untouched, GSM8K paired
+  p = 0.86 vs the record, HumanEval 160/164. Now default on Flash-Next (`R9K_HC_FP8=r9k`). Bug on the way: the
+  fp8 copies were quantized at construction, before the checkpoint loaded -- single-stream decode looked fine
+  (bf16 below 256 rows) while every batched or long prefill was garbage. Quantize after `load_weights`.
+- **KV cache 279k -> 475k tokens on TP4** from three facts: vLLM's profiling run counts torch.compile transients
+  as activation (3.83 GiB; the model's own peak is 0.6 GiB, `compat/memsnap.py`), the cudagraphs for 384-2048-token
+  chunks cost 1.4 GiB a card for no soak-measured throughput, and 0.98 utilization leaves 1 GB at the soaked peak.
+  Defaults: 0.98 + graphs to 256 (442-475k, the estimate varies by launch); `KVMEM=7.0` pins 475k; 7.5 (509k) ran
+  a clean soak 440 MiB from the top and is the edge, not a setting. A 2048-token chunk: 311k tokens, -8% prefill.
+- **All-reduce pipelining by row parts**: correct, gated, and a net loss (-5.5% / -6% prefill): the ar4 kernels,
+  fused or DMA pushes, hold CUs while they wait on the uplink (4-rank stand-in: stock 5.15 ms, best 4.67, ideal
+  3.68). Shelved. **Exact block-scaled fp8 tiled GEMM**: correct, 15-25% slower than vLLM's Triton. Opt-in.
+- v0.2.6 validation on the release tree passed in full (BetterBench 162.8, three soaks 0 errors, gates, comm
+  tests); the publish is on hold by decision. Full numbers: `notes/prefill-fp8-pipe.md`.
+
 ## 2026-10-01 (GLM FP8 plugin on stock vLLM, clean clone)
 
 - Moved the validated sparse reader into a version-pinned, opt-in plugin
@@ -1454,6 +1472,264 @@ The first launch has the smaller pool, so the case people run -- restarted -- wa
 minute, which is why a short burst was the check; a full-length soak of the restarted launch is still owed.
 Adopted as the default for TP2 with offload only (`serve/serve.sh`; `UTIL=0.94` restores).
 
+### 2026-10-03: one state page per request for GDN under speculative decoding -- design
+
+**What vLLM does today.** A hybrid model's linear-attention (GDN) state lives in the KV cache as "mamba pages". With
+a drafter, vLLM gives every request `1 + num_speculative_tokens` state pages per GDN group (2 + spec with prefix
+caching, "align" mode): the verify step writes the state after *each* candidate token into its own page, and the
+next step reads the page of the last accepted token (`spec_state_indices[n, num_accepted - 1]`). Measured
+(`~/kvcost.py`, 2026-10-03), the fixed cost per *running* request before it holds any context:
+
+| configuration | per request | at full `max_num_seqs` |
+|---|--:|--:|
+| 27B TP2, SPEC=7 (shipped) | 15,661 token-equivalents = 7.4% of the pool | 8 running: 59% |
+| 27B TP2, SPEC=5 / SPEC=3 | 5.6% / 3.8% | 45% / 31% |
+| Flash-Next TP2 offload, MTP=3 | 10,394 = 8.1% | 8 running: 65% |
+| Flash-Next TP4, MTP=3 | 6,152 = 2.4% | 16 running: 38% |
+
+On the 27B a second, independent waste: the DFlash2 drafter's 5 attention layers make vLLM's group size 5, so the
+16 target attention layers are padded to 20 (25% of attention bytes) and the 48 GDN layers to 50 -- upstream's
+grouping heuristic (`_get_kv_cache_groups_uniform_page_size`), not addressed here. Tried and rejected: the
+block-outermost layout (`VLLM_KV_CACHE_LAYOUT=BLHNC`, which our kernels could take) routes to the packed grouping
+without padding, but that path sizes every block to the widest page (the GDN state) and asked 21.7 GiB for a 32k
+request.
+
+**The design: verify from one checkpoint, replay the accepted tokens at the start of the next step.** vLLM has
+a cousin of this for Kimi-K3's KDA layers ("RecoverSSM": `num_speculative_blocks = 0`, a post-sampling commit hook
+in the runner). Its kernels are not in this build, its flag is validated against Kimi architectures, and the flag
+also stops piecewise graph capture above the decode width (`cudagraph_utils`: "recoverSSM cannot capture a dummy
+query wider than its workspace"), which would cost Flash-Next its prefill graphs. So no runner hook: the layer does
+the replay itself when the request next comes through.
+
+1. **Page layout** (`get_state_shape` / `get_state_dtype` on our GDN layer class, which stock's `bind_kv_cache`
+   turns into views): stock conv window `[C, 3 + spec]`, stock SSM state `[Hv, 128, 128]`, plus a RECORD of the last
+   step's candidate inputs in two slots -- the conv'd q/k/v rows `[2, 1 + spec, C]` bf16, the gating inputs b, a
+   `[2, 1 + spec, 2 Hv]` bf16 -- and a flag `[2]` int32 = {live rows | slot << 8, done counter}. `get_kv_cache_spec`
+   sets `num_speculative_blocks = 0`. Per GDN group that is 1 page per request instead of 1 + spec; the record adds
+   ~10% to a page (two slots).
+2. **Verify** (`r9k_gdn_spec_verify`, the decode kernel's loop): if the page's flag says a record is live, replay
+   the first `num_accepted` of its rows (vLLM hands the previous step's accepted count to this step) from the base
+   state and store the result; then run the new candidates from that state, outputs through the gated norm, no
+   state stored; write the new record into the other slot (sibling blocks of the same sequence may still be
+   replaying from the live one) and, once every value head's block of the sequence has finished (per-page atomic
+   counter), flip the flag. Stock's `causal_conv1d_update` keeps the conv window exactly as today: it only ever
+   used page 0 and its own `num_accepted - 1` offset.
+3. **Every path that touches a spec row is ours**: pure spec decode (in the FULL graph), prefill + spec, long prefill
+   + spec (stock's chunked prefill for the prefill rows, gathered; our verify for the spec rows), and a batch of
+   draft-less decodes (our verify with one candidate, so a live record is replayed first; the builder subclass
+   keeps every row's accepted count for it). Prefill rows clear the flag (our kernels do it in-kernel; a stock
+   fallback zeroes it from Python), so a recycled page never replays a stale record.
+4. **Scope of this stage: mamba cache mode "none" (prefix caching off).** In "align" mode the runner's block-boundary
+   copies pick a spec slot by `num_accepted - 1`, which no longer exists; supporting it means writing the boundary
+   checkpoint from the replay. With prefix caching on the layer logs a warning and keeps vLLM's pages. On the 27B
+   `PREFIX_CACHE=0` also measured 2.1 GiB less VRAM and 6% more KV (2026-10-02); Flash-Next already runs with it off.
+   Knob: `R9K_GDN_STATE=onepage|stock`.
+
+**Numerics.** Bit-identical to the slot design: the slot of the accepted token held `round(h)` after an fp32
+recurrence from the rounded base; the commit recomputes the same fp32 recurrence from the same rounded base on the
+same recorded inputs and rounds once. Outputs are the same kernel as today.
+
+**Cost.** The replay is at most 1 + spec tokens per layer per request inside the verify launch; the one-page verify
+without per-token state stores is *faster* than the slot kernel at 16 sequences (165 vs 281 us on 27B-TP2 heads,
+replaying 8 then running 8). Memory per request per GDN group: 1 + spec pages -> 1.
+
+**Expected.** 27B TP2 at 8 running: 59% -> ~13% of the pool pinned; Flash-Next TP2 65% -> ~16%; TP4 38% -> ~10%;
+the drafter fits at 200k on one card (the 9.35 GiB need drops by the 7 spec pages, ~1.1 GiB at TP1, more than the
+1.15 GiB that was missing).
+
+**Validation.** Unit (`tests/test_gdn_onepage_r9k.py`): multi-step simulation vs the slot design with random
+acceptance -- outputs and the replayed page bit-identical, including the step after a prefill, 1-candidate steps,
+both state dtypes, the sigmoid gate, a row map; the conv-window shift identity for a future align-mode commit.
+Serving: `kvcost`, strict sanity under overload on all configurations, probes vs shipped, VRAM peaks, then the
+release checks (Brian's call).
+
+### 2026-10-03: one state page per request -- what it measured, and a host crash during the tests
+
+**Implemented as designed** (stage 1: `mamba_cache_mode` "none", i.e. `PREFIX_CACHE=0`; `R9K_GDN_STATE=stock` restores
+vLLM's pages). The page is sized at the model level: `R9kQwen3_5*` override `get_mamba_state_shape_from_config`, and
+`R9kQwen4Exp*` must override `get_mamba_specs_from_config` as well, because stock Qwen4Exp defines it and
+`Platform._align_hybrid_block_size` prefers it when present -- the first Flash-Next launch fell back to a page sized
+2x by the layer (`GDN page 851968 -> 1703936 (the model class did not size it)`), which this fixed. Unit test
+`tests/test_gdn_onepage_r9k.py` passes (11 cases, bit-identical to the slot design).
+
+| | stock pages | one page | |
+|---|--:|--:|---|
+| 27B, one card (KVMEM=3, prefix caching off): KV cache | 35,576 | 62,295 | +75% |
+| 27B, one card: pages pinned per running request | 85 | 15 | |
+| 27B, one card: c8 / c16 tok/s | 192 / 196 | 329 / 283 | |
+| 27B, two cards (prefix caching off): KV cache | 223,329 | 367,494 | +64.5% |
+| 27B, two cards: 8 running short requests, pool pinned | 59.4% | 11.5% | |
+| 27B, two cards: decode mean / c8 / prefill 8k (3 probes each) | 206 / 534 / 4,055 | 211 / 586 / 3,900 | |
+| Flash-Next, two cards (0,1; both restarted launches): KV cache | 154,641 | 183,202 | +18.5% |
+| Flash-Next, two cards: pinned per running request (tok-eq.) / 8 running | 10,386 / 53.7% | 6,736 / 35.6% | -35% |
+| Flash-Next, two cards: decode / c8 / c16 / prefill 8k (3 probes) | 93 / 119-122 / 95-96 / 1,690 | 93 / 121-122 / 92-96 / 1,678 | |
+| Flash-Next, four cards (both first launches): KV cache | 256,682 | 279,564 | +8.9% |
+| Flash-Next, four cards: pinned per running request / 8 running | 6,152 / 19.2% | 3,739 / 10.7% | -39% |
+| Flash-Next, four cards: decode / c8 / c16 / prefill 8k | 194 / 568-597 / 893 / 7,230 | 195 / 592-621 / 896 / 6,780 | prefill -6% |
+
+Strict sanity under overload: 27B one card 0 bad of 360; 27B two cards 0 of 990; Flash-Next two cards 0 of 540
+(twice); Flash-Next four cards 0 of 1,020 (both modes). (A first one-page launch of the two-card configuration
+compiles and shows 151,179; the table has the restarted launch, the normal way to run it.)
+Attention block: 27B 1,808 tokens (stock 1,648), Flash-Next two cards 912 (832), four cards 464 (416): the
+attention page grows because the mamba page now carries the 2 x (spec+1)-row record. **Cost: long prefill is 4-6%
+slower with one-page** (27B 8k 4,055 -> 3,900; Flash-Next TP4 7,230 -> 6,780), presumably the bigger attention
+block in the paged-attention prefill; the GDN path is unchanged for long prefills. Decode and concurrency are equal
+or better everywhere.
+
+**The c16 question.** The one-page two-card runs showed 636 / 417 / 444 tok/s at 16 concurrent against stock's
+588-606. It was not the page design: ten further c16 runs on the same server measured 645-697, all above stock; GPU
+power, clocks and preemptions were unchanged in a slow run; the slow runs coincided with other containers loading
+models on the box. The 27B runs `max_num_seqs` 8, so c16 is two waves, and the prose prompts (lowest acceptance)
+are always the stragglers (~41 tok/s each vs ~57 for code). Per-request detail: `~/c16diag2.py` on VM100.
+
+**Host crash 02:21-02:25 UTC, and what it turned out to be.** With all five cards loading at once (27B TP2 on HIP
+0,1, Flash-Next TP2 on HIP 2,3, a 27B reviewer on HIP 4), the second chain B card (guest 08:00.0, host c5:00.0)
+logged `MES(1) failed to respond to msg=INVALIDATE_TLBS` three times two seconds apart, then failed REMOVE_QUEUE and
+SUSPEND, amdgpu began a GPU reset, eight seconds later the card read back as all ones ("device lost from bus"), and
+two minutes after that the host hard-reset: firmware reason "an uncorrected error caused a data fabric sync flood",
+a fatal machine check on one core (SMCA EX, code 0: a core watchdog on a stalled transaction). The BMC log has no
+power event. The first suspects (the fifth card, the new host kernel 7.0.14-20 and QEMU 11.0.3-4 that the same
+maintenance window installed, five-way load) were all cleared the same night:
+- The MES timeout is **chronic**: ~130 occurrences since 2026-09-17 in every guest boot, on every card, on host
+  kernel -19 and -20, with four cards and five, clustering at model load and graph capture (page-table churn), and
+  self-recovering every time but this one. Two more single timeouts on 10-03 (04:06, 04:07) on two different
+  cards during a Flash-Next TP4 launch, at 32-75 W and 32-38 C: not power, not heat.
+- The exact 02:17 configuration, relaunched deliberately (three servers at once on five cards, then probes and
+  stress on all three together): clean, 0 bad of 1,380.
+- The guest already runs the TLB-fence rework (Linux 7.0, backported to 6.19.10) that fixed MES deadlocks on Strix
+  Point, and the newest Debian backports firmware (MES 0x91). No fix specific to this message on gfx12 was found.
+So the crash is: a chronic firmware hang escalated once into a GPU reset, and a GPU reset under passthrough on these
+cards takes the link and then the host down. Containment proposed (Brian's call, a guest kernel parameter):
+`amdgpu.gpu_recovery=0`, so a hung MES wedges one GPU and its container instead of resetting the card; a VM reboot
+recovers it through the vfio function reset that every VM start already does. This matters for the eight-card plan
+too: the hang rate scales with load/capture churn, not with cards per VM, and a reset in any VM takes the host.
+Operational notes from the same night: the guest's power-cap service had failed at boot (an inline comment in
+`/etc/r9700-powercap.conf` was read as the value; fixed); LACT 0.10.1 (headless) now runs in the guest with
+`amdgpu.ppfeaturemask=0xffffffff`, applying -42 mV on every card (Brian's instruction) and the caps (225 W, the
+passively cooled fifth card 210 W), then 210 W on every card (Brian, 05:25 UTC): at -42 mV the 27B two-card probe lost
+0.7% decode, 1.4% at 8 concurrent and 2.2% on an 8k prefill going from 225 to 210 W, and strict sanity under
+overload was 0 bad of 2,040 at 210 W. **Numbers from here on are at 210 W with -42 mV; everything published so far
+was 225 W without the undervolt** (the undervolt alone gained ~5% decode at 225 W).
+
+**Found and fixed the same night: the conv window's candidate width.** At temperature 0 the stock-page server gives
+the same text for a request alone or in a batch of identical copies; one-page gave the same text within a batch but,
+with >= 4 identical copies, two of four prompts differed from the lone run (coherent alternatives, a near-tie flipped),
+and under `--enforce-eager` one-page was garbage even alone while stock was coherent. What cleared on the way: the
+kernel (new lockstep unit cases, 4 and 8 identical sequences vs lone, one-page and slot bit-identical), page
+distinctness and the code path (debug trace), the attention backend (vLLM's own: same divergence) and the larger
+attention block (stock kernels on a one-page-sized page: invariant). A per-step checksum trace of layer 0 in eager
+mode (`R9K_GDN_TRACE=1`) then showed it: step 1 after the prefill identical to stock in every input and the output;
+at step 2 b, a and z still identical but the conv output different -- the conv window written by step 1 was wrong.
+Cause: stock's `causal_conv1d_update` takes `max_query_len`, the number of candidate columns the window rolls by, and
+the plugin passed `idx.size(1)`. With one page per request the mamba KV group's block table has one column (no
+speculative blocks), so on every eagerly built step -- mixed prefill+spec steps, non-uniform batches, enforce-eager
+-- `idx` is `[N, 1]` and the window rolled as if one candidate per step. FULL-cudagraph steps were right only by
+accident: vLLM copies the `[N, 1]` slice into its `[N, S]` cudagraph buffer with `copy_`, which broadcasts the
+column. The fix takes S from the record (`_spec_width`) in the fused path, the mixed-step path and the debug check.
+The unit test could not see this (it feeds the conv output directly); the serving check that does is
+`~/batchid.py`: identical copies in one batch must equal the lone run, in graph and eager mode.
+
+After the fix (27B two cards, 210 W, -42 mV, prefix caching off): eager one-page bit-identical to stock per step;
+strict sanity under overload 0 bad of 990; the six single-request texts identical to stock; sixteen fixed prompts
+at 16 concurrent, six runs: every run completes all 4,096 tokens (before the fix one-page runs ended early),
+one-page runs agree with each other on 7-16 of 16 texts (stock: 5-16), one-page vs stock 5-9 -- the same spread
+stock shows against itself. The remaining run-to-run variation comes from vLLM's mixed prefill+decode steps, which
+send a running request's rows through the prefill attention path: the stock-page server shows the same thing
+(staggered arrivals: 3 distinct texts of 4), and in the traced mixed step one-page and stock produce identical
+conv, input and output checksums for the same request state. Probes after the fix: decode 212, c8 554-579,
+c16 673, 8k prefill 3,940 (210 W). Flash-Next two cards after the fix: sanity 8/8, 0 bad of 990, probes unchanged;
+four cards: sanity 8/8, 0 bad of 1,870, decode 193-197, c16 898.
+
+**What is left of batch dependence, and what it is.** Two sources, neither in the GDN path:
+- On two cards, the compressed all-reduce (`R9K_AR_QUANT=1`, messages >= 128 KB) is lossy, and its rounding depends on
+  the message, so a request's logits depend on who shares its batch: four identical copies prefilled together differ
+  from the lone run from the fourth character on, in stock mode as much as one-page (the layer-1 prefill input
+  already differs by 1.4% while layer 0's output matches). This is the documented trade of that knob, not new.
+- On one card there is no all-reduce, and the step trace of four identical copies prefilled together against the
+  lone run reads: prefill identical, verify steps 1-3 identical in every input and output, step 4 GDN state still
+  identical but the step's rows differ by 1-2% -- the drafter proposed different tokens for the batch than for the
+  lone request; acceptance then differs (4 vs 5) and the text flips at char 506. The target's GDN state never
+  deviated before the drafts did. Whether stock pages behave the same at four requests on one card cannot be
+  measured: stock pins 85 blocks per request there and admits at most two at a time (the thing one-page fixes).
+  Four *different* prompts in one batch match their lone runs, and so do two or three identical copies; the effect
+  needs three or more identical prompts at temperature 0 in one step, which production traffic does not produce.
+Diagnosis knobs kept, off by default: `R9K_GDN_TRACE=1` (per-step checksums of layers 0 and 1 on eagerly built
+steps), `R9K_GDN_PAGE_PAD=1` (stock pages with a one-page-sized page). Helper scripts on VM100: `~/batchid.py`
+(identical copies vs lone), `~/stepcmp.py` (step trace comparison), `~/c16diag2.py`, `~/lockstep_prefill.py`.
+
+**Remaining**: Flash-Next TP2 on the split pair and TP4 with one-page; whether `R9K_GDN_STATE=onepage` becomes the
+default (it needs `PREFIX_CACHE=0`, a serving-behaviour change on the 27B, Brian's call); align-mode (prefix
+caching) support via boundary checkpoints from the replay; the 200k single-card run with the drafter still needs
+the 25% attention-page padding addressed upstream.
+
+### 2026-10-03, evening: the validation debt paid, the MES firmware tested, and what determinism looks like
+
+**Validation debt (v0.2.3 and v0.2.4 had been tagged on unit gates and strict sanity only).** Run on the production
+copy at v0.2.4, 210 W, -42 mV, one server at a time: GSM8K full set (1,319, conc 1) and HumanEval (164) on all three
+configurations; the paired thinking-mode GSM8K (first 800, conc 1) on the 27B with one-page and with stock pages;
+full BetterBench on all three; 25-minute mixed-length soaks (16 clients, 200-30k tokens) with VRAM sampled; strict
+sanity under overload at NSEQ+1 and 2xNSEQ. Everything green; the tables are in `notes/release-v0.2.4.md`. Headlines:
+one-page and stock pages score identically with thinking (96.88%, 0 discordant); against the v0.2.0-era baseline
+(97.50%) and the reference stack (97.62%) the paired test finds no difference (p = 0.36 / 0.21); BetterBench decode
+is level with or above the 225 W references (27B 200.3 vs 197.5, four cards 160.9 vs 159.2, two-card offload 97.3 vs
+97.4), concurrency up 6-12% on the 27B, prefill 0-11% lower (cap + attention block); soaks 1,283 requests, 0 errors.
+A GSM8K caveat worth remembering: the September baselines are thinking-on, first 800 questions; a no-think full-set
+run (94.69% on the 27B) is a different test and `eval.py compare` across the two is meaningless (100% of outputs
+differ by construction).
+
+**Determinism, settled.** 18 of 800 thinking answers differed between one-page and stock at conc 1. Replayed alone
+with every step traced: no draft-less or short step anywhere (so not the `_nonspec_decodes` path); one-page gave
+identical text and identical step counts in every run and on both card pairs; stock pages changed one answer's
+length between two runs on the same server (514 vs 536 steps) and its step counts moved again when given the
+one-page attention block size. So the slot design (`r9k_gdn_decode_mtp`, stock pages) has a rare run-to-run
+nondeterminism and one-page does not; accuracy is unaffected. Low-priority follow-up now that one-page replaces it;
+the tools are `~/replay18.py` / `~/replay18b.py` on VM100 and `R9K_GDN_TRACE=1` (now also on the non-spec path).
+
+**MES firmware.** linux-firmware's 2026-09-11 GC 12.0.1 drop (20260916 release: `gc_12_0_1_uni_mes.bin` 0x93, ME
+0xc12, PFP 0xc76, MEC 0xd7a; the 20260810 package had MES 0x91 with `uni_mes` a symlink to the 12.0.0 blob) was
+installed in the guest and tested with nine launches: 16 `INVALIDATE_TLBS` timeouts in six four-card Flash-Next
+launches (four of six affected, 0-6 each, four different cards), none in the two-card and 27B launches, no
+escalation, throughput identical. On 0x91 the same day: 5 in four such launches. Not a fix. Rollback to the packaged
+set (backup in `~/fw-20260810-backup`) recommended, Brian's call. The report for AMD is a comment on drm/amd #5759
+(`notes/bug-mes-invalidate-tlbs.md`), which already describes this stack's problem on another box. Lesson from the
+day: VM100 has no cron; `@reboot` hooks silently do nothing -- use systemd or run by hand.
+
+### 2026-10-04: the MES timeouts have a workaround -- `amdgpu.mes_log_enable=1`
+
+Method: six launches of the four-card Flash-Next server per condition (the launch is where every timeout we have
+ever seen occurred; serving never produced one), one change per reboot, same box, same day, the kernel log watched
+for `MES(1) failed to respond to msg=INVALIDATE_TLBS`.
+
+| condition | launches | timeouts |
+|---|--:|--:|
+| MES 0x91 (linux-firmware 20260810, the Debian package), defaults | 4 | 5 |
+| MES 0x93 (20260916), defaults | 6 | 16 |
+| MES 0x8b (20260622, what production runs), defaults | 6 | 6 |
+| MES 0x8b, `vm_update_mode=3` + `mes_log_enable=1` | 6 | 0 |
+| MES 0x8b, `ras_enable=0` + `mes_log_enable=1` | 6 | 0 |
+| MES 0x8b, `mes_log_enable=1` alone | 6 | 0 |
+| MES 0x8b, defaults again (negative control) | 6 | 6 |
+
+So: not the firmware version (three generations, same rate), not power or heat, not page-table update mode or RAS,
+and not the box healing -- the one variable that moves the count is the MES event log, 0 in 18 launches with it
+against 6, 6, 5-in-4 and 16 without. In the driver the flag only adds `enable_mes_event_int_logging = 1` and a
+buffer address to the SET_HW_RESOURCES packet; timeout (2,100 ms) and polling are unchanged, so the difference is in
+the firmware's behaviour when it is logging. Launch time, decode and prefill were identical in every condition.
+PyTorch's expandable-segments allocator was also tried as a way to reduce mapping churn and does not start on this
+stack (HSA memory fault at engine init; the IPC handles the all-reduce uses do not cover VMM-backed allocations).
+
+Production (two cards, MES 0x8b, kernel 7.1.10, ROCm 7.14, idle for weeks) has 3 timeouts in its whole history,
+all in one burst during its setup period; two-card launches on the test box run at a similar low rate, so the
+production comparison mostly says "four-card launches are the trigger", not "production's stack is immune".
+
+Applied (Brian, 2026-10-04 03:30 UTC): both VMs boot with `amdgpu.mes_log_enable=1 amdgpu.gpu_recovery=0`. The
+test box is back on the Debian-packaged firmware (20260810, MES 0x91) and ran six more four-card launches clean
+with the flag -- 24 of 24 across three firmware versions now, against ~1 per launch without it. Production rebooted
+into the same parameters and its stack came back on its own (container restarted, endpoint answering in three
+minutes). The drm/amd #5759 comment is written (`notes/bug-mes-invalidate-tlbs.md`); the tracker's spam filter
+rejects API posts from the day-old account, so it goes in from the browser. Keep counting: the meswatch stays on
+and every launch from here is a data point.
+
 ### Next
 State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same box): decode +19%, step -18%, TTFT
 1.5x, prefill +18..+29%, concurrency +12..+20%. What is left, in the order it looks worth doing:
@@ -1481,3 +1757,106 @@ State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same bo
   carry it?
 - Prefix caching is off by default for Flash-Next (`PREFIX_CACHE=1` restores cross-request prefix reuse): a
   serving-behaviour change, right for benchmarks and one-shot prompts, wrong for long multi-turn sessions.
+
+## 2026-10-04 (evening): the MES workaround under a soak; radiance test run
+
+**MES workaround, more evidence.** Twelve cycles of {Flash-Next four cards, 27B two cards, Flash-Next two cards}
+on the test box (`~/mes-soak.sh`): launch, strict sanity (conc NS+1 x 10), a 5-8 minute mixed-length soak with 16
+clients, teardown. 36 launches, 0 MES or GPU kernel events, 0 bad answers, 0 soak errors; with the 24 launches of
+the reboot experiments that is 60 launches on `amdgpu.mes_log_enable=1` against the ~1 timeout per four-card launch
+without it. One blemish unrelated to MES: in cycle 9 the 27B server answered `/v1/models` after 234 s (it normally
+takes ~580 s) and then refused every connection; its log had 7 error lines, which the soak script deleted with the
+container before anyone read them; no kernel event. The other 35 launches were normal. A container-log snapshotter
+(`~/logsnap.sh`) now keeps the last 400 lines of the running server on disk for the next time.
+
+**radiance.** Brian asked for a test run of https://codeberg.org/StillDeadcode/radiance, an LLM server with its own
+C++/HIP engine and kernels (not vLLM). Built VM 102 on the production host to the test box's kernel and firmware,
+handed it the two production cards (production VM stopped for five hours, idle anyway), ran the published image (the 1.0.4 build) and
+containers through our release checklist with our clients, then gave the cards back. Write-up with the tables:
+`notes/radiance-test-run.md`. In short: the 27B (FP8) is correct and stable, GSM8K 95.60% to our 94.69% (p = 0.06),
+HumanEval equal, KV pool 549k tokens to our 367k, 38 s to serve; decode 112 vs our 200 tok/s combined (FP8 bytes vs
+our 4-bit), prefill equal, concurrency 422 vs 558 at eight. Flash-Next is not usable under load by our bar: 2-6% wrong
+or off-format answers in batches of 9-16 (clean alone; worse with speculation off; better but not clean with the exact
+all-reduce wire), and prefill falls from 5.6k tok/s alone to ~400 tok/s aggregate with four long prompts in flight
+(16-client soak: 72 requests served to our 239). Quality at conc 1 equal to ours (95.83% / 98.17%), time to first
+token 141 ms to our 463, eight-client decode 143 to our 114.
+
+## 2026-10-05: radiance 1.0.8 re-test, two cards
+
+At Brian's request, the 1.0.8 image on the same VM and cards, raw numbers only (27B BetterBench and soak cut short,
+Flash-Next without evals). Nothing changed on two cards: 27B GSM8K 95.60% again (1,261), probe 133 / 412 / 609 /
+3,884, strict sanity 0 of 7,140; Flash-Next probe 56 / 191 / 258 / 5,670 fresh, strict sanity still failing in a
+batch (6 of 270 at conc 9, 2 of 320 at conc 16, one clean run of 960; 0 of 60 alone), concurrent long-prompt prefill
+still ~420 tok/s, the 16-client soak 26 requests in 759 s. The 1.0.3 -> 1.0.8 diff is four-card Flash-Next support,
+a bs4 paged-attention kernel, tests and docs; two-card flags unchanged. Section added to notes/radiance-test-run.md.
+Cards returned to production afterwards. Also corrected: the first run's image was the 1.0.4 build, not 1.0.3.
+
+## 2026-10-06: radiance 1.1.1 on two, three and four cards
+
+Brian: pull the latest (1.1.1, published that day), test for accuracy, and can TP=3 run. Two cards on VM 102 as
+before; three and four on the five-card test box, since the production host has two R9700s and 1.1.0 added
+three-rank serving for Flash-Next only (`docs/TP3.md`). 1.1.1 is the release that fixed Flash-Next on two cards:
+strict sanity 0 bad of 2,260 (1.0.x failed ~2% of every batch), the 4-client long-prompt prefill 3,836 prompt tok/s
+(was ~420), fresh decode 193 tok/s (was 56), GSM8K 95.83% with output identical to the 1.0.4 run on 99.8% of
+questions, HumanEval 160. 27B: GSM8K 95.60% and identical output to 1.0.8/1.0.4 on 100% of questions, HumanEval 160,
+probe 156 / 466 / 725 / 3,933 (+10-20%), sanity 0 of 8,540. Three ranks: GSM8K 95.91%, HumanEval 158, probe 205 /
+568 / 600 / 5,053, long prompts 3,153 tok/s -- about 6% single-stream for the third card and nothing else. Four
+ranks: every expert resident, probe 263 / 710 / 722 / 5,191, long prompts 3,365 tok/s, GSM8K 95.83%, HumanEval 159;
+every paired comparison p = 1.00. `--expert-vs-cache-ratio` was removed in 1.1.x (compose files updated; my sed
+broke their indentation once, relaunched). Section in notes/radiance-test-run.md. VM 102 left up with the cards;
+the Flash-Next container and the TP3/TP4 compose files stay on the test box.
+
+## 2026-10-06: sixth R9700 on the test host, chain C switch-local
+
+Brian added a card to the third PLX and put a fan on the passively cooled one. Chain C = 05:00.0 + 08:00.0 at
+0x380/0x390 with switch-local P2P; VM 100 gets a third emulated switch, X-PciMmio64Mb 384G and pci-hole64-size 3072G
+(2048G stopped at 0x33f and broke placement for every card); guest 0b/0c, HIP 4/5. Verified 25.25 GB/s both ways on the
+new pair, all 30 pairs ~13 GB/s one-way, 0 faults. radiance 1.1.1 refuses --tp 6 on the Flash-Next container (an
+expert's 5 blocks of 128 do not split six ways); 2/3/4 ranks are what it serves here. Details host/README.md.
+
+## 2026-10-06: radiance 1.2.0, Flash-Next TP4 + 27B TP2 side by side on the six-card box
+
+1.2.0 adds a Quark MXFP4 27B container with vision and a --p2p flag, removes nothing we use. Flash-Next TP4 on HIP 0-3
+and the 27B TP2 on the new chain C pair, together: probes alone vs together agree within noise (FN 264/740/786 vs
+263/742/725; 27B 147/430/657 vs 152/432/656), strict sanity 0 of 1,900 and 0 of 7,180 with both loaded, GSM8K 95.83%
+and 95.60% with output identical to the 1.1.1 runs on 100% of questions, HumanEval 158 and 160, mixed load 106 long
+prompts at 3,579 tok/s beside a 16-client soak of 47 requests. BMC: 783-1,804 W at the wall under load. Chain C pair
+runs 15 C hotter (max 67 C) with fans at twice the speed. 0 MES / errors / faults. Section in notes/radiance-test-run.md.
+
+
+## 2026-10-07: decode node count -- three fusions, ~1% from launches, 2.6% with the P2P all-gather
+
+Brian: "Is there any more tuning we can do on our kernel?" -> "Go ahead and work on it." Took item 2 of the list,
+the decode node count on Flash-Next TP4. Built, unit-tested and A/B'd three things (notes/decode-nodes.md has the
+method, the bugs and the numbers): one-launch MoE routing (softmax top-k + align tables, `r9k_moe_route`), a fused
+top-k sum with the shared expert folded in plus the modular kernel's output alias (`r9k_moe_sum`, moe/fold.py),
+and a one-shot P2P all-gather for the MTP head's decode-sized gathers (`r9k_ag_oneshot_nrank`). Step time (512-token
+essay, MTP-3, 210 W): stock 16.70 / 16.70 / 16.67 ms; routing 16.56; +fold 16.56 x3 (control 16.68); +all-gather
+16.28 / 16.27 / 16.25 (control 16.58); the all-gather ALONE 16.40 with decode 196 -> 200 tok/s, c16 897 -> 904. Quality gate on everything on:
+GSM8K 95.60% vs the v0.2.4 record 95.68% (paired 14 vs 13, p = 1.00), HumanEval 160/164, strict sanity 0 of 1,020
+after. The lesson is the number: in graph replay a tiny node's dispatch overlaps the previous node, so the 240
+launches removed were worth ~0.14 ms, not the ~1.6 us each the 2026-09-28 profile implied; only the all-gather,
+which removes GPU time (RCCL 47-127 us -> 6-13 us), moved the step. Four bugs on the way, each invisible to the
+unit tests: NaN rows in vLLM's warm-up steps faulting an index-deriving kernel, a module cycle from storing a parent
+on its child, `SharedExperts.output` consuming its slot, and a per-call flag read in a torch.compile-traced forward
+(baked in at trace time -> double add). Defaults: all-gather ON (R9K_AG=1), routing and fold OFF (R9K_MOE_ROUTE=r9k / R9K_MOE_FOLD=r9k turn them on):
+0.15 ms does not buy a replaced router and two vLLM-runner patches on the production path. Nothing tagged,
+production copy untouched; the next tag owes the full validation on the all-gather (soak, BetterBench).
+
+
+## 2026-10-09/10: decode step 16.42 -> 15.01 ms (-8.6%), single-stream 199 -> 217 tok/s
+
+Brian: "ok, lets see if we can get our step time down then" (radiance 1.3.0 at 12.1 ms). notes/decode-step.md has
+the method and every run. Two things moved it, both exact in unit tests: (1) the hyper-connection down + up GEMMs
+at decode widths on the fp8 fragment-order copies the prefill mix path already holds (kernels/r9k_hc_f8.hip: bf16
+WMMA against the bf16 activations, W8A16, loads software-pipelined; the bf16 pair had been the step's largest
+stream at 1.29 GB) -- 16.42 -> 15.33; (2) the per-token fp8 quant fused into the dense block GEMM's A-load
+(r9k_gemm_fp8_block_qa, operands bit-identical, 96 launches fewer) -- 16.06 alone, 15.01 with (1). Measured and
+rejected: a 32 KB one-shot all-reduce cap (16.77), split-K across blocks for the hc down kernel (slower at every
+setting), a scalar fp8 kernel before the WMMA one (15.64). The base repeated five times at 16.42-16.44. Gate at
+conc 1 on the same tree: GSM8K 95.83% vs 95.75% (paired 8 vs 7, p = 1.00, outputs identical on 25.5%), HumanEval
+161 vs 160, strict sanity 0 of 1,040 each. Both are the fn4 defaults now (R9K_HC_FP8_DECODE=0 / R9K_FP8_QA=0 off).
+Also measured: a tiny node in a replayed graph costs ~3 us and forked branches do overlap, but the earlier finding
+stands -- route + fold reran at -0.13 ms. rocprofv3 under vLLM writes nothing (workers SIGKILLed before the tool
+finalizes); the torch profiler GPU-only (PROFACT=CUDA) still stretches the step to 23 ms, so the unprofiled split
+of the remaining 2.9 ms to radiance stays an estimate. Nothing tagged; production copy untouched.

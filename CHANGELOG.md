@@ -2,9 +2,153 @@
 
 All notable changes to r9700-stack. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project uses [semantic versioning](https://semver.org/). Every number below was measured on 4× (or 2×)
-Radeon AI PRO R9700 at a 225 W cap; [PROGRESS.md](PROGRESS.md) has the method behind each one.
+Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV voltage offset from v0.2.4 on;
+[PROGRESS.md](PROGRESS.md) has the method behind each one.
 
 ## [Unreleased]
+
+Nothing yet.
+
+## [0.3.2] - 2026-10-10
+
+Release notes with the validation record: [notes/release-v0.3.2.md](notes/release-v0.3.2.md).
+
+### Changed (`notes/decode-step.md` round 3; gate: GSM8K 95.75 vs 95.83 paired p = 1.00, HumanEval 162/164)
+- The fp8 hyper-connection kernels take any row count (token tiles of 16, `R9K_HC_F8_MT` tiles per block);
+  `R9K_HC_FP8_DECODE_MAXM` sets the widest row count on them (now 255 by default, was 16). `R9K_HC_FREE_BF16=1`
+  (with `R9K_HC_FP8_DOWN=1`, both now default) drops the bf16 up / down weights after quantisation: **KV cache
+  452k -> 516k tokens at TP4 (+14%), 167k -> 221k at TP2 (+33%)**, 8 streams +5.6% and 16 streams +3.4% at TP4,
+  8k prefill -0.8% (the tiled fp8 down GEMM's activation quant), single-stream unchanged; the fp8 decode path is
+  on at TP2 as well now (the freed pair outweighs its down copy). `R9K_HC_FREE_BF16=0` restores v0.3.1.
+
+## [0.3.1] - 2026-10-10
+
+Release notes with the validation record: [notes/release-v0.3.1.md](notes/release-v0.3.1.md).
+
+### Performance (decode step, Flash-Next TP4; `notes/decode-step.md`)
+- **fp8 hyper-connection decode GEMMs** (`kernels/r9k_hc_f8.hip`, `R9K_HC_FP8_DECODE=1`): the down+hc_silu and
+  up+gated-mean kernels at decode widths (M <= 16) read the fp8 fragment-order copies the prefill mix path already
+  holds (half the bytes of the bf16 kernels; the hc weights were the step's largest stream at 1.29 GB), bf16 WMMA
+  on the activations (W8A16, products exact), per-row scale once. 16.42 -> 15.33 ms/step.
+- **Fused activation quant in the dense fp8 block GEMM** (`r9k_gemm_fp8_block_qa`, `R9K_FP8_QA=1`, M <= 16): the
+  per-token-group-128 quant runs inside the GEMM's A-load, operands bit-identical to the two-launch path; 96
+  launches fewer a step. 16.42 -> 16.06; with the fp8 hc decode **15.01 ms/step (-8.6%, single-stream decode
+  199 -> 217 tok/s**, 8/16 concurrent and prefill unchanged). Both are the four-card defaults; at TP2 the fp8 hc
+  decode stays off (its down copy costs 0.43 GiB of KV a card there, 27k tokens, for +10% single-stream only). Measured and rejected: a 32 KB one-shot all-reduce cap (+0.35 ms), split-K across blocks for
+  the hc down kernel (`R9K_HC_FP8_DECODE_KB`, slower). Tests: `tests/test_hc_f8.py`, `tests/test_fp8_qa.py`.
+
+
+### Fixed
+- **Runs on the 2026-10-09 vLLM ROCm 10 nightly** (`8cbd5d03`, 0.31.1rc1, 360 commits past the September pin)
+  with the same kernels (`notes/vllm-upgrade-2026-10.md`): the int6 PLE table on vLLM's new PLE embedding
+  classes (`allocate_embedding_weight`), the attention backend's block-size query signature, and a workaround
+  for an upstream bug that quantizes the DFlash2 drafter's grouped-conv projections despite the checkpoint's
+  exclusions (acceptance 4.3 -> 1.0 tokens a step; `models/dflash.py alias_draft_exclusions`). Probes on the
+  new nightly: 27B 216 tok/s (4.48 tok/step), Flash-Next TP4 209 tok/s, prefill unchanged, sanity clean. The
+  v0.31.0 *release* image is ROCm 7.2.3 and is not a target. `bench/humaneval.py` takes `EVAL_BASE`.
+
+## [0.3.0] - 2026-10-08
+
+**Flash-Next on four cards: 70% more KV cache, 4% more prefill, same decode, on new measured defaults.** Validated on
+every configuration on this code (`notes/release-v0.3.0.md`).
+
+### Changed
+- **Flash-Next TP4 defaults** (`serve/flashnext.sh`, 2026-10-07): the fp8 hyper-connection up GEMM with the
+  gate mix fused (`R9K_HC_FP8=r9k`, below), memory utilization 0.98 and cudagraphs only for prefill chunks up to
+  256 tokens. KV cache 279,564 -> 442-475k tokens (+59-70%), 8k prefill 6,769 -> 6,852-7,069 tok/s, decode step
+  and concurrency unchanged (16.4 ms, 199 tok/s, 888-905 tok/s at 16). vLLM's profiling run was counting
+  torch.compile transients as activation (3.83 GiB against a measured 0.6 GiB model peak, `compat/memsnap.py`),
+  and the graphs for 384-2048-token chunks cost 1.4 GiB a card for no measured throughput. Soaked: 25 minutes,
+  684 requests, 0 errors, 31.8 of 32.6 GB at the peak; strict sanity 0 bad of 3,940 at concurrency 17 / 32 and
+  on long prompts. `KVMEM=7.0` pins the budget at 475k tokens (0.95 GiB free at the peak) when the
+  launch-to-launch estimate matters; `UTIL=0.94 CGSIZES=1,...,2048 R9K_HC_FP8=stock` restores the old defaults.
+
+### Added
+- fp8 prefill GEMMs on the LDS-tiled WMMA kernel (`r9k_moe_4bit_prefill` nv=3, `kernels/fp8.py`): e4m3 weights
+  in the fragment order, one scale a column, 163-182 TFLOPS at 4096 rows (1.3-1.9x hipBLASLt bf16); the dense
+  fp8 linear modes take it from 64 rows. The fused hyper-connection up GEMM + sigmoid-gated mean
+  (`r9k_fp8_prefill_mix`, weight rows interleaved 16 columns x 4 streams): 268-298 us against the 665-674 us
+  bf16 pair at 4096 rows, exact against the stock formula on the same gate; the hc weights are quantized after
+  load (`hc.quantize_fp8`). An exact block-scaled variant (`r9k_fp8_prefill_block`, `R9K_FP8_BLOCK_PREFILL=r9k`)
+  is correct but 15-25% slower than vLLM's Triton block GEMM on the served shapes: opt-in.
+- Prefill all-reduce pipelining by row parts (`comm/pipe.py`, `R9K_AR_PIPE=r9k`, default stock): the layer tail
+  (hc combine + mix, MoE, both all-reduces) in 2048-row parts with the attention parts' all-reduces on a comm
+  stream (a second ar4 / 2-rank instance; `R9K_AR_PIPE_BLOCKS`, `R9K_AR_PIPE_SDMA`). Correct and gated, but the
+  all-reduce kernels time-share the CUs with the GEMMs on this topology: 8k prefill -5.5% (fused pushes) / -6%
+  (DMA pushes). Shelved in the tree; `notes/prefill-fp8-pipe.md`.
+- `R9K_MEMSNAP=1` (`compat/memsnap.py`, with `EAGER=1`): per-layer / per-part peak memory of the profiling run
+  and an allocator snapshot.
+- Decode-step fusions on Flash-Next TP4 (`notes/decode-nodes.md`): one-launch MoE routing (`r9k_moe_route`:
+  softmax top-k + align tables, replacing four stock launches a layer), the top-k sum with the shared expert's
+  output folded in and the modular kernel's output alias on ROCm (`r9k_moe_sum`, `moe/fold.py`), and a one-shot
+  P2P all-gather for decode-sized gathers at TP > 2 (`r9k_ag_oneshot_nrank`, 7.8 us vs RCCL 57 at [4, 640]).
+  The all-gather alone: step 16.70 -> 16.40 ms, decode 196 -> 200 tok/s; everything on 16.25 ms. GSM8K and
+  HumanEval unchanged (paired p = 1.00). Only the all-gather is on by default (`R9K_AG=0` reverts, `R9K_AG_MAX_KB`
+  128); the routing and the fold are off (`R9K_MOE_ROUTE=r9k`, `R9K_MOE_FOLD=r9k`, `R9K_FUSED_SUM`): 0.15 ms a
+  step was not worth their surface on the production path.
+- `notes/mes-timeouts.md`: the RDNA4 `MES(1) failed to respond to msg=INVALIDATE_TLBS` timeouts under KVM
+  passthrough, the host crash they caused once, the experiment matrix (three firmware versions, power, page-table
+  mode, RAS: no effect) and the workaround now on both of our boxes, `amdgpu.mes_log_enable=1 amdgpu.gpu_recovery=0`
+  (0 timeouts in 60 launches vs ~1 per launch, 36 of them under a sanity-plus-soak cycle). Reported to AMD on drm/amd #5759.
+- `notes/radiance-test-run.md`: radiance 1.0.4 (its own C++/HIP engine, not vLLM) on two R9700 through our release
+  checklist. 27B FP8: correct and stable, equal or better quality, 549k-token KV, 38 s start, decode 112 vs our 200
+  tok/s. Flash-Next: 2-6% wrong or off-format answers in batches of 9-16 and prefill collapsing under concurrent long
+  prompts; quality at concurrency 1 equal to ours. Re-tested on 1.0.8 (2026-10-05): no change on two cards.
+
+## [0.2.5] - 2026-10-04
+
+The v0.2.4 code with its validation record, and two housekeeping fixes. No behaviour change.
+
+### Fixed
+- The plugin announced itself as 0.2.3 in the startup log of the v0.2.4 tag; the version string is now right.
+
+### Added
+- The full release checklist for v0.2.4, run the day it was tagged and all green, is in
+  `notes/release-v0.2.4.md` (GSM8K full set and HumanEval on all three configurations, the paired thinking-mode
+  GSM8K against the September baselines and the reference stack, full BetterBench, mixed soaks, strict sanity under
+  overload: 0 bad of 8,340) and summarized in PROGRESS.md 2026-10-03.
+- `R9K_GDN_TRACE=1` (diagnosis, off by default) now also covers the draft-less decode path.
+- `notes/bug-mes-invalidate-tlbs.md`: the write-up of the gfx1201 MES `INVALIDATE_TLBS` timeouts and the reset that
+  took a card off the bus, as a comment for drm/amd issue 5759, with the result that the 2026-09-11 MES firmware
+  (0x93) does not reduce them.
+
+## [0.2.4] - 2026-10-03
+
+One state page per request for the GDN layers under speculative decoding: 64% more KV cache for the 27B on two
+cards, 18% for Flash-Next on two cards, 9% on four, and four concurrent 27B requests fit on one card where stock
+pages admit two. Tagged on the unit gates and strict sanity under overload on every configuration (0 bad of
+5,680), by decision; **the full checklist ran the same day, all green**: GSM8K full set and HumanEval on all three
+configurations, the paired thinking-mode GSM8K against the September baselines and the reference stack (no
+detectable difference), a full BetterBench on all three (decode level or better than the 225 W references,
+concurrency up, prefill 0-11% lower), 25-minute mixed soaks with flat VRAM, and 0 bad of 8,340 under overload
+(`notes/release-v0.2.4.md`). The test box also moved to 210 W and a -42 mV voltage offset on every card this day;
+the probe numbers in this entry are at that setting, the earlier entries at 225 W.
+
+### Added
+- **One GDN state page per request under speculative decoding** (`R9K_GDN_STATE=onepage`, the default when
+  prefix caching is off; `stock` restores vLLM's pages). vLLM keeps 1 + spec-tokens mamba pages per request so it
+  can verify candidates from any accepted position; the plugin's verify kernel instead replays the accepted rows of
+  the previous step from a record carried in the page, so one page serves. 27B on two cards: KV cache 223,329 ->
+  367,494 tokens (+64.5%), 8 running requests pin 11.5% of the pool instead of 59.4%, decode and 8-way concurrency
+  unchanged or better (206 -> 211, 534 -> 586 tok/s), prefill -4%. 27B on one card: 35,576 -> 62,295. Flash-Next
+  on two cards: +18%. Bit-identical to the slot design (unit test with multi-step simulation); strict sanity under
+  overload 0 bad of 1,890 across the three configurations. Stage 1 requires `mamba_cache_mode` "none"
+  (`PREFIX_CACHE=0`); with prefix caching on, stock pages are used. One defect found and fixed before release: with
+  one page per request the KV group's block table has a single column, and the conv update's candidate width was
+  taken from it on eagerly built steps (mixed prefill+decode batches), rolling the conv window as if one candidate
+  per step; the width now comes from the record (PROGRESS.md 2026-10-03 has the trace that found it).
+- `tests/test_gdn_onepage_r9k.py`; kernels `r9k_gdn_spec_verify` / `r9k_gdn_spec_commit`; model classes
+  `R9kQwen3_5ForConditionalGeneration` / `R9kQwen3_5ForCausalLM`.
+
+### Changed
+- Test and production cards run at 210 W with a -42 mV GPU voltage offset (LACT, overdrive enabled in the guest).
+  Against 225 W without the offset the 27B on two cards gains ~5% decode from the offset and loses 0.7% decode,
+  1.4% at 8 concurrent and 2.2% on an 8k prefill from the lower cap; strict sanity under overload 0 bad of 2,040 at
+  the new setting. The 225 W reference numbers in README.md are unchanged and labelled.
+
+### Fixed
+- Guest power-cap service: an inline comment in `/etc/r9700-powercap.conf` was read as the cap value and the service
+  failed at boot, leaving every card at 225 W.
 
 ## [0.2.3] - 2026-10-02
 

@@ -14,7 +14,12 @@
 #     What bounds it (PROGRESS.md 2026-09-29): the link. Every routed expert that is not resident is 1.245 MiB
 #     per rank over PCIe at the link rate, so real traffic levels off near 115 tok/s from 4 requests up; eight
 #     copies of ONE prompt share their experts and run at 434-577. R9K_EXPERT_CACHE_STATS=1 logs the misses.
-#   TP4 with everything in VRAM: GPUS=0,1,2,3 TP=4 OFFLOAD_GB=0 (the headline numbers in README.md).
+#   TP4 with everything in VRAM: GPUS=0,1,2,3 TP=4 OFFLOAD_GB=0 NSEQ=16 (the headline numbers in README.md).
+#     2026-10-07 defaults (notes/prefill-fp8-pipe.md): the fp8 hyper-connection up GEMM + gate mix (+4% prefill),
+#     memory utilization 0.98 and graphs for prefill chunks <= 256 tokens: KV cache 279k -> 442-475k tokens
+#     (vLLM's compile-time transients were being counted as activation; the model's real peak is 0.6 GiB),
+#     25-minute soak 684 ok at 31.8 of 32.6 GB peak. KVMEM=7.0 pins the budget (475k) when the launch-to-launch
+#     estimate matters; 7.5 was the measured edge (440 MiB free), not a setting.
 # Attention is the model's own QSA (ATTN=CUSTOM is for standard-attention models only).
 exec env \
   OVERLAYS=${OVERLAYS-emulated-switch} `# host overlay, not the product: VM100 on the .100 PLX box
@@ -30,11 +35,31 @@ exec env \
                       # once, NSEQ=8 runs 8 (conc-8, one prompt type: 283 -> 401 tok/s). NSEQ=16 for TP4.` \
   PREFIX_CACHE=${PREFIX_CACHE-0} `  # off: avoids the mamba-aligned prefill chunking (2k prefill 2.8k -> ~4.7k tok/s,
                                     # see serve.sh); =1 restores prefix reuse across requests` \
-  CGSIZES=${CGSIZES-1,2,4,8,16,24,32,48,64,96,128,192,256,384,512,768,1024,1280,1536,1792,2048} `  # graphs for
-                                    # prefill chunks <= 2048 tokens (short-prompt TTFT 336 -> 91 ms); CGSIZES= for
-                                    # vLLM's default (max 512)` \
+  CGSIZES=${CGSIZES-1,2,4,8,16,24,32,48,64,96,128,192,256} `  # graphs for prefill chunks <= 256 tokens
+                                    # (short-prompt TTFT 336 -> 91 ms). The sizes up to 2048 cost 1.4 GiB of graph
+                                    # memory a card and 1.4 GiB of vLLM's activation estimate for no soak-measured
+                                    # throughput (6677 vs 6726 prompt tok/s): +94k KV tokens at TP4 without them.
+                                    # CGSIZES= for vLLM's default (max 512)` \
+  UTIL=${UTIL-$([ "${TP:-2}" = 4 ] && echo 0.98)} `  # TP4: 0.98 (soaked: 31.8 of 32.6 GB at the peak); TP2 keeps
+                                    # serve.sh's 0.96 / 0.94` \
+  R9K_HC_FP8=${R9K_HC_FP8-r9k} `    # the hyper-connection up GEMM + sigmoid-gated mean fused in fp8 from 256 rows
+                                    # (268 vs 674 us a layer at 4096): +4% prefill, decode untouched; GSM8K paired
+                                    # p=0.86, HumanEval 160/164. =stock for the bf16 pair` \
+  R9K_HC_FP8_DECODE=${R9K_HC_FP8_DECODE-1} `  # the hyper-connection down + up GEMMs on the fp8 copies (bf16 WMMA,
+                                              # W8A16) up to R9K_HC_FP8_DECODE_MAXM rows: 16.42 -> 15.33 ms/step at
+                                              # TP4 (2026-10-09, 16 rows); to 255 rows +5.6% at 8 streams (10-10).
+                                              # GSM8K paired, HumanEval 161/164 (notes/decode-step.md). =0 for bf16` \
+  R9K_HC_FP8_DECODE_MAXM=${R9K_HC_FP8_DECODE_MAXM-255} `  # widest row count on those kernels; above it the tiled
+                                              # fp8 GEMMs (R9K_HC_FP8_MINM=256)` \
+  R9K_HC_FP8_DOWN=${R9K_HC_FP8_DOWN-1} `      # the hc down GEMM on the tiled fp8 path above 255 rows (-0.8% at 8k
+                                              # prefill: its activation quant) so that the bf16 weights can go` \
+  R9K_HC_FREE_BF16=${R9K_HC_FREE_BF16-1} `    # drop the bf16 hyper-connection weights after quantisation: 1.3 GB a
+                                              # card of KV cache (TP4 452k -> 516k tokens, TP2 167k -> 221k); +3% at
+                                              # 16 streams. =0 keeps them (and the hipBLASLt bf16 path above 16 rows)` \
   R9K_FP8_BLOCK=${R9K_FP8_BLOCK-block} `   # block-fp8 projections on our split-K GEMM at decode widths, stock's
                                            # Triton kernel above M=64 (R9K_FP8_BLOCK_MAXM); 2026-09-24: +6% decode` \
+  R9K_FP8_QA=${R9K_FP8_QA-1} `             # ... with the per-token fp8 quant fused into that GEMM (same operands bit
+                                           # for bit, 96 launches fewer a step): 15.33 -> 15.01 ms/step. =0 splits it` \
   R9K_DRAFT_LMHEAD=${R9K_DRAFT_LMHEAD-mxfp4} `   # MTP draft head at 4 bits: draft-only, cannot change outputs` \
   R9K_TARGET_LMHEAD=${R9K_TARGET_LMHEAD-mxfp4} ` # target head at 4 bits (as Rob's w4a16): ~0.5 ms/step. Paired evals
                                                  # 2026-09-24, conc=1: 300 short 96.0 -> 97.0% p=0.51; 800 CoT

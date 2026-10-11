@@ -427,6 +427,15 @@ def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.T
     if prefill is not None:
         blk = prefill_block(prefill)
         max_blocks = min(expert_ids.numel(), (numel + blk - 1) // blk + min(numel, E))
+        if type(w).__name__ == "Fp8Weight":           # kernels/fp8.py: e4m3 fragments + one fp32 scale a column
+            rc = lib().r9k_moe_4bit_prefill(
+                3, a_q.data_ptr(), a_s.data_ptr(), w.wq.data_ptr(), 0, w.ws.data_ptr(), out.data_ptr(),
+                sorted_ids.data_ptr(), expert_ids.data_ptr(), ntpp.data_ptr(),
+                topk_w.data_ptr() if topk_w is not None else 0, 0, w.N,
+                max_blocks, numel, a_row_div, w.K, w.N, prefill, _stream())
+            if rc:
+                raise RuntimeError(f"r9k_moe_4bit_prefill (fp8) failed ({rc}) N={w.N} K={w.K} cfg={prefill}")
+            return out
         nv = isinstance(w, Nvfp4Experts)
         rc = lib().r9k_moe_4bit_prefill(
             1 if nv else (2 if w.fold else 0), a_q.data_ptr(), a_s.data_ptr(), w.wq.data_ptr(),
@@ -519,6 +528,24 @@ def pick_moe_prefill(MT: int, K_down: int, gate_up: bool = False) -> int | None:
     if cfg < 0 or 16 * MT != prefill_block(cfg) or K_down % prefill_bk(cfg):
         return None
     return cfg
+
+
+
+def moe_sum(down: torch.Tensor, shared: torch.Tensor | None, out: torch.Tensor) -> torch.Tensor:
+    """out[M, N] = sum over top-k of down[M, topk, N] (+ shared[M, N]) in fp32, one bf16 rounding
+    (kernels/r9k_moe_sum.hip). Replaces ops.moe_sum, the finalize copy and the runner's shared add."""
+    M, topk, N = down.shape
+    assert down.is_contiguous() and out.shape == (M, N) and out.dtype == torch.bfloat16 and out.stride(1) == 1
+    L = lib()
+    if not hasattr(L, "_moe_sum_bound"):
+        L.r9k_moe_sum.restype = ctypes.c_int
+        L.r9k_moe_sum.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 3 + [ctypes.c_long] * 3
+        L._moe_sum_bound = True
+    rc = L.r9k_moe_sum(down.data_ptr(), shared.data_ptr() if shared is not None else 0, out.data_ptr(), M, topk, N,
+                       shared.stride(0) if shared is not None else 0, out.stride(0), _stream())
+    if rc:
+        raise RuntimeError(f"r9k_moe_sum failed ({rc}) M={M} topk={topk} N={N}")
+    return out
 
 
 def align_block_size_ref(topk_ids: torch.Tensor, num_experts: int, block: int = MOE_BLOCK):

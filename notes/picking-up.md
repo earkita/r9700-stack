@@ -78,6 +78,33 @@ These cost real time to learn:
 
 ## Current state
 
+**2026-10-03, v0.2.4.** Read this block first; the older paragraphs below it are still true where they do not
+contradict it.
+- **One GDN state page per request under speculative decoding** is in and validated (release notes
+  `notes/release-v0.2.4.md`). It is the default (`R9K_GDN_STATE=onepage`) but only takes effect with prefix
+  caching off (`PREFIX_CACHE=0`: already the default for Flash-Next, a knob on the 27B -- whether the 27B should
+  default to it is Brian's call, it changes multi-turn behaviour). 27B two cards: 223k -> 367k KV tokens.
+- **The cards run at 210 W with a -42 mV voltage offset** (LACT in the guest, `amdgpu.ppfeaturemask=0xffffffff`,
+  `/etc/lact/config.yaml`; the boot service `r9700-powercap.service` sets the same caps). The 225 W numbers in
+  README stay the reference and are labelled; measure new things at 210 W and say so. Item 3 below is superseded
+  by this decision (Brian, 2026-10-03), not by the perf argument.
+- **The host crashed once on 2026-10-03** when a chronic `MES failed to respond to msg=INVALIDATE_TLBS` on one card
+  (~130 occurrences since September, every card, normally self-recovering) escalated into a GPU reset; under
+  passthrough the reset took the card off the bus and the EPYC sync-flooded. Not this code, not load, not heat.
+  Proposed containment, Brian's call: `amdgpu.gpu_recovery=0` in the guest. PROGRESS.md 2026-10-03 has the
+  evidence; `reference_r9700_host_100` in the agent memory has the host notes.
+- **MES timeouts, solved for now (2026-10-04):** `amdgpu.mes_log_enable=1` on the guest kernel line removes the
+  `MES(1) failed to respond to msg=INVALIDATE_TLBS` timeouts (0 in 24 four-card launches vs ~1 per launch without;
+  firmware version, power, page-table mode and RAS made no difference). Both VMs run it plus `amdgpu.gpu_recovery=0`
+  so a future hang wedges one card instead of resetting it off the bus and taking the host. Put both on every new
+  VM. The write-up for AMD is `notes/bug-mes-invalidate-tlbs.md` (drm/amd #5759). PROGRESS.md 2026-10-03/04.
+- ~~Owed for two releases~~ -- paid 2026-10-03 (`notes/release-v0.2.4.md`): GSM8K/HumanEval, BetterBench and the
+  mixed soaks on every configuration, all green. v0.2.5 is the tag that carries the record.
+- The fifth card (chain C, passively cooled) is in VM100 as HIP 4; three more arrive later (8 total, two VMs or a
+  4+2+2 split; the hang rate does not depend on cards per VM and a reset in any VM takes the host).
+- TTFT (the section below) was fixed in v0.2.3 (97 -> 47 ms on the 27B); the section is kept as the record of the
+  investigation.
+
 Working and default: our own paged attention; A-tiled (fragment-tiled activation) prefill GEMM; folded-exponent
 MXFP4; DFlash2 speculative decoding; NVFP4→MXFP4 conversion at load; GDN `in_proj` merge; expert LRU cache.
 
@@ -96,6 +123,13 @@ costs −55% prefill, so the work took "unusable without it" down to "11% behind
 `notes/replacement-plan.md` is the plan for removing the remaining non-permissive dependencies entirely.
 
 ## What's actually left, roughly in order
+
+**Added 2026-10-03:** (a) the owed release checks above; (b) one-page stage 2: `mamba_cache_mode` "align" (prefix
+caching on) via boundary checkpoints from the replay, so the 27B can keep prefix caching and the memory; (c) the
+200k-context single-card run with the drafter needs the 25% attention-group padding in vLLM's hybrid grouping
+addressed upstream (report a candidate); (d) the mixed-step numerics: vLLM sends a running request's rows through
+the prefill attention path when a prefill shares the step, so texts depend on batching -- stock behaviour, noted so
+nobody chases it again (`~/batchid.py`, `~/stepcmp.py` on VM100 are the tools if it comes up).
 
 1. **An eval that can detect regressions.** See the GSM8K point above. Until this exists, quality claims here are
    weaker than they look.
@@ -145,6 +179,21 @@ and the only honest lever left.
 
 ## Already tried, measured, and rejected — don't redo these
 
+- **Prefill all-reduce pipelining by row parts (2026-10-07, comm/pipe.py, `R9K_AR_PIPE`).** The layer tail
+  (hc combine + mix, MoE, both all-reduces) in 2048-row parts with the attention parts' all-reduces on a comm
+  stream. Correct in serving and gated, but -5.5% prefill (fused pushes) / -6% (DMA pushes): the ar4 kernels hold
+  the CUs while they wait on the uplink, so they time-share with the GEMMs (4-rank stand-in: stock 5.15 ms, best
+  4.67, ideal 3.68). Shelved, default stock; see notes/prefill-fp8-pipe.md.
+- **Exact block-scaled fp8 tiled GEMM for the Triton projections (2026-10-07, `R9K_FP8_BLOCK_PREFILL`).**
+  Correct, 15-25% slower than vLLM's Triton block GEMM (167 TFLOPS) on the served shapes: two accumulator sets
+  cap the tile at 128 x 128 and the per-128-K promotion costs. Opt-in only.
+
+- **The decode node count as a lever (2026-10-07).** Removing ~240 of the ~1,990 launches a step (routing, the
+  MoE sum + shared add + finalize copy) moved the Flash-Next TP4 step 0.14 ms (~1%): in graph replay a tiny
+  node's dispatch overlaps the previous node, so the per-node "gap" the profiler shows is the profiler's. What
+  did move it was the P2P all-gather (GPU time, not launches). `notes/decode-nodes.md`. The remaining lever of
+  that kind is fewer, fatter kernels (the GEMM families fused with their neighbours), a different project.
+
 - `CGMODE=FULL`: TTFT 159 ms vs 104. Custom attention backend cannot be fully captured.
 - `HSA_ENABLE_MWAITX=0`, `HWQ=4`, dropping the chat template: none moved TTFT by more than ~1 ms.
 - `NBT=8192` (bigger prefill chunks): no gain at 9k, engine crash at 20.7k.
@@ -169,7 +218,15 @@ and the only honest lever left.
 
 ## Deferred / next up (2026-09-22)
 
-### vLLM upgrade — deferred, two blockers to clear first
+### vLLM upgrade — done once (2026-10-09), the recipe that worked
+
+`notes/vllm-upgrade-2026-10.md`. In short: pull the `nightly-rocm100-<sha>` image (never the `v0.x` release
+images: those are ROCm 7), build `r9700/vllm:dev-<sha>` with `docker/Dockerfile` (the bare nightly has no plugin),
+run `overlay/emulated-switch/patch-hostcall.sh` with `IMG=` / `OUT=` for it, `IMG=... ~/gates4.sh`, then serve
+with `IMG=... PATCHED=...`. Three plugin fixes were needed for 360 commits of drift; the validation chain's
+launches must pass `REPO=` or serve.sh mounts the production copy. The original blockers, for the record:
+
+#### (2026-09-22) deferred, two blockers to clear first
 
 Brian asked to move to a newer vLLM and re-verify the plugin (the project's whole claim is that this is a
 no-op). Held off because two things need deciding first, and both are worse to discover mid-pull:

@@ -20,7 +20,14 @@ TESTED = {
     "glm_w4a4_c1": (("e97573215",), "Opt-in GLM C1 Quark W4A4 grouped WMMA adapter"),
     "glm_rdna_indexer": (("e97573215",), "GLM kpool RDNA4 predicate and token-sized cache pages"),
     # patch name: (vLLM commits tested, upstream issue/PR that would retire it)
-    "mtp_allowlist": (("dee37d891", "e97573215"), "vllm-project/vllm#55292"),
+    "mtp_allowlist": (("dee37d891", "e97573215", "8cbd5d030"), "vllm-project/vllm#55292 (closed unmerged 2026-10)"),
+    # the modular MoE kernel copies its workspace into the layer output on ROCm unless aiter is on (moe/fold.py)
+    "moe_output_alias": (("e97573215",), "vllm: FusedMoEKernelModularImpl._fused_experts output alias on ROCm"),
+    # the runner adds the shared expert after the experts return; ours folds it into the top-k sum (moe/fold.py)
+    "moe_shared_fold": (("e97573215",), "vllm: MoERunner.forward shared_output + fused_output"),
+    # the decoder layer's post-attention tail as one op with the two all-reduces pipelined by row parts
+    # (comm/pipe.py): Qwen4ExpDecoderLayer.forward, RowParallelLinear.reduce_results, moe_config.skip_final_all_reduce
+    "layer_tail_pipe": (("e97573215",), "vllm: an all-reduce / compute overlap for row-local layer tails"),
 }
 
 

@@ -680,9 +680,13 @@ typedef unsigned short pf_v8u16 __attribute__((ext_vector_type(8)));
 __host__ __device__ constexpr int pf_stage_js(int TM, int TN, int WM, int WN) {
   return WM * WN * TM * 16 * (TN * 32 + 16) <= PF_STAGE_MAX ? TN : 1;
 }
-__host__ __device__ constexpr int pf_stage_bytes(int TM, int TN, int WM, int WN) {
-  return WM * WN * TM * 16 * (pf_stage_js(TM, TN, WM, WN) * 32 + 16);
+// MIX stages the whole 64-column wave tile (the 4 streams of a column) but at most two 16-row blocks at a time.
+__host__ __device__ constexpr int pf_stage_bytes(int TM, int TN, int WM, int WN, bool MIX = false) {
+  return MIX ? WM * WN * (TM < 2 ? TM : 2) * 16 * (TN * 32 + 16)
+             : WM * WN * TM * 16 * (pf_stage_js(TM, TN, WM, WN) * 32 + 16);
 }
+__device__ __forceinline__ float pf_bf2f(unsigned short u) { return __uint_as_float((unsigned)u << 16); }
+__device__ __forceinline__ float pf_sigmoid(float x) { return 1.f / (1.f + __expf(-x)); }
 #define PF_STAGED_EPILOGUE(WG_OF_N)                                                                          \
   {                                                                                                          \
     constexpr int JS = pf_stage_js(TM, TN, WM, WN), SPITCH = JS * 32 + 16, CPR = JS * 2;                    \
@@ -720,32 +724,106 @@ __host__ __device__ constexpr int pf_stage_bytes(int TM, int TN, int WM, int WN)
     }                                                                                                        \
   }
 
-template <int TM, int TN, int WM, int WN, bool NV, int BK, bool DB, bool FOLD>
+// MIX (F8 only, TN == 4): the hyper-connection up GEMM with hc_gate_mix fused in. The weight rows are interleaved
+// (kernels/fp8.py hc4_interleave: r' = g*64 + s*16 + i for stream s, output column g*16 + i) so a wave's 64-column
+// tile holds 16 output columns x the 4 streams; after staging the bf16 gate (stock's rounding point) the wave
+// reads xn's 4 stream segments of its rows and writes out[fr, c] = bf16((1/4) sum_s sigmoid(g[s]) * xn[s]) --
+// [M, N/4] bf16, no [M, N] gate round trip (84 MB written, 168 MB read back at 4096 x 10240). Two 16-row blocks
+// are staged at a time so the 8-wave tiles fit the LDS.
+#define PF_MIX_EPILOGUE(WG_OF_N)                                                                             \
+  {                                                                                                          \
+    constexpr int SPITCH = TN * 32 + 16, TMS = TM < 2 ? TM : 2;                                              \
+    __syncthreads();                                              /* every wave is done with the slabs */    \
+    unsigned char* const stg = pf_smem + wave * (TMS * 16 * SPITCH);                                         \
+    const int HD = N >> 2, c0w = (nt0 + wn * TN) * 4;      /* 64 interleaved columns = 16 output columns */  \
+    _Pragma("unroll") for (int i0 = 0; i0 < TM; i0 += TMS) {                                                 \
+      _Pragma("unroll") for (int j = 0; j < TN; j++) {                                                       \
+        const int n = (nt0 + wn * TN + j) * 16 + nlane;                                                      \
+        const float wg = (n < N) ? (WG_OF_N) : 0.f;                                                          \
+        _Pragma("unroll") for (int ii = 0; ii < TMS; ii++) {                                                 \
+          _Pragma("unroll") for (int q = 0; q < 8; q++) {                                                    \
+            const int rr = wm * TM * 16 + (i0 + ii) * 16 + mhalf + q;                                        \
+            const float v = acc[i0 + ii][j][q] * (wg * sSc[rr]);                                             \
+            *reinterpret_cast<unsigned short*>(stg + (ii * 16 + mhalf + q) * SPITCH + (j * 16 + nlane) * 2) = \
+                __bfloat16_as_ushort((__hip_bfloat16)v);                                                     \
+          }                                                                                                  \
+        }                                                                                                    \
+      }                                                                                                      \
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");                                                 \
+      __builtin_amdgcn_wave_barrier();                                                                       \
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");                                                 \
+      _Pragma("unroll") for (int c = lane; c < TMS * 16 * 2; c += WAVE32) {                                  \
+        const int row = c >> 1, part = c & 1;                                                                \
+        const int fr = sRow[wm * TM * 16 + i0 * 16 + row];                                                   \
+        const int cc0 = c0w + part * 8;                                                                      \
+        if (fr >= 0 && cc0 < HD) {                                                                           \
+          const __hip_bfloat16* xr = Xn + (size_t)fr * s_xn + cc0;                                           \
+          pf_v8u16 gv[4], xv[4];                                                                             \
+          _Pragma("unroll") for (int s = 0; s < 4; s++) {                                                    \
+            gv[s] = *reinterpret_cast<const pf_v8u16*>(stg + row * SPITCH + (s * 16 + part * 8) * 2);        \
+            xv[s] = *reinterpret_cast<const pf_v8u16*>(xr + (size_t)s * HD);                                 \
+          }                                                                                                  \
+          float am[8];                                                                                       \
+          _Pragma("unroll") for (int i = 0; i < 8; i++) am[i] = 0.f;                                         \
+          _Pragma("unroll") for (int s = 0; s < 4; s++)                                                      \
+            _Pragma("unroll") for (int i = 0; i < 8; i++)                                                    \
+              am[i] = fmaf(pf_sigmoid(pf_bf2f(gv[s][i])), pf_bf2f(xv[s][i]), am[i]);                         \
+          pf_v8u16 yv;                                                                                       \
+          _Pragma("unroll") for (int i = 0; i < 8; i++)                                                      \
+            yv[i] = __bfloat16_as_ushort((__hip_bfloat16)(am[i] * 0.25f));                                   \
+          *reinterpret_cast<pf_v8u16*>(C + (size_t)fr * HD + cc0) = yv;                                      \
+        }                                                                                                    \
+      }                                                                                                      \
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");                                                 \
+      __builtin_amdgcn_wave_barrier();                                                                       \
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");                                                 \
+    }                                                                                                        \
+  }
+
+// F8: the weight is e4m3 in permute_fp8's fragment order (8 bytes per lane per K step, the LDS slab layout as it
+// is) with one fp32 scale per output column (Wref_all as float*, like NV's Wg): no unpack, no group scales, the
+// column scale meets the row scale in the epilogue. Serves dense fp8 linears at prefill widths (the hyper-connection
+// GEMMs, row-requantised block-fp8 projections) where the decode-shaped split-K kernel loses to hipBLASLt / Triton.
+// F8B (F8, exact block scales): A carries one fp32 scale per (row, kg-column group) [Asg, row stride sld], the
+// weight one per (wsb-row block, group) [Wsg, (n / wsb) * sld + g]; the WMMAs of a group accumulate into accg and
+// are promoted into acc at the group's end with the two scales' product (DeepGEMM-style), so stock's 128 x 128
+// block-fp8 math is reproduced up to summation order (no row-wise requantisation). Two accumulator sets:
+// TM * TN <= 8 tiles only.
+template <int TM, int TN, int WM, int WN, bool NV, int BK, bool DB, bool FOLD, bool F8 = false, bool MIX = false,
+          bool F8B = false>
 __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
     const unsigned char* __restrict__ A, const float* __restrict__ As,
     const unsigned int* __restrict__ Wp_all, const unsigned char* __restrict__ Ws_all,
     const unsigned char* __restrict__ Wref_all, __hip_bfloat16* __restrict__ C,
     const int* __restrict__ sorted_ids, const int* __restrict__ expert_ids,
     const int* __restrict__ ntpp, const float* __restrict__ topk_w,
-    long ws_estride, long wref_estride, int numel, int a_row_div, int K, int N) {
+    long ws_estride, long wref_estride, int numel, int a_row_div, int K, int N,
+    const __hip_bfloat16* __restrict__ Xn, long s_xn,
+    const float* __restrict__ Asg, const float* __restrict__ Wsg, int kgs, int wsb, int sld) {
   constexpr int BM = WM * TM * 16, BN = WN * TN * 16, NT = WM * WN * WAVE32;
   constexpr int ASTR = BK + 8;                              // padded A row stride: conflict-free fragment reads
   constexpr int KSPS = BK / 16;                             // WMMA K steps per slab
   constexpr int KG = NV ? 16 : GROUP, SPG = KG / 16, G = BK / KG;   // scale groups per slab
   static_assert(G >= 1, "slab must hold a whole scale group");
   static_assert(!(NV && FOLD), "folding is for E8M0 (MXFP4) scales");
+  static_assert(!(F8 && (NV || FOLD)), "F8 weights carry no group scales");
+  static_assert(!MIX || (F8 && TN == 4), "MIX: fp8 weights, 64-column wave tiles (16 columns x 4 streams)");
+  static_assert(!F8B || (F8 && !MIX && TM * TN <= 8), "F8B: fp8 weights, two accumulator sets");
+  constexpr bool NOSC = FOLD || F8;                         // no per-group scales in the K loop
   constexpr int ACH = BM * (BK / 16) / NT;                  // 16 B A chunks per thread per slab
-  constexpr int WSL = BN * (BK / 8) / NT;                   // uint32 weight slots per thread per slab
-  constexpr int SCH = FOLD ? 1 : (BN * G + NT - 1) / NT;    // scale bytes per thread per slab (guarded; FOLD: none)
+  constexpr int WSL = BN * (BK / 8) / NT;                   // weight slots per thread per slab (uint32 of codes, or 8 B of fp8)
+  constexpr int SCH = NOSC ? 1 : (BN * G + NT - 1) / NT;    // scale bytes per thread per slab (guarded; NOSC: none)
+  static_assert(!F8 || WSL == 1 || WSL % 2 == 0, "F8 slots are loaded 16 bytes at a time");
   static_assert(ACH * NT == BM * (BK / 16) && ACH >= 1 && ACH <= 8, "A slab must split evenly");
   static_assert(WSL * NT == BN * (BK / 8) && (WSL == 1 || WSL == 2 || WSL == 4), "W slab must split evenly");
-  constexpr int SA_BYTES = BM * ASTR, SW_BYTES = BN * BK, SS_BYTES = FOLD ? 0 : ((BN * G + 15) & ~15);
+  constexpr int SA_BYTES = BM * ASTR, SW_BYTES = BN * BK, SS_BYTES = NOSC ? 0 : ((BN * G + 15) & ~15);
   constexpr int BUF_BYTES = SA_BYTES + SW_BYTES + SS_BYTES, NBUF = DB ? 2 : 1;
   extern __shared__ __align__(16) unsigned char pf_smem[];
-  constexpr int TAB_OFF = NBUF * BUF_BYTES > pf_stage_bytes(TM, TN, WM, WN) ? NBUF * BUF_BYTES
-                                                                          : pf_stage_bytes(TM, TN, WM, WN);
+  constexpr int TAB_OFF = NBUF * BUF_BYTES > pf_stage_bytes(TM, TN, WM, WN, MIX) ? NBUF * BUF_BYTES
+                                                                          : pf_stage_bytes(TM, TN, WM, WN, MIX);
   int* const sRow = (int*)(pf_smem + TAB_OFF);   // row tables sit past both the slabs and the epilogue stage
   float* const sSc = (float*)(sRow + BM);          // per-row output scale: A row scale (x router weight), once per block
+  float* const sScA = sSc + BM;                    // F8B: the block's A group scales, two groups in flight
 
   // Workgroups are dispatched x-fastest: all column tiles of routing block 0, then of block 1, ... so a block's A
   // rows stay in L2 while the weight streams from MALL / DRAM once per routing block. A grouped swizzle (gm
@@ -763,16 +841,16 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
   const int nlane = lane & 15, mhalf = (lane >> 4) * 8;
   const int ksteps = K / 16, ntmax = N / 16 - 1;
   const int nt0 = bx * (BN / 16);
-  const unsigned int* __restrict__ Wp = Wp_all + (size_t)e * (N / 16) * ksteps * WAVE32;
+  const unsigned int* __restrict__ Wp = Wp_all + (size_t)e * (N / 16) * ksteps * WAVE32 * (F8 ? 2 : 1);
   const unsigned char* __restrict__ Ws = Ws_all + (size_t)e * ws_estride;
-  const float* __restrict__ Wg = NV ? (const float*)Wref_all + (size_t)e * wref_estride : nullptr;
+  const float* __restrict__ Wg = (NV || F8) ? (const float*)Wref_all + (size_t)e * wref_estride : nullptr;
   const unsigned char* __restrict__ Wref = (!NV && FOLD) ? Wref_all + (size_t)e * wref_estride : nullptr;
 
   for (int r = tid; r < BM; r += NT) {
     const int fl = sorted_ids[by * BM + r];
     const bool live = fl >= 0 && fl < numel;
     sRow[r] = live ? fl : -1;                                // -1: padding row (loaded as `first`, never stored)
-    sSc[r] = live ? As[fl / a_row_div] * (topk_w ? topk_w[fl] : 1.f) : 0.f;
+    sSc[r] = live ? (F8B ? 1.f : As[fl / a_row_div] * (topk_w ? topk_w[fl] : 1.f)) : 0.f;
   }
   __syncthreads();
 
@@ -793,7 +871,7 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
   {
     const int s0 = tid * WSL, lane_ = s0 & 31, rest = s0 >> 5, ks = rest % KSPS, ntl = rest / KSPS;
     const int ntg = nt0 + ntl < ntmax ? nt0 + ntl : ntmax;   // clamped: garbage columns are never stored
-    w_src = (unsigned)(((ntg * ksteps + ks) * WAVE32 + lane_) * 4);
+    w_src = (unsigned)(((ntg * ksteps + ks) * WAVE32 + lane_) * (F8 ? 8 : 4));
     w_dst = (unsigned)(SA_BYTES + ((ntl * KSPS + ks) * WAVE32 + lane_) * 8);
     if constexpr (FOLD) {
       const int col0 = ntg * 16 + (lane_ & 15);              // lane_ % WSL == 0: the WSL columns are aligned
@@ -812,14 +890,19 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
     s_src[it] = (unsigned)(g * N + ntg * 16 + (nl & 15));
   }
 
-  v8f acc[TM][TN];
+  v8f acc[TM][TN], accg[TM][TN];                           // accg: F8B's per-group partials
 #pragma unroll
   for (int i = 0; i < TM; i++)
 #pragma unroll
-    for (int j = 0; j < TN; j++) acc[i][j] = (v8f)(0.f);
+    for (int j = 0; j < TN; j++) acc[i][j] = accg[i][j] = (v8f)(0.f);
+  float pas = 0.f, pws0[TN], pws1[TN];                      // F8B: next group's A scale (one row a thread), W scales
+#pragma unroll
+  for (int j = 0; j < TN; j++) pws0[j] = pws1[j] = 0.f;
+#define PF_ACC (F8B ? accg : acc)
 
   uint4 pa[ACH];
   unsigned int pw[WSL];
+  v2i pw8[WSL];                                             // F8: the 8-byte fragment slots as loaded
   unsigned char ps[SCH];
   unsigned int psw = 0;                                     // FOLD: the WSL scale bytes of this thread's slots
   const int nslabs = K / BK;
@@ -828,7 +911,19 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
     const int slab_ = (SLAB);                                                                           \
     _Pragma("unroll")                                                                                   \
     for (int q = 0; q < ACH; q++) pa[q] = ld_u32off((const uint4*)A, a_src[q] + (unsigned)(slab_ * BK)); \
-    if constexpr (WSL == 4) {                                                                           \
+    if constexpr (F8) {                                                                                 \
+      const unsigned off8_ = w_src + (unsigned)(slab_ * KSPS * WAVE32 * 8);                             \
+      _Pragma("unroll")                                                                                 \
+      for (int q = 0; q < WSL; q += 2) {                                                                \
+        if constexpr (WSL >= 2) {                                                                       \
+          const uint4 v = ld_u32off((const uint4*)Wp, off8_ + (unsigned)(q * 8));                       \
+          pw8[q][0] = (int)v.x; pw8[q][1] = (int)v.y; pw8[q + 1][0] = (int)v.z; pw8[q + 1][1] = (int)v.w; \
+        } else {                                                                                        \
+          const uint2 v = ld_u32off((const uint2*)Wp, off8_);                                           \
+          pw8[q][0] = (int)v.x; pw8[q][1] = (int)v.y;                                                   \
+        }                                                                                               \
+      }                                                                                                 \
+    } else if constexpr (WSL == 4) {                                                                    \
       const uint4 v = ld_u32off((const uint4*)Wp, w_src + (unsigned)(slab_ * KSPS * WAVE32 * 4));      \
       pw[0] = v.x; pw[1] = v.y; pw[2] = v.z; pw[3] = v.w;                                               \
     } else if constexpr (WSL == 2) {                                                                    \
@@ -837,7 +932,22 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
     } else {                                                                                            \
       pw[0] = ld_u32off(Wp, w_src + (unsigned)(slab_ * KSPS * WAVE32 * 4));                            \
     }                                                                                                   \
-    if constexpr (FOLD) {                                                                               \
+    if constexpr (F8B) {                                                                                \
+      if (slab_ % kgs == 0) {                                                                           \
+        const int g_ = slab_ / kgs;                                                                     \
+        if (tid < BM) {                                                                                 \
+          const int fr_ = sRow[tid];                                                                    \
+          pas = Asg[(size_t)((fr_ < 0 ? first : fr_) / a_row_div) * sld + g_];                          \
+        }                                                                                               \
+        _Pragma("unroll")                                                                               \
+        for (int j = 0; j < TN; j++) {                                                                  \
+          const int n_ = (nt0 + wn * TN + j) * 16 + nlane;                                              \
+          const float v_ = Wsg[(size_t)((n_ < N ? n_ : N - 1) / wsb) * sld + g_];                       \
+          if (g_ & 1) pws1[j] = v_; else pws0[j] = v_;                                                  \
+        }                                                                                               \
+      }                                                                                                 \
+    } else if constexpr (F8) {                                                                          \
+    } else if constexpr (FOLD) {                                                                        \
       psw = ld_scale_bytes<WSL>(Ws, ws_own + (unsigned)(slab_ * G) * (unsigned)N);                      \
     } else {                                                                                            \
       _Pragma("unroll")                                                                                 \
@@ -850,7 +960,11 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
     unsigned char* const sb_ = pf_smem + (BUF) * BUF_BYTES;                                             \
     _Pragma("unroll")                                                                                   \
     for (int q = 0; q < ACH; q++) *(uint4*)(sb_ + a_dst[q]) = pa[q];                                    \
-    if constexpr (FOLD) {                                                                               \
+    if constexpr (F8) {                                                                                 \
+      _Pragma("unroll")                                                                                 \
+      for (int q = 0; q < WSL; q++) *(v2i*)(sb_ + w_dst + q * 8) = pw8[q];                              \
+      if constexpr (F8B) { if (slab % kgs == 0 && tid < BM) sScA[((slab / kgs) & 1) * BM + tid] = pas; } \
+    } else if constexpr (FOLD) {                                                                        \
       _Pragma("unroll")                                                                                 \
       for (int q = 0; q < WSL; q++)                                                                     \
         *(v2i*)(sb_ + w_dst + q * 8) =                                                                  \
@@ -877,7 +991,7 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
         for (int j = 0; j < TN; j++)                                                                     \
           WF[sidx][j] = *(const v2i*)(myW + (OFF) + (j * KSPS + (GV) * SPG + sidx) * (WAVE32 * 8));      \
       }                                                                                                  \
-      if constexpr (!FOLD) {                                                                             \
+      if constexpr (!NOSC) {                                                                             \
         _Pragma("unroll")                                                                                \
         for (int j = 0; j < TN; j++) SB[j] = myS[(OFF) + (GV) * BN + j * 16];                            \
       }                                                                                                  \
@@ -891,13 +1005,13 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
     {                                                                                                    \
       _Pragma("unroll")                                                                                  \
       for (int j = (J0); j < (J1); j++) {                                                                \
-        if constexpr (FOLD) {                                                                            \
+        if constexpr (NOSC) {                                                                            \
           _Pragma("unroll")                                                                              \
           for (int sidx = 0; sidx < SPG; sidx++) {                                                       \
             _Pragma("unroll")                                                                            \
             for (int i = 0; i < TM; i++) {                                                               \
               if (R9K_PF_ABL & 2) { acc[i][j][0] += __int_as_float(AF[sidx][i][0] ^ WF[sidx][j][1]); continue; } \
-              acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(AF[sidx][i], WF[sidx][j], acc[i][j]); \
+              PF_ACC[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(AF[sidx][i], WF[sidx][j], PF_ACC[i][j]); \
             }                                                                                            \
           }                                                                                              \
           continue;                                                                                      \
@@ -932,6 +1046,28 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
       _Pragma("unroll")                                                                                  \
       for (int j = 0; j < TN; j++) sbc[j] = sbn[j];                                                      \
     }
+#define PF_F8B_FLUSH()                                                                                  \
+  {                                                                                                     \
+    if constexpr (F8B) {                                                                                \
+      if ((slab + 1) % kgs == 0) {                                                                      \
+        const int gi = (slab / kgs) & 1;                                                                \
+        const float* const sa = sScA + gi * BM;                                                         \
+        _Pragma("unroll")                                                                               \
+        for (int j = 0; j < TN; j++) {                                                                  \
+          const float wsj = gi ? pws1[j] : pws0[j];                                                     \
+          _Pragma("unroll")                                                                             \
+          for (int i = 0; i < TM; i++) {                                                                \
+            _Pragma("unroll")                                                                           \
+            for (int q = 0; q < 8; q++) {                                                               \
+              const int rr = wm * TM * 16 + i * 16 + mhalf + q;                                         \
+              acc[i][j][q] = fmaf(accg[i][j][q], sa[rr] * wsj, acc[i][j][q]);                           \
+            }                                                                                           \
+            accg[i][j] = (v8f)(0.f);                                                                    \
+          }                                                                                             \
+        }                                                                                               \
+      }                                                                                                 \
+    }                                                                                                   \
+  }
   v2i afc[SPG][TM], wfc[SPG][TN], afn[SPG][TM], wfn[SPG][TN];
   unsigned int sbc[TN], sbn[TN];
   if constexpr (!DB) {
@@ -950,6 +1086,7 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
         PF_COMPUTE(0, TN, afc, wfc, sbc)
         if (g + 1 < G) PF_ROTATE()
       }
+      PF_F8B_FLUSH()
       if (!(R9K_PF_ABL & 4)) lds_barrier();
     }
   } else {
@@ -981,8 +1118,11 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
         PF_COMPUTE(0, TN, afc, wfc, sbc)
         if (g + 1 < G) PF_ROTATE()
       }
+      PF_F8B_FLUSH()
     }
   }
+#undef PF_F8B_FLUSH
+#undef PF_ACC
 #undef PF_ROTATE
 #undef PF_COMPUTE
 #undef PF_FRAG_LOAD
@@ -1003,7 +1143,8 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
   }
   // (the per-element As / topk_w gathers this once had were ~45% of the K=160 down GEMM: 1191 -> 811 us with sSc;
   //  the 2-byte scattered stores another ~30%: staged below)
-  PF_STAGED_EPILOGUE(NV ? Wg[n] : (FOLD ? __uint_as_float((unsigned)Wref[n] << 23) : 1.f))
+  if constexpr (MIX) PF_MIX_EPILOGUE(Wg[n])
+  else PF_STAGED_EPILOGUE(F8B ? 1.f : ((NV || F8) ? Wg[n] : (FOLD ? __uint_as_float((unsigned)Wref[n] << 23) : 1.f)))
 }
 
 // Tile table (cfg index -> TM, TN, WM, WN, BK, DB); BM = WM*TM*16 rows per routing block, BN = WN*TN*16 columns.
@@ -1043,9 +1184,27 @@ extern "C" int r9k_moe_prefill_bk(int cfg) {     // K slab of a prefill cfg: the
 }
 
 // Prefill entry: same operands / routing tables as r9k_moe_mxfp4a8 / r9k_moe_nvfp4a8 (nv selects the scale
-// format: 0 MXFP4, 1 NVFP4, 2 MXFP4 with the block exponents folded into the weights), routing block =
+// format: 0 MXFP4, 1 NVFP4, 2 MXFP4 with the block exponents folded into the weights, 3 fp8 weights in
+// permute_fp8 fragment order with `wref` = one fp32 scale per output column), routing block =
 // r9k_moe_prefill_bm(cfg) rows, tile = cfg. Shape rules: N % 16 == 0, K % r9k_moe_prefill_bk(cfg) == 0 (the K loop
 // walks whole BK slabs; BK=32 tiles serve K=160, the TP=4 down GEMM).
+// Launch of one tile config (grid: N tiles x routing blocks). xn / s_xn (MIX) come from the caller's scope.
+#define PL(TMv, TNv, WMv, WNv, NVv, BKv, DBv, FOv, F8v, MIXv, F8Bv)                                        \
+  {                                                                                                        \
+    constexpr int BM = WMv * TMv * 16, BN = WNv * TNv * 16, NT = WMv * WNv * WAVE32;                        \
+    constexpr int G = BKv / (NVv ? 16 : GROUP);                                                            \
+    constexpr size_t ssb = (FOv || F8v) ? 0 : (((size_t)BN * G + 15) & ~(size_t)15);                       \
+    constexpr size_t buf = (size_t)BM * (BKv + 8) + (size_t)BN * BKv + ssb;                                \
+    const size_t slabs = (DBv ? 2 : 1) * buf, stage = (size_t)pf_stage_bytes(TMv, TNv, WMv, WNv, MIXv);             \
+    const size_t smem = (slabs > stage ? slabs : stage) + (size_t)BM * (F8Bv ? 16 : 8);                      \
+    if (smem > 64 * 1024) return -4;                                                                       \
+    dim3 grid((N / 16 + BN / 16 - 1) / (BN / 16), max_blocks), block(NT);                                  \
+    hipLaunchKernelGGL((r9k_moe_4bit_prefill_kernel<TMv, TNv, WMv, WNv, NVv, BKv, DBv, FOv, F8v, MIXv, F8Bv>), grid, block, smem, st, \
+        (const unsigned char*)a, (const float*)as, (const unsigned int*)wq, (const unsigned char*)ws,       \
+        (const unsigned char*)wref, (__hip_bfloat16*)c, (const int*)sorted_ids, (const int*)expert_ids,    \
+        (const int*)ntpp, (const float*)topk_w, ws_estride, wref_estride, numel, a_row_div, K, N,          \
+        (const __hip_bfloat16*)xn, s_xn, (const float*)asg, (const float*)wsg, kgs, wsb, sld);              \
+  }
 extern "C" int r9k_moe_4bit_prefill(int nv, long a, long as, long wq, long ws, long wref, long c,
                                     long sorted_ids, long expert_ids, long ntpp, long topk_w,
                                     long ws_estride, long wref_estride, int max_blocks, int numel, int a_row_div,
@@ -1053,27 +1212,15 @@ extern "C" int r9k_moe_4bit_prefill(int nv, long a, long as, long wq, long ws, l
   if (N % 16) return -1;
   if (cfg < 0 || cfg >= PF_NCFG) return -7;
   if (K % kPfCfgs[cfg].BK) return -2;
-  if (nv < 0 || nv > 2) return -8;
+  if (nv < 0 || nv > 3) return -8;
   hipStream_t st = (hipStream_t)stream;
-#define PL(TMv, TNv, WMv, WNv, NVv, BKv, DBv, FOv)                                                         \
-  {                                                                                                        \
-    constexpr int BM = WMv * TMv * 16, BN = WNv * TNv * 16, NT = WMv * WNv * WAVE32;                        \
-    constexpr int G = BKv / (NVv ? 16 : GROUP);                                                            \
-    constexpr size_t ssb = FOv ? 0 : (((size_t)BN * G + 15) & ~(size_t)15);                                \
-    constexpr size_t buf = (size_t)BM * (BKv + 8) + (size_t)BN * BKv + ssb;                                \
-    const size_t slabs = (DBv ? 2 : 1) * buf, stage = (size_t)pf_stage_bytes(TMv, TNv, WMv, WNv);             \
-    const size_t smem = (slabs > stage ? slabs : stage) + (size_t)BM * 8;                                    \
-    if (smem > 64 * 1024) return -4;                                                                       \
-    dim3 grid((N / 16 + BN / 16 - 1) / (BN / 16), max_blocks), block(NT);                                  \
-    hipLaunchKernelGGL((r9k_moe_4bit_prefill_kernel<TMv, TNv, WMv, WNv, NVv, BKv, DBv, FOv>), grid, block, smem, st, \
-        (const unsigned char*)a, (const float*)as, (const unsigned int*)wq, (const unsigned char*)ws,       \
-        (const unsigned char*)wref, (__hip_bfloat16*)c, (const int*)sorted_ids, (const int*)expert_ids,    \
-        (const int*)ntpp, (const float*)topk_w, ws_estride, wref_estride, numel, a_row_div, K, N);         \
-  }
+  const long xn = 0, s_xn = 0, asg = 0, wsg = 0;
+  const int kgs = 0, wsb = 0, sld = 0;
 #define PLN(TMv, TNv, WMv, WNv, BKv, DBv) \
-  do { if (nv == 1) PL(TMv, TNv, WMv, WNv, true, BKv, DBv, false) \
-       else if (nv == 2) PL(TMv, TNv, WMv, WNv, false, BKv, DBv, true) \
-       else PL(TMv, TNv, WMv, WNv, false, BKv, DBv, false) } while (0)
+  do { if (nv == 1) PL(TMv, TNv, WMv, WNv, true, BKv, DBv, false, false, false, false) \
+       else if (nv == 2) PL(TMv, TNv, WMv, WNv, false, BKv, DBv, true, false, false, false) \
+       else if (nv == 3) PL(TMv, TNv, WMv, WNv, false, BKv, DBv, false, true, false, false) \
+       else PL(TMv, TNv, WMv, WNv, false, BKv, DBv, false, false, false, false) } while (0)
   switch (cfg) {
     case 0: PLN(4, 2, 4, 2, 64, false); break;
     case 1: PLN(4, 4, 4, 2, 64, false); break;
@@ -1098,6 +1245,62 @@ extern "C" int r9k_moe_4bit_prefill(int nv, long a, long as, long wq, long ws, l
     default: return -7;
   }
 #undef PLN
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+// The hyper-connection up GEMM + gate mix (MIX epilogue): out[M, N/4] bf16 from a [M, K] fp8 rows (as: row scales),
+// wq = permute_fp8(quantize(hc4_interleave(w_up))) with wscol = its N column scales, xn [M, N] bf16 (row stride
+// s_xn elements). Routing tables as r9k_moe_4bit_prefill (dense: identity). N % 64 == 0, cfg with TN == 4.
+extern "C" int r9k_fp8_prefill_mix(long a, long as, long wq, long wscol, long c, long xn, long s_xn,
+                                   long sorted_ids, long expert_ids, long ntpp, int max_blocks, int numel,
+                                   int K, int N, int cfg, long stream) {
+  if (N % 64) return -1;
+  if (cfg < 0 || cfg >= PF_NCFG) return -7;
+  if (K % kPfCfgs[cfg].BK) return -2;
+  if (kPfCfgs[cfg].TN != 4) return -8;
+  hipStream_t st = (hipStream_t)stream;
+  const long ws = 0, wref = wscol, topk_w = 0, ws_estride = 0, wref_estride = N, asg = 0, wsg = 0;
+  const int a_row_div = 1, kgs = 0, wsb = 0, sld = 0;
+  switch (cfg) {
+    case 1: PL(4, 4, 4, 2, false, 64, false, false, true, true, false) break;
+    case 9: PL(4, 4, 4, 2, false, 32, true, false, true, true, false) break;
+    case 16: PL(4, 4, 4, 2, false, 64, true, false, true, true, false) break;
+    case 17: PL(2, 4, 2, 2, false, 32, true, false, true, true, false) break;
+    case 19: PL(2, 4, 2, 2, false, 32, false, false, true, true, false) break;
+    default: return -7;
+  }
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+// Exact block-scaled fp8 GEMM (F8B): a [M, K] e4m3 rows with as [M, K/kg] fp32 (per row and kg-column group),
+// wq = permute_fp8(e4m3 [N, K]) with ws [ceil(N/wsb), K/kg] fp32 (stock's 128 x 128 block-fp8: kg = wsb = 128),
+// out [M, N] bf16. kg % BK == 0, K % kg == 0; tables as r9k_moe_4bit_prefill (dense: identity); TM*TN <= 8 cfgs.
+extern "C" int r9k_fp8_prefill_block(long a, long as, long wq, long ws_blk, long c, long sorted_ids, long expert_ids,
+                                     long ntpp, int max_blocks, int numel, int K, int N, int kg, int wsb_, int cfg,
+                                     long stream) {
+  if (N % 16) return -1;
+  if (cfg < 0 || cfg >= PF_NCFG) return -7;
+  if (K % kPfCfgs[cfg].BK || kg % kPfCfgs[cfg].BK || K % kg || wsb_ <= 0) return -2;
+  if (kPfCfgs[cfg].TM * kPfCfgs[cfg].TN > 8) return -8;
+  hipStream_t st = (hipStream_t)stream;
+  const long ws = 0, wref = 0, topk_w = 0, ws_estride = 0, wref_estride = 0, xn = 0, s_xn = 0;
+  const long asg = as, wsg = ws_blk;
+  const int a_row_div = 1, kgs = kg / kPfCfgs[cfg].BK, wsb = wsb_, sld = K / kg;
+  switch (cfg) {
+    case 2: PL(4, 2, 2, 4, false, 64, false, false, true, false, true) break;
+    case 3: PL(4, 2, 2, 2, false, 64, false, false, true, false, true) break;
+    case 4: PL(2, 2, 4, 2, false, 64, false, false, true, false, true) break;
+    case 6: PL(2, 2, 2, 2, false, 64, false, false, true, false, true) break;
+    case 10: PL(4, 2, 2, 4, false, 32, true, false, true, false, true) break;
+    case 11: PL(2, 2, 2, 2, false, 32, true, false, true, false, true) break;
+    case 13: PL(4, 2, 2, 4, false, 64, true, false, true, false, true) break;
+    case 14: PL(2, 2, 2, 2, false, 64, true, false, true, false, true) break;
+    case 15: PL(2, 2, 2, 4, false, 64, true, false, true, false, true) break;
+    case 17: PL(2, 4, 2, 2, false, 32, true, false, true, false, true) break;
+    case 18: PL(2, 2, 2, 2, false, 32, false, false, true, false, true) break;
+    case 19: PL(2, 4, 2, 2, false, 32, false, false, true, false, true) break;
+    default: return -7;
+  }
 #undef PL
   return hipGetLastError() == hipSuccess ? 0 : -6;
 }

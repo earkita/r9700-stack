@@ -38,6 +38,10 @@ from ..ple import short_conv as _ple_conv
 from .. import hc as _hc
 from .. import router as _router
 from ..moe import shared as _shared
+from ..moe import route as _route
+from ..moe import fold as _fold
+from ..comm import pipe as _pipe
+from ..compat import memsnap as _memsnap
 
 logger = init_logger("vllm." + __name__)
 
@@ -102,22 +106,34 @@ def mtp_weights(weights, mtp_mxfp4: bool):
 
 @contextlib.contextmanager
 def construction_scope():
-    """Stock construction with the int6 PLE embedding class (int6 checkpoints only) and exact pinning."""
+    """Stock construction with the int6 PLE embedding class (int6 checkpoints only) and exact pinning.
+
+    The PLE layer instantiates its table through a name in its own module: `PLEVocabParallelEmbedding` up to the
+    2026-09 vLLM, `Qwen4ExpPLEDeviceEmbedding` / `Qwen4ExpPLEPinnedHostEmbedding` (chosen by engram_config) from
+    2026-10. Whichever is there is swapped for the int6 class (built on the device base: our table is a UVA view
+    of pinned host rows either way) for the duration of the construction, then restored."""
     from ..ple.int6 import checkpoint_ple_format, make_int6_embedding_cls
     from ..utils.hostmem import exact_pinning
-    stock_cls = getattr(_ple_layer, "PLEVocabParallelEmbedding", None)
-    swap = stock_cls is not None and checkpoint_ple_format() == "int6"
-    if checkpoint_ple_format() == "int6" and stock_cls is None:
-        raise RuntimeError("r9700: vLLM's ple_layer no longer exposes PLEVocabParallelEmbedding; int6 PLE needs "
-                           "a new construction hook for this vLLM version")
+    names = [n for n in ("Qwen4ExpPLEDeviceEmbedding", "Qwen4ExpPLEPinnedHostEmbedding", "PLEVocabParallelEmbedding")
+             if getattr(_ple_layer, n, None) is not None]
+    swap = bool(names) and checkpoint_ple_format() == "int6"
+    if checkpoint_ple_format() == "int6" and not names:
+        raise RuntimeError("r9700: vLLM's ple_layer exposes none of the PLE embedding classes this hook knows "
+                           "(PLEVocabParallelEmbedding, Qwen4ExpPLEDeviceEmbedding); int6 PLE needs a new "
+                           "construction hook for this vLLM version")
+    saved = {n: getattr(_ple_layer, n) for n in names}
     if swap:
-        _ple_layer.PLEVocabParallelEmbedding = make_int6_embedding_cls(stock_cls)
+        base = saved.get("Qwen4ExpPLEDeviceEmbedding") or saved.get("PLEVocabParallelEmbedding")
+        cls = make_int6_embedding_cls(base)
+        for n in names:
+            setattr(_ple_layer, n, cls)
     try:
         with exact_pinning():
             yield
     finally:
         if swap:
-            _ple_layer.PLEVocabParallelEmbedding = stock_cls
+            for n, c in saved.items():
+                setattr(_ple_layer, n, c)
 
 
 def _head_fmt(env: str) -> str | None:
@@ -147,6 +163,23 @@ def _load_target(self, super_load, weights):
 
 
 class R9kQwen4ExpForConditionalGeneration(Qwen4ExpForConditionalGeneration):
+    # one GDN state page per request under speculative decoding (models/gdn.py): vLLM sizes the padded mamba page
+    # from these before any layer exists
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config):
+        from .gdn import onepage_state_shape_from_config
+        return onepage_state_shape_from_config(Qwen4ExpForConditionalGeneration, vllm_config)
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config):
+        from .gdn import onepage_state_dtype_from_config
+        return onepage_state_dtype_from_config(Qwen4ExpForConditionalGeneration, vllm_config)
+
+    @classmethod
+    def get_mamba_specs_from_config(cls, vllm_config):      # the hook vLLM prefers when a model defines it
+        from .gdn import onepage_specs_from_config
+        return onepage_specs_from_config(Qwen4ExpForConditionalGeneration, vllm_config)
+
 
     def __init__(self, *, vllm_config, prefix: str = "model") -> None:
         with construction_scope():
@@ -157,9 +190,14 @@ class R9kQwen4ExpForConditionalGeneration(Qwen4ExpForConditionalGeneration):
         _router.install(self)
         _hc.install_mix(self)
         _shared.install(self)
+        _route.install(self)
+        _fold.install(self)
+        _pipe.install(self)
+        _memsnap.install(self)
 
     def load_weights(self, weights):
         loaded = _load_target(self, super().load_weights, weights)
+        _hc.quantize_fp8(self)                         # fp8 hc weights need the loaded checkpoint
         _make_shadow(self, self.language_model.lm_head, "R9K_TARGET_LMHEAD", "target")
         return loaded
 
@@ -171,6 +209,23 @@ class R9kQwen4ExpForConditionalGeneration(Qwen4ExpForConditionalGeneration):
 
 
 class R9kQwen4ExpForCausalLM(Qwen4ExpForCausalLM):
+    # one GDN state page per request under speculative decoding (models/gdn.py): vLLM sizes the padded mamba page
+    # from these before any layer exists
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config):
+        from .gdn import onepage_state_shape_from_config
+        return onepage_state_shape_from_config(Qwen4ExpForCausalLM, vllm_config)
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config):
+        from .gdn import onepage_state_dtype_from_config
+        return onepage_state_dtype_from_config(Qwen4ExpForCausalLM, vllm_config)
+
+    @classmethod
+    def get_mamba_specs_from_config(cls, vllm_config):      # the hook vLLM prefers when a model defines it
+        from .gdn import onepage_specs_from_config
+        return onepage_specs_from_config(Qwen4ExpForCausalLM, vllm_config)
+
 
     def __init__(self, *, vllm_config, prefix: str = "") -> None:
         with construction_scope():
@@ -181,9 +236,14 @@ class R9kQwen4ExpForCausalLM(Qwen4ExpForCausalLM):
         _router.install(self)
         _hc.install_mix(self)
         _shared.install(self)
+        _route.install(self)
+        _fold.install(self)
+        _pipe.install(self)
+        _memsnap.install(self)
 
     def load_weights(self, weights):
         loaded = _load_target(self, super().load_weights, weights)
+        _hc.quantize_fp8(self)                         # fp8 hc weights need the loaded checkpoint
         _make_shadow(self, self.lm_head, "R9K_TARGET_LMHEAD", "target")
         return loaded
 
@@ -202,9 +262,14 @@ class R9kQwen4ExpMTP(Qwen4ExpMTP):
         _router.install(self)
         _hc.install_mix(self)
         _shared.install(self)
+        _route.install(self)
+        _fold.install(self)
+        _pipe.install(self)
+        _memsnap.install(self)
 
     def load_weights(self, weights):
         loaded = super().load_weights(mtp_weights(weights, os.environ.get("R9K_MTP_MLP", "mxfp4") == "mxfp4"))
+        _hc.quantize_fp8(self)                         # fp8 hc weights need the loaded checkpoint
         _make_shadow(self, self.lm_head, "R9K_DRAFT_LMHEAD", "MTP draft")
         return loaded
 

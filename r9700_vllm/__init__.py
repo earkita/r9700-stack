@@ -15,7 +15,7 @@ Only engages on ROCm. R9K_DISABLE=quant,models,mtp turns individual pieces off (
 """
 import os
 
-__version__ = "0.2.3"
+__version__ = "0.3.2"
 
 
 def _disabled(name: str) -> bool:
@@ -62,9 +62,10 @@ def register() -> None:
         from vllm import ModelRegistry
         from .models.qwen4_exp import ARCHS
         from .models.dflash import ARCHS as DF_ARCHS
-        for arch, qualname in (ARCHS | DF_ARCHS).items():
+        from .models.qwen3_5 import ARCHS as Q35_ARCHS
+        for arch, qualname in (ARCHS | DF_ARCHS | Q35_ARCHS).items():
             ModelRegistry.register_model(arch, qualname)
-        done.append("models:" + ",".join(ARCHS | DF_ARCHS))
+        done.append("models:" + ",".join(ARCHS | DF_ARCHS | Q35_ARCHS))
     if not _disabled("gdn"):
         from .models import gdn  # noqa: F401  (registers the QwenGatedDeltaNetAttention OOT override)
         done.append("layer:QwenGatedDeltaNetAttention(in_proj merge)")

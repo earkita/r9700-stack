@@ -94,15 +94,17 @@ def main():
                     check(f"mode{mode} {dtype} n={n} nb={nb}",
                           ar.all_reduce(inp(rank, it, n, dtype, dev), nb=nb, mode=mode),
                           ref(world, it, n, dtype, dev))
-    # back-to-back calls with no host sync in between (the double buffer is what keeps them apart)
-    for mode, n in ((1, min(hidden * 16, ar.max1 // 2)),
-                    (2, min(hidden * 64, ar.max_bytes // 2))):
+    # back-to-back calls with no host sync in between (the double buffer is what keeps them apart). Sizes from
+    # the caps: the one-shot cap is 16 KiB by default (R9K_ARN_1S_KB) -- a fixed 2560 x 16 bf16 message was -7.
+    n1 = min(hidden * 16, ar.max1 // 2 // 2 // 8 * 8)          # bf16 elements, under the one-shot slot, x8 aligned
+    n2 = min(hidden * 64, ar.max_bytes // 2 // 2 // 8 * 8)
+    for mode, n in ((1, n1), (2, n2)):
         xs = [inp(rank, 5000 + i, n, torch.bfloat16, dev) for i in range(40)]
         outs = [ar.all_reduce(x, mode=mode) for x in xs]
         for i, o in enumerate(outs):
             check(f"burst mode{mode} {i}", o, ref(world, 5000 + i, n, torch.bfloat16, dev))
-    # graph replay: one-shot -> two-shot -> one-shot chained
-    x = torch.zeros(min(hidden * 16, ar.max1 // 2), dtype=torch.bfloat16, device=dev)
+    # graph replay: one-shot -> two-shot -> one-shot chained (a one-shot-sized message)
+    x = torch.zeros(n1, dtype=torch.bfloat16, device=dev)
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
@@ -145,7 +147,9 @@ def main():
             for mode, cap in ((1, ar.max1), (2, ar.max_bytes)):
                 per = {}
                 if nbytes <= cap:
-                    for nb in ((1, 2, 4, 8, 16) if mode == 1 else (4, 8, 16, 32, 64, 128, 256)):
+                    nbs = [int(v) for v in os.environ["NBS"].split(",")] if os.environ.get("NBS") else \
+                        ((1, 2, 4, 8, 16) if mode == 1 else (4, 8, 16, 32, 64, 128, 256))
+                    for nb in nbs:
                         if nb <= ar.L.r9k_ar_max_blocks():
                             per[nb] = graph_time(lambda: ar.all_reduce(x, nb=nb, mode=mode), reps=20 if tok >= 1024 else 50)
                 res[mode] = per
