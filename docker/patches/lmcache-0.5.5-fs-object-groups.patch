@@ -1,0 +1,71 @@
+--- a/csrc/storage_backends/fs/connector.cpp
++++ b/csrc/storage_backends/fs/connector.cpp
+@@ -27,23 +27,9 @@
+ }
+ 
+ std::string FSConnector::key_to_filename(const std::string& key) {
+-  // Input key format (from _object_key_to_string):
+-  //   Unsalted: <model_name>@<kv_rank_hex>@<chunk_hash_hex>
+-  //   Salted  : <model_name>@<kv_rank_hex>@<chunk_hash_hex>@<cache_salt>
+-  //
+-  // Output filename (matching fs_l2_adapter.py._object_key_to_filename):
+-  //   Unsalted: <model_name_safe>@0x<kv_rank_hex>@<chunk_hash_hex>.data
+-  //   Salted  :
+-  //   <model_name_safe>@0x<kv_rank_hex>@<chunk_hash_hex>@<cache_salt>.data
+-  //
+-  // The unsalted 3-field shape is bit-identical to the pre-cache_salt
+-  // format, so existing cache directories remain valid.
+-  //
+-  // NOTE: both model_name and cache_salt are forbidden from containing
+-  // '@' (invariant enforced on the Python side), so splitting on '@'
+-  // is unambiguous — no marker, no rsplit.
+-
+-  // Split on '@' — must yield 3 (unsalted) or 4 (salted) fields.
++  // MP ObjectKey: model@rank@group@hash[@salt]. Legacy connectors may
++  // still use model@rank@hash[@salt]. Preserve the tail verbatim so both
++  // contracts retain their filenames; modern salted keys have five fields.
+   std::vector<std::string> parts;
+   size_t start = 0;
+   for (size_t pos = 0; pos <= key.size(); ++pos) {
+@@ -52,34 +38,23 @@
+       start = pos + 1;
+     }
+   }
+-  if (parts.size() != 3 && parts.size() != 4) {
++  if (parts.size() < 3 || parts.size() > 5) {
+     throw std::runtime_error(
+-        "FSConnector: malformed key (expected 3 or 4 '@'-separated fields): " +
++        "FSConnector: malformed key (expected 3, 4 or 5 '@'-separated fields): " +
+         key);
+   }
+ 
+   const std::string& model_name = parts[0];
+   const std::string& kv_rank_hex = parts[1];
+-  const std::string& chunk_hash = parts[2];
+-  const std::string cache_salt = parts.size() == 4 ? parts[3] : std::string();
+-
+-  // Replace '/' with '-SEP-' for filesystem safety
+-  std::string safe_model = replace_all(model_name, "/", PATH_SLASH_REPLACEMENT);
+-
+-  // Emit filename. Salt is appended at the tail so the unsalted shape
+-  // matches what older builds wrote to disk.
+-  std::string result;
+-  result.reserve(safe_model.size() + kv_rank_hex.size() + chunk_hash.size() +
+-                 cache_salt.size() + 32);
+-  result += safe_model;
++  std::string result = replace_all(model_name, "/", PATH_SLASH_REPLACEMENT);
+   result += KEY_SEP;
+   result += "0x";
+   result += kv_rank_hex;
+-  result += KEY_SEP;
+-  result += chunk_hash;
+-  if (!cache_salt.empty()) {
++  for (size_t i = 2; i < parts.size(); ++i) {
++    // Retain the legacy handling of an explicitly empty optional salt.
++    if (i == parts.size() - 1 && i >= 3 && parts[i].empty()) continue;
+     result += KEY_SEP;
+-    result += cache_salt;
++    result += parts[i];
+   }
+   result += FILE_EXT;
+   return result;

@@ -2,7 +2,7 @@
 # GLM-5.3-Flash C4 + DFlash K4 + LMCache RAM/NVMe, 8x R9700.
 # Nadpisania KEY=value jak w flashnext.sh. Podglad: DRYRUN=1.
 # Jeden start: usluga LMCache, potem GLM przez wspolny serve.sh.
-# Eksperymentalny offload: testy C1/C4 ~4K przeszly; dlugi kontekst wymaga walidacji.
+# Wyniki C1/C2/C4 32K/128K low i parametry 128/512 GiB: glm-5.3-flash-c4-lmcache.md.
 # Nie zastepuje istniejacych kontenerow. DRYRUN=1 pokazuje obie komendy.
 
 # Rozmiary grafow musza odpowiadac liczbie sekwencji; uwzglednij tez argumenty CLI.
@@ -11,6 +11,7 @@ MAXLEN=${MAXLEN:-auto}
 KV_OFFLOAD=${KV_OFFLOAD:-lmcache} # 0 = APC w VRAM; lmcache = eksperymentalny RAM + NVMe.
 KV_CACHE_NAME=${KV_CACHE_NAME:-glm53-kv-cache-c4} # Nazwa osobnego kontenera cache.
 KV_CACHE_PORT=${KV_CACHE_PORT:-5555} # Port osobno uruchamianego serve/glm-kv-cache.sh.
+KV_CACHE_START_TIMEOUT=${KV_CACHE_START_TIMEOUT:-600} # Pelna alokacja duzej puli RAM moze trwac dluzej niz minute.
 for arg in "$@"; do
   case "$arg" in
     NSEQ=*) NSEQ=${arg#*=} ;;
@@ -19,6 +20,7 @@ for arg in "$@"; do
     IMG=*|NAME=*|DRYRUN=*|DOCKER_SUDO=*|GPUS=*|KV_CACHE_*=*) export "$arg" ;;
   esac
 done
+[[ "$KV_CACHE_START_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || { echo 'KV_CACHE_START_TIMEOUT must be positive seconds.' >&2; exit 2; }
 case "$NSEQ" in
   1) graphs=5 ;;
   2) graphs=5,10 ;;
@@ -26,7 +28,7 @@ case "$NSEQ" in
   *) echo 'NSEQ must be 1, 2 or 4.' >&2; exit 2 ;;
 esac
 [ "$MAXLEN" = auto ] && MAXLEN=-1
-serve_dir=$(dirname "$(dirname "$(realpath "$0")")")
+serve_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 kv_args=()
 case "$KV_OFFLOAD" in
   0) ;;
@@ -132,7 +134,7 @@ if [ "$KV_OFFLOAD" = lmcache ]; then
     }
     trap cleanup_failed_start EXIT
     ready=0
-    for ((attempt=0; attempt<60; attempt++)); do
+    for ((attempt=0; attempt<KV_CACHE_START_TIMEOUT; attempt++)); do
       state=$("${docker_cmd[@]}" inspect --format '{{.State.Running}}' "$cache_id") || break
       [ "$state" = true ] || break
       if "${docker_cmd[@]}" logs "$cache_id" 2>&1 | grep -Fq "LMCache ZMQ cache server is running on tcp://127.0.0.1:$KV_CACHE_PORT"; then

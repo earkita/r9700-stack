@@ -1,5 +1,5 @@
 # Historical source-patched reference only. New GLM builds use docker/Dockerfile
-# with the FP8 plugin; see notes/glm-overview.md.
+# with the FP8 plugin; see serve/baseline-earkita/glm/README.md.
 # Keep the original image intact. Check the local BASE tag against the recorded
 # image ID, or use a registry digest of the same r9700 build elsewhere.
 ARG BASE=r9700/vllm:glm53-bf16-20bdbfe

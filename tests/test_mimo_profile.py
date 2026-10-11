@@ -17,7 +17,7 @@ class MiMoProfile(unittest.TestCase):
         env = dict(os.environ, DRYRUN="1")
         return shlex.split(
             subprocess.check_output(
-                ["bash", str(ROOT / "serve" / "baseline-earkita" / profile), *args],
+                ["bash", str(ROOT / "serve" / "baseline-earkita" / "mimo" / profile), *args],
                 env=env,
                 text=True,
             )

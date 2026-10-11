@@ -1,6 +1,6 @@
 # Benchmark requirements
 
-- Before measuring model performance, read `notes/glm-testing.md`; its
+- Before measuring model performance, read `serve/baseline-earkita/glm/testing.md`; its
   measurement-comparability rules apply to all models, with model-specific
   sampling and thinking settings recorded explicitly.
 - PCIe verification is mandatory before every GPU/runtime test or benchmark
@@ -12,7 +12,7 @@
   Recheck after a reboot, GPU reset, hardware/BIOS change or runtime device-map
   change, and before each comparison variant. Missing evidence or unexpected
   link/topology differences must be resolved before claiming comparable
-  performance. See the PCIe preflight in `notes/glm-testing.md`.
+  performance. See the PCIe preflight in `serve/baseline-earkita/glm/testing.md`.
 - Freeze and save the comparison protocol before running either variant.
   Change only the declared experimental variable. Match prompts, token budgets,
   sampling/thinking, cache preparation, warmups, repetitions, concurrency,

@@ -2,7 +2,7 @@
 """Bounded GLM answer-quality probes; separate from BetterBench throughput.
 
 Corpus: JSON list of {id, messages, expected, scoring: exact|json}.
-See notes/glm-testing.md. This runner never changes the serving runtime.
+See serve/baseline-earkita/glm/testing.md. This runner never changes the serving runtime.
 """
 import argparse
 from collections import Counter

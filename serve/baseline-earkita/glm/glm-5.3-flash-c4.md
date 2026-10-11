@@ -1,8 +1,25 @@
-# GLM C4 profile: C1/C2/C4 decode — 2026-10-02
+# GLM-5.3-Flash C4
+
+[Profile](glm-5.3-flash-c4.sh) · [Shared configuration](README.md) · [Testing](testing.md)
+
+Four active sequences, TP8 target/drafter, DFlash K4, FP8 E4M3 KV, APC in VRAM,
+NBT2048, 4.125 GiB KV per GPU and decode graphs 5/10/15/20. Text and images are
+supported. `MAXLEN=auto` is a per-request limit, with one shared KV pool;
+the previously checked fixed limit is 131072 tokens. LMCache is off by default.
+
+```bash
+bash serve/baseline-earkita/glm/glm-5.3-flash-c4.sh DRYRUN=1
+bash serve/baseline-earkita/glm/glm-5.3-flash-c4.sh
+```
+
+This independently invokes `serve/serve.sh`. The latest RAM/disk measurements
+belong to [C4+LMCache](glm-5.3-flash-c4-lmcache.md), not this profile.
+
+## Historical C1/C2/C4 decode — 2026-10-02
 
 Historical **text-only, NBT1024** measurements. The maintained C2/C4 profiles
 now enable vision with NBT2048; their current settings and separate validation
-are in the [profile overview](glm-overview.md). These results are not a matched
+are in the [profile overview](README.md). These results are not a matched
 performance comparison with the current vision configuration.
 
 ## Configuration at measurement time

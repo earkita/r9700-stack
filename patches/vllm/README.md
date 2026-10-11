@@ -2,7 +2,7 @@
 
 These patches retain the historical source-patched reference and upstream
 submission material. The current GLM profile uses a process-local plugin on
-unmodified vLLM; see [current GLM profiles](../../notes/glm-overview.md).
+unmodified vLLM; see [current GLM profiles](../../serve/baseline-earkita/glm/README.md).
 
 Base: vLLM `e9757321527ca1ecd514c07c1418dd2c53da3d19`.
 
@@ -40,5 +40,5 @@ docker run --rm --entrypoint python \
 
 Compare against a dequantized reference with the same FP8 bytes. This isolates
 reader correctness from FP8 quantization error. Separately run the unchanged
-BF16 attention gates and the [model-level testing protocol](../../notes/glm-testing.md)
+BF16 attention gates and the [model-level testing protocol](../../serve/baseline-earkita/glm/testing.md)
 before selecting a runtime default.

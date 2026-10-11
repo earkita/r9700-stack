@@ -1,12 +1,12 @@
 #!/bin/bash
 # GLM-5.3-Flash Quark W4A4 baseline candidate: stock vLLM, TP8, no speculative decoding.
-# Profile settings and requirements: notes/glm-overview.md. No performance claim.
+# Profile settings: glm-5.3-flash.md beside this script. No performance claim.
 # MODEL may be a Hub ID or a container path under /models; MODELS_DIR is the host mount.
 # Like the other profiles, arguments are env assignments, e.g. NSEQ=16 PORT=8081.
 # Experimental C1 W4A4: pass R9K_GLM_MOE=w4a4 BUILD_KERNELS=1 (stock by default).
 # Opt-in C1 graph: also pass EAGER=0 CGMODE=FULL_DECODE_ONLY CGSIZES=1 KVMEM=1.25.
-# See notes/glm-testing.md for validation requirements.
-serve_dir=$(dirname "$(dirname "$(realpath "$0")")")
+# See serve/baseline-earkita/glm/testing.md for validation requirements.
+serve_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 exec env \
   IMG="${IMG:-r9700/vllm:dev}" \
   REPO="${REPO:-$(dirname "$serve_dir")}" \

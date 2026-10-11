@@ -1,10 +1,11 @@
 #!/bin/bash
 # GLM-5.3-Flash MXFP4 + DFlash K4, 8x R9700. Wspolny launcher: serve.sh.
+# Notatki i pomiary: glm-5.3-flash-c4.md obok tego skryptu.
 # Nadpisania KEY=value jak w flashnext.sh. Podglad: DRYRUN=1.
-# Sprawdzony wariant: MAXLEN=262144 NSEQ=2 KVMEM=4.125; wiekszy kontekst wymaga testu.
+# Sprawdzony wariant: MAXLEN=131072 NSEQ=4 KVMEM=4.125; wiekszy kontekst wymaga testu.
 
 # Rozmiary grafow musza odpowiadac liczbie sekwencji; uwzglednij tez argumenty CLI.
-NSEQ=${NSEQ:-2}
+NSEQ=${NSEQ:-4}
 MAXLEN=${MAXLEN:-auto}
 KV_OFFLOAD=${KV_OFFLOAD:-0} # 0 = APC w VRAM; lmcache = eksperymentalny RAM + NVMe.
 KV_CACHE_PORT=${KV_CACHE_PORT:-5555} # Port osobno uruchamianego serve/glm-kv-cache.sh.
@@ -23,7 +24,7 @@ case "$NSEQ" in
   *) echo 'NSEQ must be 1, 2 or 4.' >&2; exit 2 ;;
 esac
 [ "$MAXLEN" = auto ] && MAXLEN=-1
-serve_dir=$(dirname "$(dirname "$(realpath "$0")")")
+serve_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 kv_args=()
 case "$KV_OFFLOAD" in
   0) ;;
@@ -40,7 +41,7 @@ exec env \
   MODELS_DIR="${MODELS_DIR:-/mnt/ai/models/glm}" `# Host -> /models w kontenerze.` \
   MODEL="${MODEL:-/models/GLM-5.3-Flash-Quark-MXFP4}" `# Model glowny, eksperci MXFP4.` \
   DRAFT="${DRAFT:-/models/GLM-5.3-Flash-DFlash2-HF-bf582e4}" `# Drafter, wagi BF16.` \
-  NAME="${NAME:-glm53-flash-c2}" \
+  NAME="${NAME:-glm53-flash-c4}" \
   SERVED_MODEL_NAME=glm-5.3-flash \
   HOST="${HOST:-0.0.0.0}" \
   PORT="${PORT:-8080}" `# Port API.` \
@@ -52,7 +53,7 @@ exec env \
   GPUS=0,1,2,3,4,5,6,7 \
   TP=8 `# Model rozlozony na 8 GPU; drafter tez TP8 (SPEC_EXTRA).` \
   MAXLEN="$MAXLEN" `# auto (-1): maks. JEDNEGO kontekstu; wejscie + wyjscie, takze thinking.` \
-  NSEQ="$NSEQ" `# Domyslnie 2 aktywne zadania; auto nie gwarantuje 2 pelnych kontekstow naraz.` \
+  NSEQ="$NSEQ" `# Domyslnie 4 aktywne zadania; auto nie gwarantuje 4 pelnych kontekstow naraz.` \
   NBT="${NBT:-2048}" `# Prefill i minimum cache encodera; 2048 pokrywa pelny limit obrazu.` \
   UTIL=0.90 `# Jawny KVMEM ma pierwszenstwo dla rozmiaru KV.` \
   KVMEM="${KVMEM:-4.125}" `# GiB KV na GPU, wspolne dla wszystkich zadan.` \

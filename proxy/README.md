@@ -10,7 +10,7 @@ OpenAI / Anthropic client -> 127.0.0.1:4000 -> vLLM :8080
 
 ## Start
 
-Start a GLM profile first, for example `serve/baseline-earkita/glm-5.3-flash-c4.sh`. Create a
+Start a GLM profile first, for example `serve/baseline-earkita/glm/glm-5.3-flash-c4.sh`. Create a
 local credential file once, from the repository root:
 
 ```bash
@@ -70,7 +70,7 @@ workers. Default sampling is temperature 1 / top-p 0.95, with high reasoning
 effort. Requests can supply sampling overrides. The OpenAI alias sends GLM's
 `chat_template_kwargs.reasoning_effort`; the Anthropic alias uses native vLLM
 Messages handling. GLM's `high`/`low`/`max` semantics are described in
-[the testing guide](../notes/glm-testing.md). Do not use Qwen's
+[the testing guide](../serve/baseline-earkita/glm/testing.md). Do not use Qwen's
 `enable_thinking=false` to disable GLM thinking.
 
 The `fast` alias selects GLM's **Low** template effort on the same backend;
@@ -166,8 +166,8 @@ claude --settings "$PWD/serve/templates/mimo-v2.6-flash.settings.local.json"
 ```
 
 The same local proxy key and port 4000 work for both. GPU launchers are
-`serve/baseline-earkita/glm-5.3-flash-c2.sh` / `-c4.sh` and
-`serve/baseline-earkita/mimo-v2.6-flash-c2.sh` / `-c4.sh`. Recreate older containers through these
+`serve/baseline-earkita/glm/glm-5.3-flash-c2.sh` / `-c4.sh` and
+`serve/baseline-earkita/mimo/mimo-v2.6-flash-c2.sh` / `-c4.sh`. Recreate older containers through these
 profiles when their saved mounts point to retired cache/config paths.
 
 For a manual task comparison, start fresh conversations from the same clean
@@ -249,4 +249,4 @@ transport captures, source hashes and final service metrics. The GPU server
 was not restarted during that integration test. These are historical results;
 check `/v1/models` for the currently served backend.
 
-MiMo uses its own aliases and template; see [the MiMo profile](../notes/mimo.md).
+MiMo uses its own aliases and template; see [the MiMo profile](../serve/baseline-earkita/mimo/README.md).

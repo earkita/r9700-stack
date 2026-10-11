@@ -67,7 +67,7 @@ class Launcher(unittest.TestCase):
     def launch(self, profile, *assignments, **env):
         clean = {k: v for k, v in os.environ.items() if not k.startswith(("R9K_", "VLLM_"))}
         clean.update(DRYRUN="1", REPO=str(ROOT), **env)
-        out = subprocess.check_output(["bash", str(ROOT / "serve" / ("baseline-earkita" if profile.startswith("glm-") else "") / profile), *assignments], env=clean, text=True)
+        out = subprocess.check_output(["bash", str(ROOT / ("serve/baseline-earkita/glm" if profile.startswith("glm-") else "serve") / profile), *assignments], env=clean, text=True)
         return shlex.split(out)
 
     def test_lmcache_matches_model_ipc_environment(self):

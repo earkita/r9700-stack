@@ -22,7 +22,7 @@ class CacheGates(unittest.TestCase):
         self.before = dict.fromkeys(b.COUNTERS,0.) | dict(l1_bytes=0.,running=0.,waiting=0.)
 
     def after(self, **kwargs):
-        return self.before | dict(success=4,queries=4*8192) | kwargs
+        return self.before | dict(success=4,queries=4*8192,gpu_stores_done=4,stores_done=4,stored_objects=28) | kwargs
 
     def test_all_three_proven_sources(self):
         expected = 7*1152*4
@@ -57,6 +57,30 @@ class CacheGates(unittest.TestCase):
         self.assertEqual(b.metric('count{x="a"} 3\ncount{x="b"} 5\ncount_created 900\n','count'),8)
         with self.assertRaises(RuntimeError):
             b.metric('other 0\n','count')
+        self.assertEqual(b.metric('other 0\n','count',unobserved_zero=True),0)
+
+    def test_cold_requires_store_completion_evidence(self):
+        with self.assertRaisesRegex(RuntimeError,'population not proven'):
+            b.cache_proof('cold',self.before,self.after(gpu_stores_done=0),8192,4,1152)
+        with self.assertRaisesRegex(RuntimeError,'population not proven'):
+            b.cache_proof('cold',self.before,self.after(stored_objects=0),8192,4,1152)
+
+    def test_pinned_lazy_counters_but_not_missing_gauges(self):
+        vr = '\n'.join(f'# TYPE {name} counter\n{name} 0' for name in b.COUNTERS.values() if name.startswith(b.V))
+        vr += '\nvllm:num_requests_running 0\nvllm:num_requests_waiting 0\n'
+        lr = 'lmcache_mp_l1_memory_usage_bytes 0\n'
+        p = dict(base='test-model',cache_metrics='test-cache',versions={'lmcache':'0.5.5'})
+        with patch.object(b,'SEEN_COUNTERS',set()),patch.object(b,'http',side_effect=[vr,lr]):
+            self.assertEqual(b.snapshot(p)['l1_hit'],0)
+        with patch.object(b,'SEEN_COUNTERS',set()),patch.object(b,'http',side_effect=[vr,'']):
+            with self.assertRaisesRegex(RuntimeError,'l1_memory_usage_bytes'):
+                b.snapshot(p)
+        with patch.object(b,'SEEN_COUNTERS',{('test-cache',b.L+'lookup_hit_l1_tokens_total')}),patch.object(b,'http',side_effect=[vr,lr]):
+            with self.assertRaisesRegex(RuntimeError,'lookup_hit_l1'):
+                b.snapshot(p)
+        p['versions']['lmcache']='unknown'
+        with patch.object(b,'http',side_effect=[vr,lr]),self.assertRaises(RuntimeError):
+            b.snapshot(p)
 
     def test_reset_404_is_not_success(self):
         p = dict(base='http://localhost:8080',settle_timeout_seconds=0)
@@ -85,6 +109,15 @@ class CacheGates(unittest.TestCase):
 
 
 class HardwareAndReport(unittest.TestCase):
+    def test_docker_mount_order_does_not_change_identity(self):
+        mounts=[{'Source':'/a','Destination':'/models'},{'Source':'/b','Destination':'/kv-cache'}]
+        c=dict(Config={'Env':[],'Cmd':[]},Id='id',Image='image',State={'Running':True},Mounts=mounts)
+        with patch.object(b.hardware,'command',return_value=json.dumps([c])):
+            first=b.container_identity('fixture')
+        c['Mounts']=list(reversed(mounts))
+        with patch.object(b.hardware,'command',return_value=json.dumps([c])):
+            self.assertEqual(first,b.container_identity('fixture'))
+
     def links(self,speed='32.0 GT/s PCIe',width='16'):
         return dict(paths={'0000:01:00.0':['0000:01:00.0']},devices={'0000:01:00.0':dict(
             max_link_speed='32.0 GT/s PCIe',max_link_width='16',numa_node='0',
@@ -119,6 +152,16 @@ class HardwareAndReport(unittest.TestCase):
             ttft_ms=1000.,ttfa_ms=None,update_gaps_ms=[100.]*10,decode_tps=10.)) for i in range(2)]
         self.assertEqual(b.summarize(rows,8192)['all_clients_decode_overlap_s'],0)
 
+    def test_cold_cache_diagnostic_does_not_claim_concurrent_decode(self):
+        summary = dict(all_clients_decode_overlap_s=0)
+        with self.assertRaisesRegex(RuntimeError,'No simultaneous decode'):
+            b.qualify_decode_overlap(summary,2,'cold')
+        self.assertFalse(b.qualify_decode_overlap(summary,2,'cold',True))
+        for state in ('ram','disk'):
+            with self.subTest(state=state), self.assertRaises(RuntimeError):
+                b.qualify_decode_overlap(summary,2,state,True)
+        self.assertTrue(b.qualify_decode_overlap(dict(all_clients_decode_overlap_s=1),4,'ram'))
+
     def test_format_only_failure_retains_retrieval_and_completion(self):
         case = dict(expected='R9700-NIAH-005-ABCDEF',scoring='exact')
         response = dict(content='The answer is R9700-NIAH-005-ABCDEF.',finish_reason='stop')
@@ -142,6 +185,17 @@ class HardwareAndReport(unittest.TestCase):
         self.assertEqual(group['batches'],1)
         self.assertIsNone(group['per_request']['ttfa_ms'])
         self.assertEqual(report['status'],'failed')
+
+    def test_report_keeps_unqualified_cold_decode_visible(self):
+        summary = dict(per_request=[dict(decode_tps=20,ttft_ms=300,ttfa_ms=None,effective_prompt_tps=99)],
+                       aggregate_e2e_output_tps=15,all_clients_decode_overlap_s=0)
+        batch = dict(length=131072,concurrency=2,effort='low',cache='cold',summary=summary,
+                     valid=True,phase='measured',decode_concurrency_qualified=False)
+        with tempfile.TemporaryDirectory() as t:
+            b.report(Path(t),[batch],'complete')
+            result=json.loads((Path(t)/'report.json').read_text())
+            self.assertFalse(result['groups']['131072/C2/low/cold']['decode_concurrency_qualified'])
+            self.assertIn('| False |',(Path(t)/'report.md').read_text())
 
 
 class UnattendedLifecycle(unittest.TestCase):
@@ -175,6 +229,11 @@ class UnattendedLifecycle(unittest.TestCase):
                 raise RuntimeError('injected transport failure')
             counters['success'] += 1
             counters['queries'] += 8192
+            counters['stores_sent'] += 1
+            counters['stores_done'] += 1
+            counters['stored_objects'] += 7
+            counters['gpu_stores_sent'] += 1
+            counters['gpu_stores_done'] += 1
             if index%3:
                 counters['external_hit'] += 8064
                 counters['l1_hit' if index%3==1 else 'l2_hit'] += 8064

@@ -1,13 +1,13 @@
 # Testing GLM-5.3-Flash
 
 These guidelines apply to the pinned GLM-5.3-Flash Quark MXFP4 checkpoint
-and runtime described in [the current profile overview](glm-overview.md). Keep API
+and runtime described in [the current profile overview](README.md). Keep API
 contract, throughput, numerical regression and completed-answer quality
 results separate. Passing one does not qualify the others.
 
 ## Earkita automated baseline
 
-The versioned [earkita standard](../bench/baseline-earkita/README.md) defines
+The versioned [earkita standard](../../../bench/baseline-earkita/README.md) defines
 C1/C2/C4 × 8K/32K/128K × low/high/max × cold/RAM/disk, with pinned sampling,
 BetterBench, cache-source proofs and separate completed-answer NIAH checks.
 `bash bench/baseline-earkita/glm.sh` prepares and executes it unattended against
@@ -270,7 +270,7 @@ cannot establish a performance improvement, regression or absence of regression.
 Preserve all warmups and failed attempts, marking exclusions by the rule fixed
 before execution; never select the fastest or only passing repetitions.
 
-To reproduce the published [C4 profile measurements](glm-c4-profile.md), use
+To reproduce the published [C4 profile measurements](glm-5.3-flash-c4.md), use
 the same NSEQ=4 server and per-concurrency natural-EOS quality/cache preparation,
 then one excluded performance warmup and three measured batches, with exactly
 8192 input and 256 output tokens and the documented sampling. Preserve these
