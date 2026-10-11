@@ -100,6 +100,7 @@ env \
   R9K_GLM_APC_BOUNDARY=fixed `# Poprawka granicy zapisu stanow APC.` \
   R9K_GLM_W4A4_MAX_ROWS=32 `# Limit wierszy dla szybkiej sciezki W4A4.` \
   R9K_GLM_W4A4_BATCH=packed `# Kernel dla wielu wierszy bez rozpakowania calych wag.` \
+  R9K_AG="${R9K_AG:-0}" `# RCCL all-gather baseline; 1 = kandydat upstream wymagajacy testu TP8.` \
   R9K_ARN_MAX_KB=16 R9K_AR4=0 R9K_AR_QUANT=0 \
   R9K_EXPERT_CACHE_SLOTS=0 `# Bez cache ekspertow offloadowanych z CPU.` \
   R9K_TARGET_LMHEAD=stock R9K_DRAFT_LMHEAD=stock \

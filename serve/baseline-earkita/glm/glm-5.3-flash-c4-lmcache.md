@@ -395,3 +395,53 @@ References: [LMCache hybrid groups](https://docs.lmcache.ai/mp/hybrid_models.htm
 [native filesystem adapter](https://docs.lmcache.ai/mp/l2_storage/fs_native.html),
 [GLM recipe](https://docs.lmcache.ai/recipes/glm5_3.html). The GLM recipe explicitly
 does not validate the Flash variant or our DFlash combination.
+
+## Upstream v0.3.2 review (2026-10-11)
+
+Merged r9700-stack upstream through `02bab38`; this does not upgrade the
+GLM image's vLLM `e97573215` or LMCache 0.5.5. GPU performance and cache
+roundtrip results above predate this merge and do not qualify the new tree.
+
+- **Communication:** upstream enables its small-message N-rank all-gather by
+  default. C2/C4 profiles explicitly keep `R9K_AG=0` (RCCL all-gather),
+  preserving the prior baseline. `R9K_AG=1` is the first bounded experiment:
+  rebuild the library in an isolated image, pass numerical TP8 eager/graph
+  communication checks, then compare C1/C2/C4 under the frozen protocol.
+  All-reduce settings are unchanged; all-gather is a separate collective.
+- **Dense FP8 decode:** the new `gemm_fp8_block_qa` fuses activation quantization
+  with block-scaled GEMM. It is a candidate for GLM's 3072x4096 and 4096x1536
+  projections, not an automatic Quark optimization: generic quant overrides
+  are disabled in these profiles. A scoped Quark adapter must preserve scales
+  and rounding and pass reference tests first. Its M<=16 bound covers C1/C2
+  K4 verification (5/10 rows), not full C4 K4 (20 rows); retain a correct
+  fallback or validate an extended kernel. Do not enable global quant hooks.
+- **VRAM accounting:** upstream reduced Qwen compile transients and graph
+  reservations. Our GLM already has an explicit 4.125 GiB KV budget and small
+  decode graphs (5/10/15/20). Qwen's 0.98 utilization and reported KV gains
+  cannot be transferred. `compat/memsnap.py` hooks Qwen decoder classes only;
+  adapt diagnostics to GLM and measure all ranks before enlarging its pool.
+- **Not applicable directly:** Qwen GDN single-page state, hyper-connection FP8
+  copies and their BF16 release, and DFlash2 FP8 exclusion aliases. Our drafter
+  weights are BF16 (FP8 KV does not mean FP8 weights). No reason to apply the
+  exclusion workaround to this checkpoint or replace GLM's cache geometry.
+- **Prefill:** upstream reports its exact block-scaled tiled FP8 path slower
+  than stock Triton in its workloads; it is not a justified GLM default.
+  The shared launcher now accepts `PROFACT=CUDA` for GPU-only profiling;
+  verify profiler configuration against the pinned image before use.
+- **LMCache:** upstream added no GLM LMCache fix. Keep the existing geometry,
+  synchronized completion, filesystem group keys and eviction-lock patches.
+
+Next performance step is a single-variable all-gather comparison, followed
+by the scoped dense-FP8 kernel experiment. Follow `testing.md`, including
+PCIe verification and cold/RAM/disk cache preparation. No new throughput or
+memory-capacity claim follows from this source review.
+
+Merge validation: host profile/benchmark/proxy selection 70 passed, 6 skipped
+(13 subtests); final profile/launcher checks 30 passed (3 subtests).
+Pinned-image CPU GLM DFlash/APC/indexer/LMCache checks: 68 passed. The initial
+selection also included two GPU Mamba cases, which failed because the isolated
+container intentionally had no GPUs; the CPU-only rerun deselected those two.
+The merged HIP library builds with the pinned image for gfx1201, passes the
+build's export/hostcall checks and loads with both GLM W4A4 and new candidate
+symbols. These checks do not replace GPU numerical or serving benchmarks.
+The production library was not replaced and services were not restarted.
