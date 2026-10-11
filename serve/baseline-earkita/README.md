@@ -1,7 +1,12 @@
 # Earkita serving baselines
 
-Model profiles in this directory use the common `../serve.sh` launcher.
+Model profiles in the subdirectories use the common `../serve.sh` launcher.
 Preview launch commands with `DRYRUN=1`.
+
+GLM profiles and matching per-script notes live in
+[`serve/baseline-earkita/glm`](glm/README.md).
+MiMo-V2.6-Flash profiles follow the same layout in
+[`serve/baseline-earkita/mimo`](mimo/README.md).
 
 The required measurement protocol and unattended runner live in
 [`bench/baseline-earkita`](../../bench/baseline-earkita/README.md).

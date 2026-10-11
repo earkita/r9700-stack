@@ -1,8 +1,8 @@
 # Earkita baseline standard
 
-Executable specification: [`glm.json`](glm.json). Serving profiles remain in
-[`serve/baseline-earkita`](../../serve/baseline-earkita/). This standard follows
-[`notes/glm-testing.md`](../../notes/glm-testing.md). It is a **new protocol**;
+Executable specification: [`glm.json`](glm.json). GLM profiles and their
+per-script notes live in [`serve/baseline-earkita/glm`](../../serve/baseline-earkita/glm/README.md). This standard follows
+[`serve/baseline-earkita/glm/testing.md`](../../serve/baseline-earkita/glm/testing.md). It is a **new protocol**;
 results from older, differently configured runs are not comparable.
 
 ## GLM matrix
@@ -26,6 +26,16 @@ additional maximum-context size. The longest tested input is 128 Ki tokens;
 output needs additional context capacity. This is a substantial run, not a
 smoke test; no duration or long-context qualification is claimed in advance.
 
+The standard requires simultaneous decode overlap for C2/C4 performance
+batches. A short 256-token output can finish before another long cold prompt
+completes prefill; this fails measurement qualification, not necessarily the
+backend. For explicitly frozen **cache-only diagnostics**, a custom protocol
+may set `allow_serial_cold_prefill_diagnostic=true`. Only cold batches may then
+continue without overlap, with `decode_concurrency_qualified=false` recorded
+in JSON and reports; they must not be presented as simultaneous C2/C4 decode.
+Warm RAM/disk batches still require overlap. This option is absent from the
+standard protocol and must never silently change a comparison.
+
 Each cycle uses fresh deterministic salts derived from its frozen run ID,
 and executes cold → RAM → disk with the **same prompts and salts**. Distinct
 clients use distinct salts/needles. Cold populates RAM and disk. Before every
@@ -34,6 +44,11 @@ the cache service's **L1 only** is cleared after pending disk stores complete.
 Disk files are retained. All expected full prompt chunks must hit the declared
 external tier; GPU hits, partial/mixed-tier hits or missing metrics invalidate
 the batch. Counter publication is awaited, rather than interpreted as zero.
+LMCache 0.5.5 OTel event counters are absent until their first observation;
+only these known, pinned counters may start at zero. Once published, a
+disappearing counter fails. Cold population must show completed GPU→RAM and
+RAM→disk stores, including successfully stored L2 objects (completed requests
+alone also include failures); warm states still require full, positive tier-hit evidence.
 
 Disk-warm means filesystem/L2 restore with buffered I/O. The OS page cache is
 **not** flushed, so this does not prove physical NVMe throughput. Repeated
@@ -56,8 +71,9 @@ benchmark-only overrides:
 
 ```bash
 VLLM_SERVER_DEV_MODE=1 HOST=127.0.0.1 \
-KV_CACHE_RAM_GB=16 KV_CACHE_NAMESPACE=earkita-bench-v1 \
-bash serve/baseline-earkita/glm-5.3-flash-c4-lmcache.sh \
+KV_CACHE_RAM_GB=128 KV_CACHE_DISK_GB=512 KV_CACHE_ALLOCATOR=pinned-gtt \
+KV_CACHE_NAMESPACE=earkita-bench-v1 \
+bash serve/baseline-earkita/glm/glm-5.3-flash-c4-lmcache.sh \
   NAME=earkita-glm-bench KV_CACHE_NAME=earkita-glm-cache-bench
 ```
 
@@ -66,15 +82,26 @@ the APC reset endpoint; it is required only for this dedicated **loopback**
 benchmark service. A production endpoint without it fails preflight; no restart
 or change is attempted. Never expose this benchmark API to LAN clients.
 
-The example retains the existing **16 GiB L1 budget across all eight GPUs**,
-allocated lazily. This is not a claim that C4 × 128K fits in RAM cache.
+The full-suite example uses the approved **128 GiB L1 budget across all eight
+GPUs** and **512 GiB L2 budget**, with native HIP/GTT-backed RAM allocation.
+This avoids the cache pool's pageable USERPTR mapping and its observed
+compaction-related stalls. GTT is host RAM, not GPU VRAM; its driver limit must
+also fit the allocation. Cache-size production defaults
+remain unchanged. This is not a claim that C4 × 128K has passed validation.
 The actual configured budget is frozen with the protocol, and the runner
 requires full-prefix L1 hits for every RAM-warm batch. Insufficient L1 capacity
 fails that gate; the runner does not raise the allocation automatically or
 silently count disk restores as RAM hits. Size changes require a fresh protocol
 and both comparison variants to be rerun. Fresh salts accumulate disk
-data throughout the matrix; plan ample free disk space. The runner stops below
-64 GiB free and never deletes existing cache files. A failed capacity gate is
+data throughout the matrix. With `KV_CACHE_DISK_GB` enabled, LMCache's L2 LRU
+evicts least-recently-used objects in the dedicated benchmark namespace, starting
+at 75% occupancy and removing 20% of tracked objects per pass. The 512 GiB value
+is an asynchronous accounting budget, not a filesystem quota. Locked and pending
+lookup/store objects are protected by the pinned image patch. All cache-hit gates
+remain mandatory: eviction must not turn a RAM/disk measurement into recomputation.
+Use a fresh empty namespace: this version does not inventory existing files after
+a cache-daemon restart. No production cache or result/transcript is deleted.
+The runner stops below 64 GiB free. A failed capacity gate is
 not a benchmark result. Changing budgets/protocol requires a fresh frozen run.
 
 ## Unattended execution

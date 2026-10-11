@@ -1,8 +1,8 @@
 # r9700-stack
 
 Additional model deployments on 8× R9700:
-[GLM-5.3-Flash](notes/glm-overview.md) and
-[MiMo-V2.6-Flash-MOPD](notes/mimo.md).
+[GLM-5.3-Flash](serve/baseline-earkita/glm/README.md) and
+[MiMo-V2.6-Flash-MOPD](serve/baseline-earkita/mimo/README.md).
 
 Optional local API gateway: [LiteLLM setup](proxy/README.md) for OpenAI and
 Anthropic-compatible clients, running separately from the GPU server.
@@ -12,14 +12,15 @@ The shared `serve/serve.sh` stores generated caches inside the mounted checkout:
 
 GLM C2/C4 also expose `KV_CACHE_DIR`, defaulting to `/mnt/ai/cache/` on the host,
 mounted at `/kv-cache` in the container. Override it like other profile settings:
-`bash serve/baseline-earkita/glm-5.3-flash-c4.sh KV_CACHE_DIR=/mnt/other/kv-cache`.
+`bash serve/baseline-earkita/glm/glm-5.3-flash-c4.sh KV_CACHE_DIR=/mnt/other/kv-cache`.
 An empty `KV_CACHE_DIR=` disables this mount. GLM C2/C4 can opt into the
 experimental LMCache service with `KV_OFFLOAD=lmcache`; it remains off by default
-and passed bounded C1/C4 functional checks, including filesystem restoration
-after clearing GPU/RAM caches. Long-context capacity and performance remain
-unqualified. Both endpoints require the scoped geometry/completion adapters.
-See [GLM offload status](notes/glm-overview.md#experimental-nvme-prefix-cache).
-The dedicated `serve/baseline-earkita/glm-5.3-flash-c4-lmcache.sh` profile selects
+and passed bounded C1/C2/C4 functional checks at 32K/128K, including filesystem
+restoration after clearing GPU/RAM caches. Full low/high/max repeated performance
+and maximum-context capacity remain unqualified. Both endpoints require the
+scoped geometry/completion adapters.
+See [GLM offload status](serve/baseline-earkita/glm/glm-5.3-flash-c4-lmcache.md).
+The dedicated `serve/baseline-earkita/glm/glm-5.3-flash-c4-lmcache.sh` profile selects
 the connector and candidate image by default and starts the cache service before
 launching GLM. Use `DRYRUN=1` to preview both containers.
 Compilation caches remain in `.runtime/cache/`.
@@ -238,9 +239,9 @@ An OpenAI-compatible endpoint comes up on `:8080`. After upgrading, rebuild the 
 (`kernels/build.sh`): the plugin refuses a `libr9k.so` from before v0.2.2. On a first launch of a new configuration,
 restart once (the launch that compiles gets a smaller KV pool).
 
-For GLM, start with the [current profiles, launch instructions and capacity limits](notes/glm-overview.md).
+For GLM, start with the [current profiles, launch instructions and capacity limits](serve/baseline-earkita/glm/README.md).
 
-**GLM profiles:** `serve/baseline-earkita/glm-5.3-flash-c2.sh` and `serve/baseline-earkita/glm-5.3-flash-c4.sh`
+**GLM profiles:** `serve/baseline-earkita/glm/glm-5.3-flash-c2.sh` and `serve/baseline-earkita/glm/glm-5.3-flash-c4.sh`
 call `serve/serve.sh` directly. They use TP8, DFlash K4, shared FP8 KV/APC,
 NBT2048 and 4.125 GiB KV per GPU, with two/four active requests. Vision allows
 100 images across each request's entire history, up to 2048 tokens per image.
@@ -249,12 +250,12 @@ share the cache. The current C4 vision start reports 700416 tokens; Claude
 Code's template declares 524288. These are limits, not full-context quality
 qualifications. Preview with `DRYRUN=1`.
 
-`serve/baseline-earkita/glm-5.3-flash.sh` remains the conservative text-only TP8 / 64K fallback,
+`serve/baseline-earkita/glm/glm-5.3-flash.sh` remains the conservative text-only TP8 / 64K fallback,
 without speculation. All profiles require their corresponding checkpoints,
 image and plugin library; they do not stop an existing server.
-See [current settings and validation](notes/glm-overview.md), the
-[historical text-only C1/C2/C4 measurements](notes/glm-c4-profile.md) and
-[testing guidelines](notes/glm-testing.md). Dense FP8 tuning is opt-in through
+See [current settings and validation](serve/baseline-earkita/glm/README.md), the
+[historical text-only C1/C2/C4 measurements](serve/baseline-earkita/glm/glm-5.3-flash-c4.md) and
+[testing guidelines](serve/baseline-earkita/glm/testing.md). Dense FP8 tuning is opt-in through
 `FP8_CONFIG_DIR="$PWD/tuning/configs/glm"`; it has not established a repeatable
 whole-model speedup.
 

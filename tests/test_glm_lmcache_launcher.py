@@ -8,23 +8,79 @@ import subprocess
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-PROFILE = ROOT / 'serve/baseline-earkita/glm-5.3-flash-c4-lmcache.sh'
+PROFILE = ROOT / 'serve/baseline-earkita/glm/glm-5.3-flash-c4-lmcache.sh'
 
 
 def test_dryrun_configures_both_services(tmp_path):
     out = subprocess.check_output([
         'bash', str(PROFILE), 'DRYRUN=1', 'IMG=test-image',
-        'KV_CACHE_PORT=5556', 'KV_CACHE_RAM_GB=2',
+        'KV_CACHE_PORT=5556', 'KV_CACHE_RAM_GB=128', 'KV_CACHE_DISK_GB=512',
         f'KV_CACHE_DIR={tmp_path}/cache',
     ], text=True)
     cache, model = [shlex.split(line) for line in out.splitlines()]
     assert 'test-image' in cache and 'test-image' in model
     assert cache[cache.index('--port')+1] == '5556'
-    assert cache[cache.index('--l1-size-gb')+1] == '2'
+    assert cache[cache.index('--l1-size-gb')+1] == '128'
+    assert '--no-l1-use-lazy' in cache
+    assert 'HSA_USERPTR_FOR_PAGED_MEM=0' in cache
+    disk = json.loads(cache[cache.index('--l2-adapter')+1])
+    assert disk['max_capacity_gb'] == 512
+    assert disk['eviction'] == dict(eviction_policy='LRU', trigger_watermark=.75, eviction_ratio=.2)
     config = json.loads(model[model.index('--kv-transfer-config')+1])
     assert config['kv_connector_extra_config']['lmcache.mp.port'] == 5556
     assert model[model.index('--max-num-seqs')+1] == '4'
     assert not (tmp_path/'cache').exists()
+
+
+def test_native_pinned_allocator_disables_pageable_shm():
+    out = subprocess.check_output([
+        'bash', str(PROFILE), 'DRYRUN=1', 'KV_CACHE_ALLOCATOR=pinned',
+    ], text=True)
+    cache = shlex.split(out.splitlines()[0])
+    assert '--no-l1-use-lazy' in cache
+    assert '--l1-use-lazy' not in cache
+    assert cache[cache.index('--shm-name')+1] == ''
+
+
+def test_gtt_policy_is_scoped_to_cache_container():
+    out = subprocess.check_output([
+        'bash', str(PROFILE), 'DRYRUN=1', 'KV_CACHE_ALLOCATOR=pinned-gtt',
+    ], text=True)
+    cache, model = [shlex.split(line) for line in out.splitlines()]
+    assert 'HSA_USERPTR_FOR_PAGED_MEM=0' in cache
+    assert '--no-l1-use-lazy' in cache
+    assert cache[cache.index('--shm-name')+1] == ''
+    assert 'HSA_USERPTR_FOR_PAGED_MEM=0' not in model
+
+
+@pytest.mark.parametrize('setting', ['KV_CACHE_ALLOCATOR=invalid', 'KV_CACHE_START_TIMEOUT=0'])
+def test_invalid_allocator_or_timeout_fails_before_launch(setting):
+    result = subprocess.run(['bash', str(PROFILE), 'DRYRUN=1', setting],
+                            capture_output=True, text=True)
+    assert result.returncode != 0
+    assert not result.stdout
+
+
+@pytest.mark.parametrize('setting', ['KV_CACHE_DISK_GB=-1', 'KV_CACHE_DISK_GB=nan',
+                                    'KV_CACHE_DISK_WATERMARK=1', 'KV_CACHE_DISK_EVICTION_RATIO=0'])
+def test_invalid_disk_budget_fails_before_docker(setting):
+    result = subprocess.run(['bash', str(ROOT/'serve/glm-kv-cache.sh'), 'DRYRUN=1', setting],
+                            capture_output=True, text=True)
+    assert result.returncode != 0
+    assert not result.stdout
+
+
+def test_lru_refuses_unaccounted_existing_files(tmp_path):
+    directory = tmp_path/'existing'
+    directory.mkdir()
+    data = directory/'keep.data'
+    data.write_bytes(b'untouched')
+    result = subprocess.run(['bash', str(ROOT/'serve/glm-kv-cache.sh'),
+                             f'KV_CACHE_DIR={tmp_path}', 'KV_CACHE_NAMESPACE=existing',
+                             'KV_CACHE_DISK_GB=512', 'DOCKER_SUDO='], capture_output=True, text=True)
+    assert result.returncode == 2
+    assert 'fresh empty namespace' in result.stderr
+    assert data.read_bytes() == b'untouched'
 
 
 @pytest.mark.parametrize('scenario', ['success', 'model_exists', 'cache_exists', 'cache_failed', 'model_failed'])

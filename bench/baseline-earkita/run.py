@@ -42,10 +42,10 @@ def http(url, body=None):
         return r.read().decode()
 
 
-def metric(raw, name):
+def metric(raw, name, *, unobserved_zero=False):
     values = [float(line.rsplit(' ', 1)[1]) for line in raw.splitlines()
               if re.match(re.escape(name) + r'(?:\{| )', line)]
-    if not values and f'# TYPE {name} ' not in raw:
+    if not values and f'# TYPE {name} ' not in raw and not unobserved_zero:
         raise RuntimeError('Required metric missing: ' + name)
     return sum(values)
 
@@ -66,9 +66,15 @@ COUNTERS = {
     'l2_load': L+'l2_prefetch_load_completed_chunks_total',
     'stores_sent': L+'l2_store_submitted_requests_total',
     'stores_done': L+'l2_store_completed_requests_total',
+    'stored_objects': L+'l2_store_completed_objects_chunks_total',
     'gpu_stores_sent': L+'num_submitted_stores_total',
     'gpu_stores_done': L+'num_finished_stores_total',
 }
+
+# LMCache 0.5.5 uses OTel event counters: even TYPE is absent until the first
+# add(), including add(0). Gauges/vLLM metrics never get this exception.
+LAZY_COUNTERS = {name for name in COUNTERS.values() if name.startswith(L)}
+SEEN_COUNTERS = set()
 
 
 def snapshot(p, out=None):
@@ -77,7 +83,15 @@ def snapshot(p, out=None):
     if out:
         out.with_suffix('.vllm.prom').write_text(vr)
         out.with_suffix('.lmcache.prom').write_text(lr)
-    result = {key: metric(vr if name.startswith(V) else lr, name) for key, name in COUNTERS.items()}
+    result = {}
+    for key,name in COUNTERS.items():
+        raw = vr if name.startswith(V) else lr
+        identity = (p['cache_metrics'],name)
+        unobserved = (p.get('versions',{}).get('lmcache')=='0.5.5'
+                      and name in LAZY_COUNTERS and identity not in SEEN_COUNTERS)
+        result[key] = metric(raw,name,unobserved_zero=unobserved)
+        if f'# TYPE {name} ' in raw:
+            SEEN_COUNTERS.add(identity)
     result.update(running=metric(vr, V+'num_requests_running'),
                   waiting=metric(vr, V+'num_requests_waiting'),
                   l1_bytes=metric(lr, L+'l1_memory_usage_bytes'))
@@ -122,7 +136,10 @@ def clear_l1(p):
 assert m.version("lmcache")=="0.5.5"
 from lmcache.v1.multiprocess.transport.factory import RequestClientFactory
 c=RequestClientFactory.create(%r)
-c.clear().result(timeout=30)
+try:
+ c.clear().result(timeout=30)
+finally:
+ c.close()
 ''' % ('tcp://127.0.0.1:'+str(p['cache_port']))
     subprocess.run(['docker', 'exec', p['cache_container'], 'python3', '-c', code],
                    check=True, timeout=45, stdout=subprocess.DEVNULL)
@@ -142,6 +159,9 @@ def cache_proof(state, before, after, length, count, chunk):
     if d['success'] != count:
         raise RuntimeError('Missing completion or foreign request detected')
     expected = (length // chunk) * chunk * count
+    if state == 'cold' and (d['gpu_stores_done'] <= 0 or d['stores_done'] <= 0 or d['stored_objects'] <= 0):
+        # Completed L2 requests include failed tasks; successful objects do not.
+        raise RuntimeError('Cold cache population not proven by GPU/L2 successful-store counters')
     if state == 'cold':
         ok = d['external_hit'] == d['l1_hit'] == d['l2_hit'] == d['l2_load'] == 0
     elif state == 'ram':
@@ -163,7 +183,8 @@ def container_identity(name):
         raise RuntimeError('Credential-bearing launch args: use the documented isolated local benchmark deployment')
     return dict(id=c['Id'], image=c['Image'], args=args,
                 env={k:v for k,v in env.items() if k in allowed or k.startswith('R9K_')},
-                mounts=[dict(source=m['Source'], destination=m['Destination']) for m in c['Mounts']],
+                mounts=sorted((dict(source=m['Source'], destination=m['Destination']) for m in c['Mounts']),
+                              key=lambda m:(m['destination'],m['source'])),
                 running=c['State']['Running'])
 
 
@@ -179,7 +200,7 @@ def sources():
     paths += list((ROOT/'r9700_vllm').rglob('*.py'))
     paths += list((ROOT/'r9700_vllm/kernels').glob('*.so'))
     paths += [ROOT/'serve/serve.sh', ROOT/'serve/glm-kv-cache.sh',
-              ROOT/'serve/baseline-earkita/glm-5.3-flash-c4-lmcache.sh']
+              ROOT/'serve/baseline-earkita/glm/glm-5.3-flash-c4-lmcache.sh']
     return {str(p.relative_to(ROOT)):digest(p) for p in paths}
 
 
@@ -235,6 +256,8 @@ def prepare(a):
     if int(flag(ci['args'], '--chunk-size')) != p['chunk_tokens']:
         raise RuntimeError('Cache chunk geometry differs from protocol')
     adapter = json.loads(flag(ci['args'], '--l2-adapter'))
+    p['configured_l2_gib'] = adapter.get('max_capacity_gb', 0)
+    p['l2_eviction'] = adapter.get('eviction')
     mount = next(m for m in ci['mounts'] if m['destination']=='/kv-cache')
     if adapter['type'] != 'fs_native' or adapter.get('use_odirect') is not False:
         raise RuntimeError('Expected buffered filesystem L2')
@@ -354,6 +377,19 @@ def summarize(rows, length):
                     effective_prompt_tps=length/(r['result']['ttft_ms']/1000)) for r in rows])
 
 
+def qualify_decode_overlap(summary, count, state, allow_serial_cold_prefill=False):
+    """Cold-prefill diagnostics may finish short outputs before peers prefill.
+
+    Preserve the strict baseline by default. An explicit frozen diagnostic
+    exception validates cache/TTFT only, never concurrent decode; warm tiers
+    must still demonstrate overlapping decode for every client.
+    """
+    qualified = count == 1 or summary['all_clients_decode_overlap_s'] > 0
+    if not qualified and not (state == 'cold' and allow_serial_cold_prefill):
+        raise RuntimeError('No simultaneous decode observed for all clients')
+    return qualified
+
+
 def report(out, batches, status):
     groups = defaultdict(list)
     quality = defaultdict(Counter)
@@ -372,6 +408,7 @@ def report(out, batches, status):
             values = [r[field] for b in group for r in b['summary']['per_request'] if r[field] is not None]
             stats[field] = dict(median=statistics.median(values),min=min(values),max=max(values),n=len(values)) if values else None
         summary[key] = dict(batches=len(group),per_request=stats,
+            decode_concurrency_qualified=all(b.get('decode_concurrency_qualified',True) for b in group),
             aggregate_e2e_output_tps=[b['summary']['aggregate_e2e_output_tps'] for b in group],
             acceptance=[b.get('acceptance') for b in group],
             overlap_s=[b['summary']['all_clients_decode_overlap_s'] for b in group])
@@ -379,11 +416,11 @@ def report(out, batches, status):
     lines = ['# Earkita benchmark', '', 'Status: '+status,
              '', 'Warm effective prompt rate includes cache restore; it is not computed prefill speed.',
              'Disk means filesystem L2, potentially served by the OS page cache.', '',
-             '| Input / C / effort / cache | Batches | Decode median per request tok/s | TTFT median ms |',
-             '|---|---:|---:|---:|']
+             '| Input / C / effort / cache | Batches | Decode median per request tok/s | TTFT median ms | Concurrent decode qualified |',
+             '|---|---:|---:|---:|---|']
     for key,g in summary.items():
         s = g['per_request']
-        lines.append(f"| {key} | {g['batches']} | {s['decode_tps']['median']:.2f} | {s['ttft_ms']['median']:.1f} |")
+        lines.append(f"| {key} | {g['batches']} | {s['decode_tps']['median']:.2f} | {s['ttft_ms']['median']:.1f} | {g['decode_concurrency_qualified']} |")
     lines += ['', 'NIAH dimensions (including failed attempts):', '', '```json',json.dumps(quality,indent=2),'```',
               '', 'Raw attempts, warmups, per-request rates, overlap and acceptance are retained in JSON.']
     (out/'report.md').write_text('\n'.join(lines)+'\n')
@@ -484,8 +521,9 @@ def run(a):
                                            or r['result']['completion_tokens']!=p['output_tokens'] or not r['result']['decode_tps'] for r in rows):
                                         raise RuntimeError('Incomplete/failed performance request')
                                     b['summary'] = summarize(rows,length)
-                                    if count>1 and b['summary']['all_clients_decode_overlap_s']<=0:
-                                        raise RuntimeError('No simultaneous decode observed for all clients')
+                                    b['decode_concurrency_qualified'] = qualify_decode_overlap(
+                                        b['summary'], count, state,
+                                        p.get('allow_serial_cold_prefill_diagnostic',False))
                                 b['valid'] = True
                                 save(target/'result.json',b)
                                 report(out,batches,'running')
