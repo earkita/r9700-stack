@@ -180,6 +180,29 @@ Both main templates declare 512K with compaction at 90%; this does not qualify
 
 ## Local compatibility and checks
 
+### Experimental DeepSeek V4.1
+
+Select [`deepseek.yaml`](deepseek.yaml) with `CONFIG` and
+`BACKEND_MODEL=deepseek-v4.1-flash`. Main alias `deepseek-v4.1-flash` uses high
+reasoning; `deepseek-v4.1-flash-fast` uses low reasoning with thinking enabled.
+The [Claude Code template](../serve/templates/deepseek-v4.1-flash.settings.local.json)
+assigns the fast alias to Haiku/Small Fast. The scoped `deepseek_hooks.py`
+preserves effort settings and local token counting; it does not rewrite tool
+output. This Anthropic-backed route rejects unsupported OpenAI `seed` requests.
+
+For a separate local test gateway, after the backend is ready:
+
+```bash
+bash serve/litellm.sh NAME=deepseek-proxy PORT=4001 \
+  CONFIG="$PWD/proxy/deepseek.yaml" BACKEND_MODEL=deepseek-v4.1-flash
+```
+
+The template defaults to port 4000; set its client URL to port 4001 when using
+this isolated gateway. Selecting a config does not switch or start the GPU
+model. See [DeepSeek validation and capacity limits](../serve/baseline-earkita/deepseek/deepseek-v4.1-flash.md):
+the latest qualification is text-only and short-context; historical 512K/vision
+metadata in the proxy config is not evidence that those limits are qualified.
+
 `litellm_hooks.py` contains one narrowly scoped compatibility fix: LiteLLM
 1.103.0's Anthropic token counter hardcodes the remote Anthropic endpoint.
 The hook sends it to this deployment's local `/v1/messages/count_tokens`.
