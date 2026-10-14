@@ -1,0 +1,49 @@
+# DeepSeek-only gateway; select with BACKEND_MODEL=deepseek-v4.1-flash.
+# Both aliases use the same backend. No fixed context budget is declared here.
+model_list:
+  - model_name: deepseek-v4.1-flash
+    litellm_params:
+      model: os.environ/LITELLM_ANTHROPIC_MODEL
+      api_base: os.environ/LITELLM_BACKEND_BASE
+      api_key: os.environ/LITELLM_BACKEND_KEY
+      temperature: 1.0
+      top_p: 0.95
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: true
+          reasoning_effort: high
+    model_info:
+      supports_reasoning: true
+      supports_function_calling: true
+      supports_vision: true
+      max_input_tokens: 524288 # Client declaration; not a per-session KV reservation.
+
+  - model_name: deepseek-v4.1-flash-fast
+    litellm_params:
+      model: os.environ/LITELLM_ANTHROPIC_MODEL
+      api_base: os.environ/LITELLM_BACKEND_BASE
+      api_key: os.environ/LITELLM_BACKEND_KEY
+      temperature: 1.0
+      top_p: 0.95
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: true
+          reasoning_effort: low
+    model_info:
+      supports_reasoning: true
+      supports_function_calling: true
+      supports_vision: true
+      max_input_tokens: 524288 # Client declaration; not a per-session KV reservation.
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+router_settings:
+  num_retries: 0
+  timeout: 1800
+
+litellm_settings:
+  drop_params: false
+  telemetry: false
+  callbacks:
+    - deepseek_hooks.local_backend

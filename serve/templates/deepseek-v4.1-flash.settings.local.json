@@ -1,0 +1,30 @@
+{
+  "apiKeyHelper": "python3 \"${R9700_STACK_ROOT:-$HOME/ai/r9700-stack}/serve/claude-litellm-key.py\"",
+  "totalTokensReminder": "off",
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Read",
+      "Bash"
+    ]
+  },
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:4000",
+    "ANTHROPIC_MODEL": "deepseek-v4.1-flash",
+    "ANTHROPIC_SMALL_FAST_MODEL": "deepseek-v4.1-flash-fast",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-v4.1-flash-fast",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-v4.1-flash",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "deepseek-v4.1-flash",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "deepseek-v4.1-flash",
+    "DISABLE_PROMPT_CACHING": "1",
+    "CLAUDE_CODE_TODO_REMINDER_MODE": "off",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "CLAUDE_CODE_AUTO_MODE_SERVER": "0",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "524288",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "524288",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "90"
+  },
+  "model": "deepseek-v4.1-flash",
+  "effortLevel": "high"
+}

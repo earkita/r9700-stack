@@ -1,8 +1,6 @@
 # r9700-stack
 
-Additional model deployments on 8× R9700: [GLM-5.3-Flash](serve/baseline-earkita/glm/README.md) and [MiMo-V2.6-Flash-MOPD](serve/baseline-earkita/mimo/README.md).
-
-Optional MiMo deployment: [MiMo-V2.6-Flash-MOPD on 8× R9700](notes/mimo.md).
+Additional model deployments on 8× R9700: [GLM-5.3-Flash](serve/baseline-earkita/glm/README.md), [MiMo-V2.6-Flash-MOPD](serve/baseline-earkita/mimo/README.md), and experimental [DeepSeek-V4.1-Flash](serve/baseline-earkita/deepseek/deepseek-v4.1-flash.md).
 
 Optional local API gateway: [LiteLLM setup](proxy/README.md) for OpenAI and
 Anthropic-compatible clients, running separately from the GPU server.

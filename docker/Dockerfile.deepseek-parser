@@ -1,0 +1,13 @@
+# DeepSeek-only image layer. Backport vLLM PR #58295, Apache-2.0:
+# https://github.com/vllm-project/vllm/pull/58295
+# Preserve exactly one content/tool separator when replaying conversation history.
+# Adaptation: remove it only in _events_to_delta. Removing it again in
+# _strip_content_whitespace destroys intentional trailing newlines in nonstream.
+ARG BASE=r9700/vllm:deepseek-v41-18f8f960
+FROM ${BASE}
+ARG VLLM_COMMIT=18f8f960
+COPY docker/patches/deepseek-v41-tool-separator.patch /tmp/deepseek-parser.patch
+RUN python3 -c "from importlib.metadata import version; v=version('vllm'); assert '${VLLM_COMMIT}' in v, v" \
+ && cd /usr/local/lib/python3.12/dist-packages \
+ && patch --batch --forward --fuzz=0 -p1 < /tmp/deepseek-parser.patch \
+ && rm /tmp/deepseek-parser.patch
