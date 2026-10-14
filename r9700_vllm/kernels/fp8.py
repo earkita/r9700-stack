@@ -119,10 +119,10 @@ def gemm_fp8_block(a_q: torch.Tensor, a_s: torch.Tensor, wq: torch.Tensor, bs: t
 
 def gemm_fp8_block_qa(x: torch.Tensor, wq: torch.Tensor, bs: torch.Tensor, N: int, K: int,
                       out: torch.Tensor | None = None, WV: int = 4, SK: int = 4, NPW: int = 2):
-    """Block-scaled fp8 GEMM with the per-token-group-128 activation quant fused in (M <= 16): x bf16 [M, K]
+    """Block-scaled fp8 GEMM with the per-token-group-128 activation quant fused in (M <= 32): x bf16 [M, K]
     straight in, one launch. Bit-identical operands to quant_group128_fp8 + gemm_fp8_block."""
     M = x.shape[0]
-    assert x.dtype == torch.bfloat16 and x.stride(1) == 1 and M <= 16
+    assert x.dtype == torch.bfloat16 and x.stride(1) == 1 and 0 < M <= 32
     if out is None:
         out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
     while SK > 1 and K % (128 * SK):

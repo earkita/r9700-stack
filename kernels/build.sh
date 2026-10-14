@@ -14,4 +14,5 @@ for sym in r9k_moe_mxfp4a8 r9k_moe_route r9k_moe_sum r9k_fp8_prefill_mix r9k_fp8
 done
 nm -D "$OUT" | grep -q ' T r9k_moe_mxfp4a4_c1$' || { echo "MISSING EXPORT: r9k_moe_mxfp4a4_c1" >&2; exit 1; }
 nm -D "$OUT" | grep -q ' T r9k_moe_mxfp4a4_batch$' || { echo "MISSING EXPORT: r9k_moe_mxfp4a4_batch" >&2; exit 1; }
+nm -D "$OUT" | grep -q ' T r9k_glm_gemm_fp8_block_qa$' || { echo "MISSING EXPORT: r9k_glm_gemm_fp8_block_qa" >&2; exit 1; }
 echo "built $(ls -la "$OUT")"

@@ -212,7 +212,7 @@ __global__ void r9k_gemm_fp8_block_kernel(const unsigned char* __restrict__ A, c
   }
 }
 
-// Block-scaled variant with the activation quant fused in (decode widths, M <= 16, one M-tile): A is bf16, each lane
+// Block-scaled variant with the activation quant fused in (decode widths, M <= 32, independent 16-row M-tiles): A is bf16, each lane
 // keeps its row's 128-group (8 k-steps x 8 values) in registers, the group's absmax meets its other half with one
 // shuffle, the fragments are built with the hardware fp8 convert (RNE, as r9k_quant_group128_fp8), and the
 // per-row scale rides in registers to the fold instead of through As. Same math as quant_group128 + block GEMM
@@ -222,7 +222,7 @@ typedef uint16_t v8u16_ __attribute__((ext_vector_type(8)));
 template <int NPW>
 __global__ void r9k_gemm_fp8_block_qa_kernel(const uint16_t* __restrict__ X, int lda,
                                              const v2i* __restrict__ Wp, const float* __restrict__ Bs,
-                                             __hip_bfloat16* __restrict__ C, int M, int K, int N, int ldc, int WV, int SK) {
+                                             __hip_bfloat16* __restrict__ C, int M, int K, int N, int ldc, int WV, int SK, float eps) {
   extern __shared__ float red[];
   const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
   const int col_local = wave / SK, ksplit = wave % SK;
@@ -230,7 +230,8 @@ __global__ void r9k_gemm_fp8_block_qa_kernel(const uint16_t* __restrict__ X, int
   const int Ks = K / SK, kbase = ksplit * Ks;
   const int nlane = lane & 15, mhalf = (lane >> 4) * 8;
   const int ksteps = K / 16, kgroups = K / 128;
-  const int arow = nlane < M - 1 ? nlane : M - 1;
+  const int mbase = blockIdx.y * 16;
+  const int arow = mbase + nlane < M - 1 ? mbase + nlane : M - 1;
   const uint16_t* xr = X + (size_t)arow * lda + mhalf;
 
   v8f acc[NPW];
@@ -259,7 +260,7 @@ __global__ void r9k_gemm_fp8_block_qa_kernel(const uint16_t* __restrict__ X, int
       }
     }
     amax = fmaxf(amax, __shfl_xor(amax, 16, WAVE32));          // the row's other k-half
-    amax = fmaxf(amax, 1e-12f);
+    amax = fmaxf(amax, eps);
     const float inv = 448.f / amax, scale = amax / 448.f;      // as r9k_quant_group128_fp8
     v8f tmp[NPW];
 #pragma unroll
@@ -304,7 +305,7 @@ __global__ void r9k_gemm_fp8_block_qa_kernel(const uint16_t* __restrict__ X, int
   for (int t = tid; t < ncols * 256; t += blockDim.x) {
     const int col = t >> 8, off = t & 255;
     const int n = (blockIdx.x * ncols + col) * 16 + ((off >> 3) & 15);
-    const int m = ((off >> 7) << 3) + (off & 7);
+    const int m = mbase + ((off >> 7) << 3) + (off & 7);
     if (n >= N || m >= M) continue;
     float v = 0.f;
     for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + off];
@@ -372,11 +373,11 @@ extern "C" int r9k_gemm_fp8_block(long a, long as, long wq, long bs, long c, int
   return hipGetLastError() == hipSuccess ? 0 : -6;
 }
 
-// x [M, K] bf16 (row stride lda elements, 16-byte aligned rows), M <= 16; the rest as r9k_gemm_fp8_block with MT = 1.
+// x [M, K] bf16 (row stride lda elements, 16-byte aligned rows), M <= 32; the rest as r9k_gemm_fp8_block with MT = 1.
 extern "C" int r9k_gemm_fp8_block_qa(long x, int lda, long wq, long bs, long c, int M, int K, int N, int ldc, int WV,
                                      int SK, int NPW, long stream) {
   if (M <= 0) return 0;
-  if (M > 16) return -7;
+  if (M > 32) return -7;
   if (N % 16) return -1;
   if (K % (128 * SK)) return -2;
   if (WV * SK * WAVE32 > 1024) return -3;
@@ -384,10 +385,36 @@ extern "C" int r9k_gemm_fp8_block_qa(long x, int lda, long wq, long bs, long c, 
   const int ncols = WV * NPW;
   const size_t smem = (size_t)ncols * SK * 256 * sizeof(float);
   if (smem > 64 * 1024) return -4;
-  dim3 grid((N / 16 + ncols - 1) / ncols, 1), block(WV * SK * WAVE32);
+  dim3 grid((N / 16 + ncols - 1) / ncols, (M + 15) / 16), block(WV * SK * WAVE32);
   hipStream_t st = (hipStream_t)stream;
 #define LQ(NP) hipLaunchKernelGGL((r9k_gemm_fp8_block_qa_kernel<NP>), grid, block, smem, st, (const uint16_t*)x, lda, \
-                                  (const v2i*)wq, (const float*)bs, (__hip_bfloat16*)c, M, K, N, ldc, WV, SK)
+                                  (const v2i*)wq, (const float*)bs, (__hip_bfloat16*)c, M, K, N, ldc, WV, SK, 1e-12f)
+  switch (NPW) {
+    case 1: LQ(1); break;
+    case 2: LQ(2); break;
+    case 4: LQ(4); break;
+    default: return -5;
+  }
+#undef LQ
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+// Quark dynamic group128 uses eps=1e-10; keep the generic entry unchanged.
+extern "C" int r9k_glm_gemm_fp8_block_qa(long x, int lda, long wq, long bs, long c, int M, int K, int N, int ldc, int WV,
+                                     int SK, int NPW, long stream) {
+  if (M <= 0) return 0;
+  if (M > 32) return -7;
+  if (N % 16) return -1;
+  if (K % (128 * SK)) return -2;
+  if (WV * SK * WAVE32 > 1024) return -3;
+  if (lda % 8) return -8;
+  const int ncols = WV * NPW;
+  const size_t smem = (size_t)ncols * SK * 256 * sizeof(float);
+  if (smem > 64 * 1024) return -4;
+  dim3 grid((N / 16 + ncols - 1) / ncols, (M + 15) / 16), block(WV * SK * WAVE32);
+  hipStream_t st = (hipStream_t)stream;
+#define LQ(NP) hipLaunchKernelGGL((r9k_gemm_fp8_block_qa_kernel<NP>), grid, block, smem, st, (const uint16_t*)x, lda, \
+                                  (const v2i*)wq, (const float*)bs, (__hip_bfloat16*)c, M, K, N, ldc, WV, SK, 1e-10f)
   switch (NPW) {
     case 1: LQ(1); break;
     case 2: LQ(2); break;
