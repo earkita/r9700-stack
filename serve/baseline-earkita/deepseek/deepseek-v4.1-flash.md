@@ -1,5 +1,38 @@
 # DeepSeek V4.1 Flash: requalification on eight R9700 GPUs
 
+## Decode critical path from the eight-rank trace (2026-10-14)
+
+An offline alignment of the 8 traced decode steps across all 8 ranks identifies
+the immediate bottleneck more precisely. Each rank launched 80 packed MoE
+kernels and 86 NCCL kernels per step. Of 5120 MoE calls, 205 exceeded 1 ms;
+the longest took 16.38 ms, while the typical call was about 0.03 ms. The slow
+rank changes by layer and step, so this is not one persistently slow GPU.
+
+At each of 320 layer/step positions, the spread between the fastest and
+slowest rank's two MoE projections closely matches the spread in duration of
+the **following** NCCL collective (Pearson r=0.995 in this trace). For example,
+at step 3, layer 30, rank 1's projections took 21.126 ms versus 0.005 ms on
+the fastest rank; the following collective's inter-rank duration spread was
+21.140 ms. Across 688 corresponding collective positions, 308 had a duration
+spread above 1 ms. This is direct evidence that intermittent MoE stragglers
+make other ranks wait at synchronization. It does not establish that NCCL's
+own data transfer is slow: summing the fastest observed rank at each
+collective gives only 6.3–8.4 ms per step, whereas the eight-step rank
+averages are 121–148 ms of collective duration per step, including waits.
+
+The likely source of the MoE long tail is access to offloaded expert pages:
+the server keeps 10.5 GiB/rank of expert matrices host-backed, and the
+`R9K_DEEPSEEK_STAGE_MIN_TOKENS=256` threshold means C1 decode reads them
+without whole-projection staging. However, the trace does **not** identify
+the selected expert IDs or measure host-page traffic. The precise page-level
+cause remains a hypothesis. Sparse attention was much steadier
+(9.3–9.6 ms/step), and the
+remaining GPU kernels took 17.5–18.8 ms/step. About 3255 kernel launches per
+step and 9–21% gaps in the GPU event span are a secondary launch/scheduling
+cost, subject to profiler overhead. No new runtime or comparison benchmark was
+run for this analysis; the existing PCIe discrepancy still makes performance
+observations diagnostic rather than comparable.
+
 ## Current decode trace (2026-10-14)
 
 The placed, decode-weight-0.5 variant was restarted with the same vLLM
