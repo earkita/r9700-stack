@@ -109,6 +109,8 @@ class Launcher(unittest.TestCase):
                         "glm-5.3-flash-c4-lmcache.sh"):
             with self.subTest(profile=profile):
                 self.assertIn("R9K_AG=0", self.launch(profile))
+                self.assertIn("R9K_AG_MAX_KB=16", self.launch(profile))
+                self.assertIn("R9K_GLM_DENSE_FP8=0", self.launch(profile))
                 self.assertIn("R9K_AG=1", self.launch(profile, "R9K_AG=1"))
 
     def test_dflash_window_override(self):

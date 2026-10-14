@@ -78,6 +78,10 @@ def main():
 
     cases = [((4, 640), -1), ((16, 640), -1), ((1, 640), -1), ((4, 62016), -1), ((64, 640), -1),
              ((4, 640), 0), ((2, 3, 320), 1), ((4, 2560), -1)]
+    if os.environ.get("AG_MODEL") == "glm":
+        # TP8 GLM: sharded projection/aux widths and 154880/8 logits.
+        cases += [((m, width), -1) for m in (1, 5, 10, 20)
+                  for width in (512, 2048, 19360)]
     it = 0
     for shape, dim in cases:
         for dtype in (torch.bfloat16, torch.float32):
@@ -93,9 +97,13 @@ def main():
     # repeated calls, varying block counts, interleaved with the all-reduce on its own pool
     for it2 in range(12):
         x = inp(rank, 100 + it2, (4 + it2, 640), torch.bfloat16, dev)
-        got = ar.all_gather(x, -1, nb=1 + it2 % 4)
+        got = (ar.all_gather(x, -1, nb=1 + it2 % 4) if ar.should_ag(x, -1)
+               else ref_gather(x, -1, world, dist.group.WORLD))
         y = inp(rank, 200 + it2, (4 * 2560,), torch.bfloat16, dev)
-        _ = ar.all_reduce(y)
+        if ar.should(y):
+            _ = ar.all_reduce(y)
+        else:
+            dist.all_reduce(y)  # Same fallback as the serving communicator's cap.
         want = ref_gather(x, -1, world, dist.group.WORLD)
         check(f"repeat {it2} nb={1 + it2 % 4}", got, want)
     # graph replay: capture an all-gather + all-reduce pair, replay several times, compare each replay
@@ -122,7 +130,10 @@ def main():
     if os.environ.get("BENCH", "1") == "1":
         if rank == 0:
             print(f"{'shape':>14} {'bytes/rank':>10} {'r9k ag us':>10} {'rccl us':>9}")
-        for shape in ((4, 640), (16, 640), (64, 640), (4, 62016)):
+        shapes = ([(m, width) for m in (1, 5, 10, 20) for width in (512, 2048, 19360)]
+                  if os.environ.get("AG_MODEL") == "glm"
+                  else [(4, 640), (16, 640), (64, 640), (4, 62016)])
+        for shape in shapes:
             x = inp(rank, 500, shape, torch.bfloat16, dev)
             if not ar.should_ag(x, -1):
                 continue
