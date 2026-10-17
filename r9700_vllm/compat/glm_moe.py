@@ -47,13 +47,20 @@ def patch() -> bool:
         raise ValueError("R9K_GLM_W4A4_BATCH must be isolated, grouped or packed")
     if max_rows == 32 and batch != "packed":
         raise ValueError("R9K_GLM_W4A4_MAX_ROWS=32 requires R9K_GLM_W4A4_BATCH=packed")
+    if batch == "packed" and os.environ.get("R9K_GLM_PACKED_DOWN_BN", "8") not in ("8", "16", "32", "64"):
+        raise ValueError("R9K_GLM_PACKED_DOWN_BN must be 8, 16, 32 or 64")
+    geometry = os.environ.get("R9K_GLM_PACKED_GEOMETRY", "stock")
+    if batch == "packed" and geometry not in ("stock", "wide"):
+        raise ValueError("R9K_GLM_PACKED_GEOMETRY must be stock or wide")
+    if batch == "packed" and geometry == "wide" and "R9K_GLM_PACKED_DOWN_BN" in os.environ:
+        raise ValueError("R9K_GLM_PACKED_DOWN_BN cannot override wide geometry")
     import torch
     from vllm.platforms import current_platform
     from .gate import check, vllm_commit
     if (not current_platform.is_rocm()
             or torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(":")[0] != "gfx1201"
-            or not vllm_commit().startswith("e97573215")):
-        raise RuntimeError("GLM W4A4 candidate requires gfx1201 and audited vLLM e97573215")
+            or not vllm_commit().startswith(("e97573215", "77154ca6"))):
+        raise RuntimeError("GLM W4A4 candidate requires gfx1201 and audited vLLM e97573215 or 77154ca6")
     from vllm.model_executor.layers.fused_moe.experts.ocp_mx_emulation_moe import (
         OCP_MXQuantizationEmulationTritonExperts as Experts,
     )

@@ -57,8 +57,8 @@ def patch() -> bool:
     from .gate import check, vllm_commit
     if (not current_platform.is_rocm()
             or torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(":")[0] != "gfx1201"
-            or not vllm_commit().startswith("e97573215")):
-        raise RuntimeError("GLM head GEMV requires gfx1201 and audited vLLM e97573215")
+            or not vllm_commit().startswith(("e97573215", "77154ca6"))):
+        raise RuntimeError("GLM head GEMV requires gfx1201 and audited vLLM e97573215 or 77154ca6")
     from vllm.models.glm5next.common.attention import Indexer
     if getattr(Indexer.forward, "_r9700_glm_head_gemv", False):
         return True

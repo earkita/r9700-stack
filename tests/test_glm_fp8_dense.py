@@ -65,8 +65,14 @@ def test_runtime_names_and_nested_text_config():
     assert not target_model(cfg)
     assert target_prefix("language_model.model.layers.3.self_attn.q_b_proj")
     assert target_prefix("model.language_model.layers.3.self_attn.q_b_proj")
+    assert target_prefix("model.layers.3.self_attn.q_b_proj", native_glm=True)
+    assert not target_prefix("model.layers.3.self_attn.q_b_proj")
     for name in ("visual.blocks.3.proj", "draft.model.layers.45.fc", "model.layers.3.mlp"):
         assert not target_prefix(name)
+    for name in ("visual.model.layers.3.self_attn.q_b_proj",
+                 "draft.model.layers.3.self_attn.q_b_proj",
+                 "model.layers.x.self_attn.q_b_proj"):
+        assert not target_prefix(name, native_glm=True)
 
 
 def test_prepare_preserves_checkpoint_and_rejects_other_layouts():

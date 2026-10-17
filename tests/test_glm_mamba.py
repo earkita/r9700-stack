@@ -8,6 +8,10 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from r9700_vllm.compat.glm_mamba import _wrap_add_request, _wrap_group_info
+from r9700_vllm.compat.gate import vllm_commit
+
+_LATEST = vllm_commit().startswith("77154ca6")
+_LEGACY_ONLY = pytest.mark.skipif(_LATEST, reason="latest vLLM seeds Mamba APC natively")
 
 
 def state(model="glm5_next", align=True, device="cpu", attention=640, mamba=16):
@@ -23,6 +27,7 @@ def state(model="glm5_next", align=True, device="cpu", attention=640, mamba=16):
     return s
 
 
+@_LEGACY_ONLY
 @pytest.mark.parametrize("tokens,expected", [(0, -1), (1, 0), (16, 0), (17, 1), (640, 39), (7680, 479)])
 def test_request_seed_and_upstream_side_effects(tokens, expected):
     s, req = state(), NS(num_computed_tokens=tokens)
@@ -32,6 +37,7 @@ def test_request_seed_and_upstream_side_effects(tokens, expected):
     s.prompt_embeds_state.add_request.assert_called_once_with(0, req)
 
 
+@_LEGACY_ONLY
 @pytest.mark.parametrize("model,align,expected", [("other", True, 11), ("glm5_next", False, -99)])
 def test_scope(model, align, expected):
     s = state(model=model, align=align)
@@ -39,6 +45,7 @@ def test_scope(model, align, expected):
     assert s._mamba_state_idx_gpu.item() == expected
 
 
+@_LEGACY_ONLY
 def test_effective_spec_guard():
     s = state()
     log = Mock()
@@ -48,6 +55,8 @@ def test_effective_spec_guard():
         _wrap_group_info(lambda s, cfg: ([2], NS(block_size=640)), log)(s, None)
 
 
+@_LEGACY_ONLY
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required for pre-copy kernel")
 @pytest.mark.parametrize("attention,mamba,tokens", [(640, 16, 7680), (64, 7168, 14336)])
 def test_gpu_precopy_uses_resumed_mamba_column(attention, mamba, tokens):
     from vllm.v1.worker.mamba_utils import preprocess_mamba_align_fused_kernel
@@ -66,3 +75,11 @@ def test_gpu_precopy_uses_resumed_mamba_column(attention, mamba, tokens):
     assert src.item() != wrong_seed
     assert s._mamba_state_idx_gpu.item() == tokens // mamba
     assert off.item() == 0
+
+
+@pytest.mark.skipif(not _LATEST, reason="requires native Mamba APC seed")
+@pytest.mark.parametrize("tokens,expected", [(0, -1), (16, 0), (17, 1), (7680, 479)])
+def test_latest_upstream_seed(tokens, expected):
+    s, req = state(), NS(num_computed_tokens=tokens)
+    MambaHybridModelState.add_request(s, 0, req)
+    assert s._mamba_state_idx_gpu.item() == expected

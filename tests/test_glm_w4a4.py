@@ -259,6 +259,34 @@ def test_packed_large_batch_reference(rows, input_scale, capture):
     test_moe_matches_full_emulation(288, 800 + rows, input_scale, capture, rows, "packed")
 
 
+@pytest.mark.parametrize("rows", [5, 20])
+def test_packed_down_tile_32_matches_full_emulation(monkeypatch, rows):
+    """Graph replay and changing routes for the DFlash C1/C4 verify shapes."""
+    monkeypatch.setenv("R9K_GLM_PACKED_DOWN_BN", "32")
+    test_moe_matches_full_emulation(288, 840 + rows, 4, True, rows, "packed")
+
+
+@pytest.mark.parametrize("rows", [5, 20, 32])
+def test_packed_down_tile_64_matches_full_emulation(monkeypatch, rows):
+    """Isolate down projection tiling with gate/up left at the stock geometry."""
+    monkeypatch.setenv("R9K_GLM_PACKED_DOWN_BN", "64")
+    test_moe_matches_full_emulation(288, 860 + rows, 4, True, rows, "packed")
+
+
+@pytest.mark.parametrize("rows", [5, 20, 32])
+def test_packed_gate_grouped_scale_matches_full_emulation(monkeypatch, rows):
+    """Gate/up scale-load variant with changing routes and graph replay."""
+    monkeypatch.setenv("R9K_GLM_PACKED_GATE_SCALE_GROUP", "1")
+    test_moe_matches_full_emulation(288, 870 + rows, 4, True, rows, "packed")
+
+
+@pytest.mark.parametrize("rows", [5, 20, 32])
+def test_packed_wide_geometry_matches_full_emulation(monkeypatch, rows):
+    """Whole MoE reference with changing expert routes under graph replay."""
+    monkeypatch.setenv("R9K_GLM_PACKED_GEOMETRY", "wide")
+    test_moe_matches_full_emulation(288, 850 + rows, 4, True, rows, "packed")
+
+
 @pytest.mark.parametrize("rows", [9, 17, 31])
 def test_packed_partial_batch_reference(rows):
     test_moe_matches_full_emulation(288, 900 + rows, 4, True, rows, "packed")

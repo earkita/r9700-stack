@@ -26,6 +26,11 @@ def register_glm() -> None:
     """Minimal, explicitly enabled GLM bring-up fixes; no Qwen/kernel registration."""
     if os.environ.get("R9K_GLM_BASELINE") != "1":
         return
+    from .compat.gate import vllm_commit
+    if vllm_commit().startswith("77154ca6"):
+        from .compat.glm_latest import patch
+        patch()
+        return
     from .compat.glm_indexer import patch
     patch()
     from .compat.glm_mamba import patch as patch_mamba

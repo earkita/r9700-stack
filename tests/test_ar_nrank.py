@@ -86,7 +86,7 @@ def main():
         for dtype in (torch.bfloat16, torch.float16, torch.float32):
             esz = torch.tensor([], dtype=dtype).element_size()
             for n in (8, 24, hidden, hidden * 4 - 8, hidden * 8, hidden * 16,
-                      hidden * 32, hidden * 64, hidden * 200 + 8, cap // esz):
+                      hidden * 20, hidden * 32, hidden * 64, hidden * 200 + 8, cap // esz):
                 if n * esz % 16 or n * esz > cap:
                     continue
                 for nb in (None, 1, 3, 16):
@@ -127,6 +127,23 @@ def main():
             for _ in range(world):
                 w += a.float()
             check(f"graph {nm} {r}", bb, w.to(a.dtype))
+    # GLM DFlash K4/C4 produces 20 x 4096 bf16 = 160 KiB all-reduces.
+    # Check varying inputs under graph replay, not only eager calls or zero-filled timing.
+    n_verify = hidden * 20
+    if n_verify * 2 <= ar.max_bytes and n_verify * 2 > ar.max1:
+        x_verify = torch.zeros(n_verify, dtype=torch.bfloat16, device=dev)
+        with torch.cuda.stream(s):
+            ar.all_reduce(x_verify, mode=2)
+        torch.cuda.current_stream().wait_stream(s)
+        verify_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(verify_graph):
+            y_verify = ar.all_reduce(x_verify, mode=2)
+        for r in range(10):
+            x_verify.copy_(inp(rank, 8000 + r, n_verify, x_verify.dtype, dev))
+            verify_graph.replay()
+            check(f"graph {n_verify * 2 // 1024}KiB {r}", y_verify,
+                  ref(world, 8000 + r, n_verify, x_verify.dtype, dev))
+            torch.cuda.synchronize()
     torch.cuda.synchronize()
     tb = torch.tensor([bad], device=dev)
     dist.all_reduce(tb)
