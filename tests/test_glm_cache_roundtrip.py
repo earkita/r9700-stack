@@ -89,7 +89,8 @@ def test_decode_logits_roundtrip(written_cache):
 
 
 @pytest.mark.parametrize("per_row", [False, True])
-def test_decode_graph_replay_and_context_mask(written_cache, per_row):
+@pytest.mark.parametrize("tile", [64, 128, 256])
+def test_decode_graph_replay_and_context_mask(written_cache, per_row, tile):
     from vllm.v1.worker.workspace import init_workspace_manager
     from r9700_vllm.attn.glm_paged_logits import paged_logits
     init_workspace_manager(torch.cuda.current_device())
@@ -102,7 +103,7 @@ def test_decode_graph_replay_and_context_mask(written_cache, per_row):
     lengths = torch.tensor([[n - 1, n], [64, 65]] if per_row else [n, 65],
                            device="cuda", dtype=torch.int32)
     tables = table.repeat(2, 1)
-    call = lambda: paged_logits(q, cache.unsqueeze(2), weights, lengths, tables, None, 4093)
+    call = lambda: paged_logits(q, cache.unsqueeze(2), weights, lengths, tables, None, 4093, tile=tile)
     for _ in range(3):
         call()
     graph = torch.cuda.CUDAGraph()

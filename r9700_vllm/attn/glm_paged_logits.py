@@ -4,9 +4,25 @@ The pinned AITER RDNA stage1 reader assumes token-major values. GLM's kpool
 writer and prefill gather instead use tiled values, followed by FP32 scales.
 FP8 -> BF16 is exact; matrix products and head reduction accumulate in FP32.
 """
+import os
+
 import torch
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.workspace import current_workspace_manager
+
+
+def _tile_size(value):
+    try:
+        tile = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("R9K_GLM_PAGED_LOGITS_TILE must be 64, 128 or 256") from exc
+    if tile not in (64, 128, 256):
+        raise ValueError("R9K_GLM_PAGED_LOGITS_TILE must be 64, 128 or 256")
+    return tile
+
+
+# Frozen at process import so every captured decode graph uses the same grid.
+DEFAULT_TILE = _tile_size(os.environ.get("R9K_GLM_PAGED_LOGITS_TILE", "64"))
 
 
 @triton.jit
@@ -45,12 +61,13 @@ def _paged_logits(Q, K, W, LENS, TABLE, OUT,
 
 
 def paged_logits(q, cache, weights, context_lens, table, schedule_metadata,
-                 max_model_len, *, compress_ratio=1):
+                 max_model_len, *, compress_ratio=1, tile=None):
     """Audited GLM shape only; dispatch adapter handles all other calls."""
     batch, next_n, heads, dim = q.shape
     assert (heads, dim) == (32, 128) and compress_ratio == 1
     assert cache.shape[1] in (32, 64) and cache.is_contiguous()
     assert q.stride(-1) == weights.stride(-1) == table.stride(-1) == 1
+    tile = DEFAULT_TILE if tile is None else _tile_size(tile)
     flat = cache.view(cache.shape[0], -1).view(q.dtype)
     lens = context_lens.reshape(-1)
     per_row = lens.numel() == batch * next_n
@@ -58,9 +75,10 @@ def paged_logits(q, cache, weights, context_lens, table, schedule_metadata,
     (out,) = current_workspace_manager().get_simultaneous(
         ((batch * next_n, max_model_len), torch.float32),
     )
-    _paged_logits[(batch * next_n, triton.cdiv(max_model_len, 64))](
+    _paged_logits[(batch * next_n, triton.cdiv(max_model_len, tile))](
         q, flat, weights, lens, table, out,
         *q.stride()[:3], weights.stride(0), flat.stride(0), table.stride(0),
         max_model_len, table.shape[1], cache.shape[1], next_n, per_row,
+        TILE=tile,
         num_warps=4, num_stages=2)
     return out
