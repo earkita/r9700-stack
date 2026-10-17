@@ -139,6 +139,68 @@ def test_launch_tuning_is_scoped(monkeypatch, rows, heads, fp8, rdna, expected):
     assert launches[0]["num_warps"] == expected
     assert launches[0]["BLOCK_K"] == 16
 
+
+@pytest.mark.parametrize("rows,expected", [(8, 8), (9, 8), (20, 8), (32, 8), (33, 4)])
+def test_large_verify_warps_opt_in_is_scoped(monkeypatch, rows, expected):
+    from r9700_vllm.attn import glm_sparse_fp8 as ops
+    q, kv, scale, indices, lengths, sinks = inputs(rows, 1., True, heads=16)
+    launches = []
+    class RecordLaunch:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append(kwargs)
+            return launch
+    monkeypatch.setenv("R9K_GLM_SPARSE_VERIFY_WARPS", "8")
+    monkeypatch.setattr(ops, "_ON_RDNA4", True)
+    monkeypatch.setattr(ops, "_sparse_attn_prefill_ragged_kernel", RecordLaunch())
+    call(q, kv, scale, indices, lengths, sinks, ragged=True)
+    assert launches[0]["num_warps"] == expected
+
+
+def test_large_verify_warps_reject_invalid_setting(monkeypatch):
+    from r9700_vllm.attn import glm_sparse_fp8 as ops
+    monkeypatch.setenv("R9K_GLM_SPARSE_VERIFY_WARPS", "16")
+    with pytest.raises(ValueError, match="must be 4 or 8"):
+        call(*inputs(20, 1., True, heads=16), ragged=True)
+
+
+@pytest.mark.parametrize("rows", [9, 20, 32])
+def test_large_verify_warps_match_baseline_and_reference(monkeypatch, rows):
+    q, kv, scale, indices, lengths, sinks = inputs(rows, .125, True, heads=16)
+    monkeypatch.setenv("R9K_GLM_SPARSE_VERIFY_WARPS", "4")
+    baseline = call(q, kv, scale, indices, lengths, sinks, ragged=True)
+    monkeypatch.setenv("R9K_GLM_SPARSE_VERIFY_WARPS", "8")
+    actual = call(q, kv, scale, indices, lengths, sinks, ragged=True)
+    torch.testing.assert_close(actual, baseline, rtol=0, atol=0)
+    torch.testing.assert_close(actual, reference(q, kv, scale, indices, sinks),
+                               rtol=1e-2, atol=3e-3)
+
+
+def test_large_verify_warps_graph_replay_changed_inputs(monkeypatch):
+    from r9700_vllm.attn.glm_sparse_fp8 import _rocm_sparse_attn_prefill_ragged_triton
+    monkeypatch.setenv("R9K_GLM_SPARSE_VERIFY_WARPS", "8")
+    q, kv, scale, indices, lengths, sinks = inputs(20, .125, True, heads=16)
+    flat = indices[indices >= 0]
+    indptr = torch.cat([torch.zeros(1, device="cuda", dtype=torch.int32),
+                        lengths.cumsum(0).int()])
+    def invoke():
+        return _rocm_sparse_attn_prefill_ragged_triton(
+            q, kv[:, 0], flat, indptr, 512 ** -.5, sinks, 512, 0, scale)
+    for _ in range(3):
+        invoke()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = invoke()
+    q.normal_()
+    scale.fill_(.25)
+    kv.copy_(torch.randn_like(kv.float()).to(kv.dtype))
+    flat.copy_(flat[torch.randperm(flat.numel(), device="cuda")])
+    indices[indices >= 0] = flat
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, reference(q, kv, scale, indices, sinks),
+                               rtol=1e-2, atol=3e-3)
+
 @pytest.mark.parametrize("scale_value", [.125, 1., 2.5])
 def test_decode_long_sparse_rows_match_bf16_reference(scale_value):
     torch.manual_seed(707)

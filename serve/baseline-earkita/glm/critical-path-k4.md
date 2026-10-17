@@ -227,3 +227,126 @@ i mikrotesty są w ignorowanych `bench/results/glm-gate-scale-*20261015/`.
 W trakcie próby poprawiono fałszywy alarm preflightu: port podrzędny
 reklamujący x16 jest prawidłowo ograniczany przez fizyczny port nadrzędny
 x4; test regresji potwierdza też wykrywanie faktycznego spadku do x2.
+
+## Kafel odczytu FP8 indexera: TILE64 → TILE256 → TILE64 (2026-10-17)
+
+Ślad C4 wyżej zawierał 11 uruchomień paged logits na krok, łącznie 5,33 ms
+na analizowanym ranku. Zbadaliśmy wyłącznie wielkość kafla tego czytnika,
+bez zmiany wag, formatu FP8, arytmetyki, DFlash K4 ani pozostałych kerneli.
+Flaga `R9K_GLM_PAGED_LOGITS_TILE` jest opt-in; domyślna wartość nadal wynosi
+64. Wstępny TILE32 nie był bitowo zgodny dla wszystkich logitów FP32 (maks.
+różnica około 1,9e-6), więc nie jest dopuszczony w kodzie produkcyjnym.
+
+Izolowany grafowy mikrotest na `gfx1201` porównał pełne logity i top-k
+bitowo z TILE64 dla 5 wierszy C1 i 20 wierszy C4, przy 128K/258048
+tokenach kontekstu i pojemności modelu 262144. TILE128 i TILE256 przeszły
+kontrolę. Przy C4/128K mediana samego czytnika wyniosła 0,535–0,525 ms
+dla TILE64 i 0,347 ms dla TILE256. To nie jest oszczędność czasu kroku
+ani całej odpowiedzi. Surowe próby, w tym odrzucony pilot TILE32, są w
+ignorowanym `bench/results/glm-paged-logits-tiles-20261017/`.
+
+Pełne A–B–A użyło tego samego obrazu `r9700/vllm:glm53-lmcache055-lru`
+(vLLM `e97573215`), checkpointu Quark MXFP4, TP8, czterech slotów,
+DFlash K4, FP8 target/draft KV i cache 128 GiB RAM / 512 GiB filesystem.
+Protokół `bench/baseline-earkita/glm-paged-logits-128k.json` zamroził
+identyczne prompty po 130816 tokenów, high, temperaturę 1,0, top-p 0,95,
+seed 1234, jeden cold prime, jedną warmup i trzy mierzone partie C1/C4 po
+256 wymuszonych tokenów. Osobny NIAH używał naturalnego EOS. Każda noga
+miała odrębny namespace cache, potwierdzone trafienia L1, rzeczywisty
+overlap C4, brak preemption i obowiązkowy zapis PCIe wszystkich ośmiu GPU
+przed próbą i pod obciążeniem. Hash 116 źródeł, korpus, sampling i profil
+K4 były identyczne; w tożsamości modelu różniła się tylko flaga kafla.
+
+| Noga | C1 decode/request | C4 decode/request | C4 ITL p50 / p95 | C4 TTFT mediana |
+|---|---:|---:|---:|---:|
+| TILE64 A | 48,68 tok/s | 22,91 tok/s | 94,83 / 99,72 ms | 3105 ms |
+| TILE256 B | 50,39 tok/s | 24,17 tok/s | 93,09 / 98,18 ms | 3139 ms |
+| TILE64 C | 43,18 tok/s | 26,48 tok/s | 94,66 / 100,03 ms | 3425 ms |
+
+Decode to mediana żądań z trzech partii; C1 ma n=3, C4 n=12. Wymuszony
+256-tokenowy ciąg po krótkiej odpowiedzi NIAH nie miał zachowanego tekstu
+strumienia i może zawierać generację po znaczniku końca tury. Zgodnie z
+`testing.md` ten pomiar jest **diagnostyką syntetyczną**, nie miarą
+rzeczywistego zadania programistycznego. Wniosek o przyspieszeniu wymaga
+odrębnego, zamrożonego długiego zadania z EOS i zapisanym pełnym tekstem,
+uruchomionego dla obu wariantów. Wszystkie trzy nogi przeszły NIAH 5/5
+strict/retrieval/format/completion, bez błędów
+runtime. Przepustowość aggregate C4, która **obejmuje TTFT**, miała mediany
+72,18 / 72,50 / 73,78 tok/s odpowiednio A/B/C; nie jest to prędkość sesji.
+Mediany akceptacji K4 C4 wynosiły 35,8% / 34,9% / 40,3%, a zakresy między
+partiami A 31,2–37,3%, B 30,8–40,7%, C 37,5–42,0%. TILE256 skrócił medianę
+odstępu strumienia C4 o około 1,6 ms względem obu prób TILE64, ale jego
+mediana decode C4 była niższa od powtórzonej bazy C. **Nie ma potwierdzonego, powtarzalnego
+zysku end-to-end; domyślne TILE64 pozostaje bez zmian.** Nie wnioskujemy z
+tych danych o 256K, cold prefill ani zadaniach wieloetapowych z narzędziami.
+
+Pełne protokoły, każdy request, przyjęcia według pozycji, telemetria PCIe,
+logi i wyniki jakości są w `bench/results/glm-paged-tile64-a-20261017/`,
+`bench/results/glm-paged-tile256-b-20261017/` i
+`bench/results/glm-paged-tile64-c-20261017/` (ignorowane przez Git).
+Oryginalne kontenery K4/LMCache zostały przywrócone po eksperymencie.
+
+## Naturalny EOS i gęste FP8: K4 → opt-in → K4 (2026-10-17)
+
+Żeby uniknąć mierzenia generacji po końcu odpowiedzi, zamrożony test
+`bench/glm_completed_code.py` użył archiwum kodu o **131072 rzeczywistych
+tokenach wejścia** i zadania `dependency_waves`. W każdej nodze najpierw
+wykonano jedną cold rozgrzewkę, a potem trzy mierzone próby z naturalnym
+EOS. Zachowano pełny tekst, reasoning, zdarzenia SSE, liczniki tokenów oraz
+wynik niezależnego wykonania 169 przypadków. Prędkość decode jest liczona
+z przyrostu rzeczywistego licznika tokenów między pierwszą i ostatnią
+tekstową aktualizacją strumienia; TTFT i pierwszy burst są wyłączone.
+Odstępy aktualizacji SSE nie są per-token ITL przy spekulacji.
+
+Przez całe A–B–A działały ten sam obraz i checkpoint, TP8, DFlash K4, FP8
+KV, LMCache, argumenty serwera, prompt, temperatura 1,0, top-p 0,95,
+seed 1234 i effort high. Jedyną różnicą środowiska modelu była flaga
+`R9K_GLM_DENSE_FP8` (0/1/0); osobne sole cache izolowały cold prime.
+Każda ciepła próba miała **130176** tokenów trafienia GPU prefix cache.
+Mapowanie HIP/BDF, topologia i linki pod obciążeniem ośmiu GPU przeszły
+kontrolę w każdej nodze. Wszystkie **9/9 mierzone odpowiedzi** zakończyły
+się poprawnym kodem (169/169 przypadków na odpowiedź). Nie wykonywano
+równolegle innych testów GPU.
+
+| Noga | C1 decode mediana (zakres) | TTFT mediana | Cała odpowiedź mediana | Akceptacja draftu mediana |
+|---|---:|---:|---:|---:|
+| K4 A | 61,41 (57,80–68,21) tok/s | 987 ms | 14,79 s | 52,4% |
+| Gęste FP8 | 59,77 (56,73–63,33) tok/s | 957 ms | 14,45 s | 50,1% |
+| K4 C | 63,87 (63,36–67,11) tok/s | 962 ms | 8,88 s | 57,1% |
+
+Wartości całego czasu odpowiedzi nie są bezpośrednim zyskiem, bo ukończone
+odpowiedzi miały różne długości: mediany 797 / 765 / 503 tokenów. Podobnie
+akceptacja DFlash zmieniała się między próbkami; zapisano ją osobno, bez
+przypisywania jej zmian do kernela. Mediany odstępu aktualizacji SSE wyniosły
+50,54 / 50,39 / 50,56 ms. Izolowany kernel gęstego FP8 przeszedł 18/18
+przypadków GPU i był szybszy dla odpowiednich kształtów, lecz **pełny model
+nie wykazał powtarzalnego zysku decode**. Flaga pozostaje wyłączona. To
+test C1 na jednym zadaniu programistycznym, nie kwalifikacja C4, 256K ani
+wieloetapowego agenta z narzędziami.
+
+Wszystkie próby, pełne odpowiedzi, raw Prometheus, licznik akceptacji,
+protokół, kod orakla i PCIe są w ignorowanym
+`bench/results/glm-dense-code-128k-20261017/`. K4 został przywrócony;
+kontener kandydata jest zatrzymany. Następny eksperyment powinien dotyczyć
+większego składnika ścieżki krytycznej, zwłaszcza MoE albo verify, z tą
+samą bramką zakończonej odpowiedzi i jakości narzędzi.
+
+## Sparse verify: izolowany test 4/8 warpów (2026-10-17)
+
+W śladzie C4 sparse verify zużył 7,90 ms sumy kerneli na analizowanym
+ranku. Obecny czytnik FP8 używa 8 warpów dla 1–8 zapytań, lecz 4 dla
+20-wierszowego verify C4. `tuning/tune_glm_sparse_verify_warps.py`
+sprawdził ten sam kernel przy 5 i 20 wierszach, 16 głowach, latentnym
+wymiarze 512 i 2048 wybranych pozycjach KV. Izolowana karta gfx1201
+przeszła kontrolę PCIe przed próbą i pod obciążeniem. Wyniki dla 4 i 8
+warpów były bitowo identyczne na tych danych; osiem grafowych powtórzeń
+dało mediany 1,574 i 0,393 ms na kernel przy 20 wierszach (przy pięciu:
+1,576 i 0,396 ms). Surowe wyniki są w ignorowanym
+`bench/results/glm-sparse-verify-warps-20261017/`.
+
+To mocna hipoteza o koszcie spillowania/redukcji w wariancie 4-warpowym,
+ale **nie dowód przyspieszenia kroku ani całego decode**. Kolejna bramka
+wymaga opt-in ograniczonego do GLM/gfx1201/FP8 i 9–32 wierszy, pełnego
+testu numerycznego z nierównymi długościami i grafowym replayem oraz
+porównania K4→kandydat→K4 na zakończonych zadaniach C4. Działającego
+profilu K4 nie zmieniono.

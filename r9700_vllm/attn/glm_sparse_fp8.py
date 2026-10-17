@@ -6,6 +6,8 @@ Adapted from vLLM e9757321527ca1ecd514c07c1418dd2c53da3d19 and the
 validated patches/vllm/0001 and 0002. Arithmetic and launch configuration
 are retained verbatim. No installed upstream source is modified.
 """
+import os
+
 import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -199,6 +201,9 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     # four warps. Eight warps reduce that to 24 and preserve the reduction
     # order (BLOCK_K=16). Keep the measured choice local to short decode
     # batches; BF16, larger batches and other architectures keep defaults.
+    verify_warps = os.environ.get("R9K_GLM_SPARSE_VERIFY_WARPS", "4")
+    if verify_warps not in ("4", "8"):
+        raise ValueError("R9K_GLM_SPARSE_VERIFY_WARPS must be 4 or 8")
     fp8_rdna_decode = (
         _ON_RDNA4
         and fp8_kv
@@ -207,7 +212,19 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         and head_dim == 512
         and rope_head_dim == 0
     )
-    num_warps = 8 if fp8_rdna_decode else 4
+    # The existing <=8-row path stays unchanged. Opt in only for the larger
+    # FP8 GLM verify batches; the adapter is the sole caller of this local
+    # reader in serving. Keep the baseline choice for every other shape.
+    fp8_rdna_large_verify = (
+        verify_warps == "8"
+        and _ON_RDNA4
+        and fp8_kv
+        and 8 < num_queries <= 32
+        and num_heads == 16
+        and head_dim == 512
+        and rope_head_dim == 0
+    )
+    num_warps = 8 if fp8_rdna_decode or fp8_rdna_large_verify else 4
     out = torch.empty_like(q)
     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
         q,

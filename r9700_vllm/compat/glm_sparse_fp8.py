@@ -101,6 +101,8 @@ def patch():
         return False
     if enabled != '1':
         raise ValueError('R9K_GLM_FP8_SPARSE must be 0 or 1')
+    if os.environ.get('R9K_GLM_SPARSE_VERIFY_WARPS', '4') not in ('4', '8'):
+        raise ValueError('R9K_GLM_SPARSE_VERIFY_WARPS must be 4 or 8')
     import hashlib
     from pathlib import Path
     import torch
