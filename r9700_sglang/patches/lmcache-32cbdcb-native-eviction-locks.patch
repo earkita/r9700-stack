@@ -1,0 +1,26 @@
+diff --git a/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py b/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py
+--- a/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py
++++ b/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py
+@@ -381,8 +381,19 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
+         if not keys or not self._has_delete:
+             return
+
+-        key_strings = [_object_key_to_string(k) for k in keys]
+         done_event = threading.Event()
+
+         with self._lock:
++            # A lookup must be protected before its asynchronous completion
++            # installs a lock; pending stores must likewise survive LRU.
++            protected = set(self._locked_keys)
++            for op, _, _, pending_keys in self._pending_ops.values():
++                if op == self._OP_LOOKUP and pending_keys:
++                    protected.update(pending_keys)
++            for pending_keys, _ in self._pending_store_sizes.values():
++                protected.update(pending_keys)
++            keys = [key for key in keys if key not in protected]
++            if not keys:
++                return
++            key_strings = [_object_key_to_string(k) for k in keys]
+             task_id = self._get_next_task_id()
+             future_id = int(self._client.submit_batch_delete(key_strings))
+             self._pending_ops[future_id] = (

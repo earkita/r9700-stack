@@ -1,12 +1,24 @@
 # GLM: current profiles and validation
 
-Maintained configuration reference, updated 2026-10-11. Historical measurements
+Maintained configuration reference, updated 2026-10-14. Historical measurements
 record their own settings; check the running API for live service status.
 
 ## Profiles
 
 These four GLM launchers are maintained. Each invokes the shared
 [`serve.sh`](../../serve.sh) directly.
+
+The separate [C4/MTP candidate](glm-5.3-flash-c4-mtp.md) has its own
+[experimental launcher](glm-5.3-flash-c4-mtp.sh). Initial C1 text diagnostics
+are recorded; it does not replace a maintained baseline.
+The [vLLM 77154ca6 C4 candidate](glm-5.3-flash-c4-vllm771.md) likewise has
+a [standalone launcher](glm-5.3-flash-c4-vllm771.sh). Matched 128K C1/C4
+diagnostics found no confirmed decode gain; the established profiles keep
+their current pin.
+The [SGLang v0.5.20 candidate](glm-5.3-flash-sglang.md) has a separate
+[launcher](glm-5.3-flash-sglang.sh), image and adapter under `r9700_sglang/`.
+Its short text, streaming and tool-call smokes passed, but it has no qualified
+long-context or performance comparison with K4.
 
 | Profile | Notes / results | Active sequences | Context limit | Speculation |
 |---|---|---:|---|---|

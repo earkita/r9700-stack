@@ -1,0 +1,103 @@
+# Experimental SGLang main/LMCache candidate for GLM-5.3-Flash on 8x gfx1201.
+# The qualified v0.5.20/MTP3 image remains untouched for rollback.
+FROM vllm/vllm-openai-rocm@sha256:7164f874815b44cfd639126cee25d80a5c4872a6f8e59c4495a2b172cc7e5d15
+
+ARG SGLANG_COMMIT=aaf5f397a5a6565ad2cbcfe64bab56bdebbe4b75
+ARG LMCACHE_COMMIT=32cbdcb7a94bfb07fe25dad104f95e11b1f472b1
+ARG MAX_JOBS=8
+
+RUN git init /opt/sglang \
+ && cd /opt/sglang \
+ && git remote add origin https://github.com/sgl-project/sglang.git \
+ && git fetch --depth=1 origin "$SGLANG_COMMIT" \
+ && git checkout --detach FETCH_HEAD \
+ && test "$(git rev-parse HEAD)" = "$SGLANG_COMMIT"
+
+# Ported from the v0.5.20 adapter onto the exact source pin. The patch is
+# intentionally separate from the qualified image and applies without fuzz.
+COPY r9700_sglang/patches/sglang-aaf5f397-gfx1201-glm.patch /tmp/sglang-gfx1201-glm.patch
+RUN cd /opt/sglang \
+ && git apply --check /tmp/sglang-gfx1201-glm.patch \
+ && git apply /tmp/sglang-gfx1201-glm.patch \
+ && git diff --check
+
+# Keep the ROCm PyTorch/Triton wheels supplied by the base image.
+RUN python3 -m pip install --no-cache-dir setuptools-scm setuptools-rust \
+ && cd /opt/sglang \
+ && cp python/pyproject_other.toml python/pyproject.toml \
+ && SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION=0.5.21.dev0 \
+    python3 -m pip install --no-cache-dir --no-build-isolation -e 'python[runtime_base]'
+
+RUN cd /opt/sglang/python/sglang/kernels/aot \
+ && cp pyproject_rocm.toml pyproject.toml \
+ && AMDGPU_TARGET=gfx1201 MAX_JOBS=${MAX_JOBS} python3 setup_rocm.py install
+
+COPY r9700_sglang/__init__.py r9700_sglang/packed_moe.py \
+     r9700_sglang/bf16_dense.py r9700_sglang/hip_w4a4.py \
+     r9700_sglang/mhc.py r9700_sglang/mhc_post.py \
+     r9700_sglang/kpool.py r9700_sglang/mtp_names.py \
+     r9700_sglang/mtp_fp8.py r9700_sglang/mtp_trace.py \
+     r9700_sglang/profile_worker_env.py r9700_sglang/lmcache_events.py \
+     /opt/r9700_sglang/
+COPY kernels/r9k_moe_mxfp4a8.hip /opt/r9700_sglang/r9k_moe_mxfp4a8.hip
+RUN hipcc -O3 -std=c++17 -fPIC -DNDEBUG --offload-arch=gfx1201 \
+    -ffp-contract=off -shared /opt/r9700_sglang/r9k_moe_mxfp4a8.hip \
+    -o /opt/r9700_sglang/libr9k_moe.so \
+ && nm -D /opt/r9700_sglang/libr9k_moe.so | grep -q ' T r9k_moe_mxfp4a4_c1$'
+
+# New unified SGLang cache requires the matching LMCache dev connector. Build
+# its HIP extension without replacing the base ROCm torch/triton packages.
+COPY r9700_sglang/patches/lmcache-32cbdcb-sglang-kda-slice-axis.patch /tmp/lmcache-kda-slice-axis.patch
+COPY r9700_sglang/patches/lmcache-32cbdcb-rocm-sync-events.patch /tmp/lmcache-rocm-sync-events.patch
+COPY r9700_sglang/patches/lmcache-32cbdcb-native-eviction-locks.patch /tmp/lmcache-native-eviction-locks.patch
+RUN python3 -m pip install --no-cache-dir --no-deps grpcio-tools==1.78.0 \
+ && git init /opt/lmcache \
+ && cd /opt/lmcache \
+ && git remote add origin https://github.com/LMCache/LMCache.git \
+ && git fetch --depth=1 origin "$LMCACHE_COMMIT" \
+ && git checkout --detach FETCH_HEAD \
+ && test "$(git rev-parse HEAD)" = "$LMCACHE_COMMIT" \
+ && git apply --check /tmp/lmcache-kda-slice-axis.patch \
+ && git apply /tmp/lmcache-kda-slice-axis.patch \
+ && git apply --check /tmp/lmcache-rocm-sync-events.patch \
+ && git apply /tmp/lmcache-rocm-sync-events.patch \
+ && git apply --check /tmp/lmcache-native-eviction-locks.patch \
+ && git apply /tmp/lmcache-native-eviction-locks.patch \
+ && git diff --check \
+ && BUILD_WITH_HIP=1 CXX=hipcc PYTORCH_ROCM_ARCH=gfx1201 \
+    HIPCC_COMPILE_FLAGS_APPEND=--offload-arch=gfx1201 MAX_JOBS=${MAX_JOBS} \
+    SETUPTOOLS_SCM_PRETEND_VERSION=0.5.6.dev0 \
+    python3 -m pip install --no-cache-dir --no-deps --no-build-isolation /opt/lmcache \
+ && cd / \
+ && python3 -c 'import lmcache.cuda_ops; import lmcache.lmcache_native; from lmcache.integration.sglang.unified_lmcache_mp_connector import UnifiedLMCacheMPConnector; print("SGLang unified LMCache connector imports")'
+
+# Upstream still leaves a second complete GLM tool call buffered in one stream
+# delta. Keep the independently scoped drain fix; do not enable JSON/tool
+# rewriting without a separate model qualification.
+COPY r9700_sglang/patches/sglang-aaf5f397-glm47-buffer-drain.patch /tmp/glm47-buffer-drain.patch
+RUN cd /opt/sglang \
+ && git apply --check /tmp/glm47-buffer-drain.patch \
+ && git apply /tmp/glm47-buffer-drain.patch \
+ && git diff --check
+
+# SGLang writes 64-token KPool pages in 16x16 tiles. The pinned AITER image
+# only reads that layout through Gluon on gfx942/gfx950/gfx1250, so add the
+# equivalent gfx1201-only address calculation to its Triton paged-MQA reader.
+COPY r9700_sglang/patches/aiter-base-gfx1201-preshuffle-mqa.patch /tmp/aiter-gfx1201-preshuffle-mqa.patch
+RUN cd /usr/local/lib/python3.12/dist-packages \
+ && git apply --check /tmp/aiter-gfx1201-preshuffle-mqa.patch \
+ && git apply /tmp/aiter-gfx1201-preshuffle-mqa.patch \
+ && python3 -m py_compile \
+    aiter/ops/triton/attention/pa_mqa_logits.py \
+    aiter/ops/triton/_triton_kernels/attention/pa_mqa_logits.py
+
+ENV PYTHONPATH=/opt:/opt/sglang/python \
+    SGLANG_USE_AITER=1 \
+    AITER_FORCE_A8W4=1
+WORKDIR /opt/sglang
+LABEL org.r9700.sglang.commit="${SGLANG_COMMIT}" \
+      org.r9700.lmcache.commit="${LMCACHE_COMMIT}" \
+      org.r9700.lmcache.glm-sync-events="1" \
+      org.r9700.lmcache.native-eviction-locks="1" \
+      org.r9700.sglang.candidate="unqualified"
+ENTRYPOINT ["python3", "-m", "sglang.launch_server"]
