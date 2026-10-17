@@ -242,6 +242,78 @@ such a report remains diagnostic and records both image IDs.
 Even a passing comparison is labelled **diagnostic** until matched completed
 coding/tool tasks and their outputs establish end-to-end correctness and time.
 
+### 2026-10-17 vLLM MTP depth screen (C1/8K only)
+
+The opt-in `MTP_DEPTH=4|5` launcher was tested against its unchanged MTP3
+default using the same pinned vLLM image (`e97573215`, image ID beginning
+`c6cf5181`), checkpoint, TP8, FP8 KV, 4.125 GiB GPU KV per rank, NSEQ1,
+`MAXLEN=131072`, GPU APC and **no LMCache**. The necessary decode graph sizes
+were 4/5/6 for MTP3/4/5. This was a text-only coding screen: actual 8192-token
+prompt, high thinking, temperature 1.0, top-p 0.95, top-k disabled, natural
+EOS, 4096-token output budget, one excluded warmup and the same three measured
+seeds. Each generated answer was retained and checked by the 169-case code
+oracle. GPU identity, topology and loaded PCIe links passed the preflight for
+each variant. Raw data and frozen protocol are ignored by Git in
+`bench/results/glm-vllm-mtp345-c1-8k-v2-20261017/`.
+
+| vLLM depth | Correct completed | Decode tok/s, three measured requests | Median decode | Median accepted/drafted | Median TTFT |
+|---|---:|---|---:|---:|---:|
+| MTP3 | 3/3 | 69.8, 72.1, 71.4 | 71.4 | 0.739 | 0.77 s |
+| MTP4 | 3/3 | 69.5, 66.8, 76.0 | 69.5 | 0.606 | 0.77 s |
+| MTP5 | 3/3 | 68.6, 66.3, 68.9 | 68.6 | 0.569 | 0.77 s |
+
+Each measured request had 6912/8192 GPU-prefix hit tokens and zero
+preemptions. The MTP5 TTFT median hides one 12.54 s measured outlier; all
+attempts remain in the raw results. A separate bounded API-contract smoke
+passed answer, streaming and tool-call checks for MTP4 and MTP5. This small
+screen does not establish a speed difference, 128K/C4 quality, external cache
+compatibility or an end-to-end coding gain; it gives no reason to promote
+MTP4/5 over MTP3 or the production K4 baseline. The first MTP4 attempt is
+retained in `bench/results/glm-vllm-mtp345-c1-8k-20261017/` as diagnostic:
+its 7000-token APC-hit threshold incorrectly rejected the observed 6912-hit
+geometry, so all three depths were run under a fresh protocol with the
+predeclared 80% threshold. In this vLLM build, the relevant attention
+backends do not support fused multi-step draft decode; metadata is rebuilt
+between draft steps. This is a plausible limit on deeper MTP, not a measured
+causal attribution.
+After the exclusive screen, the original K4 model container was restarted
+against its still-running LMCache service; `/health` and a bounded
+answer/stream/tool API smoke passed. The smoke is not a performance rerun.
+
+### 2026-10-17 DFlash K4 control on the same C1/8K screen
+
+`bench/glm_k4_depth_screen.py` reused the frozen MTP screen's exact corpus,
+8192-token prompt, measured seeds, high thinking, sampling, natural EOS,
+4096-token budget, one excluded warmup, three measured requests, code oracle
+and streaming decode calculation. K4 used the **same image ID** as MTP3/4/5,
+TP8, NSEQ1, 131072 max model length, 2048 max batched tokens, 4.125 GiB
+FP8 KV per GPU and GPU APC without LMCache. Only the speculative runtime and
+its required decode graph size differed. The PCIe mapping, topology, link
+capabilities and power limits matched the MTP3 preflight; negotiated links
+passed the loaded check. Raw protocol, attempts, outputs and PCIe evidence are
+in ignored `bench/results/glm-vllm-k4-mtp345-c1-8k-20261017/`.
+
+| vLLM variant | Correct completed | Measured decode tok/s | Median decode | Median TTFT |
+|---|---:|---|---:|---:|
+| DFlash K4 | 3/3 | 74.8, 77.6, 76.4 | **76.4** | 0.38 s |
+| MTP3 | 3/3 | 69.8, 72.1, 71.4 | 71.4 | 0.77 s |
+| MTP4 | 3/3 | 69.5, 66.8, 76.0 | 69.5 | 0.77 s |
+| MTP5 | 3/3 | 68.6, 66.3, 68.9 | 68.6 | 0.77 s |
+
+All K4 requests completed correctly, with zero preemptions. Its measured APC
+hits were 8064/8192 versus 6912/8192 for MTP; therefore the warm TTFT
+difference is **not a matched cache-hit comparison**. Decode here excludes
+TTFT and the first text-bearing stream update, but the sampled completions
+have different lengths and this is only a three-request C1/8K screen. The
+observed K4 median is higher, not a demonstrated 128K/C4 or end-to-end gain.
+This K4 control used the MTP comparison image without LMCache; the deployed
+K4 + LMCache image remains `r9700/vllm:glm53-lmcache055-lru`, both pinned to
+vLLM `e97573215`, rather than an unqualified newer upstream release. After
+the control, the deployed K4 container and its existing cache were restored;
+`/health` and the bounded API-contract smoke passed. The first restoration
+smoke invocation used an incorrect URL base and failed with HTTP 404 before
+reaching the model; that attempt is retained beside the corrected smoke run.
+
 The pre-inference frozen corpus, tokenizer hashes, profile/client hashes and
 comparison settings are in ignored
 `bench/results/glm-mtp3-k4-20261017-prep/protocol.json` and `corpus/`.

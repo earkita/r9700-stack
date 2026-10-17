@@ -1,5 +1,6 @@
 #!/bin/bash
-# Experimental GLM-5.3-Flash C4 + checkpoint MTP3 + LMCache, 8x R9700.
+# Experimental GLM-5.3-Flash C4 + checkpoint MTP + LMCache, 8x R9700.
+# MTP_DEPTH=3 remains the comparison baseline; depths 4/5 are opt-in.
 # Nadpisania KEY=value jak w flashnext.sh. Podglad: DRYRUN=1.
 # Jeden start: osobna usluga LMCache, potem GLM przez wspolny serve.sh.
 # Nie uruchamiaj rownolegle z K4; kandydat wymaga testow poprawnosci.
@@ -10,6 +11,7 @@ NSEQ=${NSEQ:-4}
 MAXLEN=${MAXLEN:-auto}
 KV_OFFLOAD=${KV_OFFLOAD:-lmcache} # 0 = APC w VRAM; lmcache = eksperymentalny RAM + NVMe.
 REFERENCE=${REFERENCE:-0} # 1 = target-only kontrola poprawnosci, bez spekulacji.
+MTP_DEPTH=${MTP_DEPTH:-3} # 3 = sprawdzony kandydat; 4/5 = odrebne eksperymenty.
 KV_CACHE_RAM_GB=${KV_CACHE_RAM_GB:-128}
 KV_CACHE_DISK_GB=${KV_CACHE_DISK_GB:-512}
 KV_CACHE_START_TIMEOUT=${KV_CACHE_START_TIMEOUT:-600} # Pelna alokacja duzej puli RAM moze trwac dluzej niz minute.
@@ -20,12 +22,21 @@ for arg in "$@"; do
     MAXLEN=*) MAXLEN=${arg#*=} ;;
     KV_OFFLOAD=*) KV_OFFLOAD=${arg#*=} ;;
     REFERENCE=*) REFERENCE=${arg#*=} ;;
+    MTP_DEPTH=*) MTP_DEPTH=${arg#*=} ;;
     IMG=*|NAME=*|DRYRUN=*|DOCKER_SUDO=*|GPUS=*|KV_CACHE_*=*) export "$arg" ;;
     MTP=*|DRAFT=*|SPEC=*|SPEC_METHOD=*|DRAFT_KV_DTYPE=*|SPEC_EXTRA=*)
-      echo 'This profile fixes checkpoint MTP3; use REFERENCE=1 only for a target-only correctness control.' >&2
+      echo 'Set MTP_DEPTH=3, 4 or 5; use REFERENCE=1 only for target-only control.' >&2
       exit 2 ;;
   esac
 done
+case "$MTP_DEPTH" in
+  3|4|5) ;;
+  *) echo 'MTP_DEPTH must be 3, 4 or 5.' >&2; exit 2 ;;
+esac
+if [ "$REFERENCE" = 1 ] && [ "$MTP_DEPTH" != 3 ]; then
+  echo 'Target-only reference retains the MTP3 comparison geometry.' >&2
+  exit 2
+fi
 case "$REFERENCE" in
   0) default_name=glm53-flash-c4-mtp3-lmcache
      default_cache_name=glm53-kv-cache-mtp3
@@ -37,6 +48,15 @@ case "$REFERENCE" in
      default_port=8082 default_cache_port=5557 default_metrics_port=9093 mtp_steps= ;;
   *) echo 'REFERENCE must be 0 (MTP3) or 1 (target-only correctness control).' >&2; exit 2 ;;
 esac
+if [ "$REFERENCE" = 0 ] && [ "$MTP_DEPTH" != 3 ]; then
+  default_name="glm53-flash-c4-mtp${MTP_DEPTH}-lmcache"
+  default_cache_name="glm53-kv-cache-mtp${MTP_DEPTH}"
+  default_namespace="glm53-e975-fp8-mtp${MTP_DEPTH}-v1"
+  default_port="808${MTP_DEPTH}"
+  default_cache_port="556${MTP_DEPTH}"
+  default_metrics_port="910${MTP_DEPTH}"
+  mtp_steps=$MTP_DEPTH
+fi
 KV_CACHE_NAME=${KV_CACHE_NAME:-$default_cache_name}
 KV_CACHE_PORT=${KV_CACHE_PORT:-$default_cache_port}
 KV_CACHE_NAMESPACE=${KV_CACHE_NAMESPACE:-$default_namespace}
@@ -50,9 +70,13 @@ case "$VLLM_SERVER_DEV_MODE" in
   *) echo 'VLLM_SERVER_DEV_MODE must be 0 or 1.' >&2; exit 2 ;;
 esac
 case "$NSEQ" in
-  1) graphs=4 ;;
-  2) graphs=4,8 ;;
-  4) graphs=4,8,12,16 ;;
+  1|2|4)
+    graph_rows=$((mtp_steps + 1))
+    [ "$REFERENCE" = 0 ] || graph_rows=4
+    graphs=$graph_rows
+    for ((row=2; row<=NSEQ; row++)); do
+      graphs+=",$((row * graph_rows))"
+    done ;;
   *) echo 'NSEQ must be 1, 2 or 4.' >&2; exit 2 ;;
 esac
 [ "$MAXLEN" = auto ] && MAXLEN=-1
@@ -94,10 +118,10 @@ env \
   PREFIX_CACHE=1 `# APC: ponowne wykorzystanie wspolnych prefiksow.` \
   KV_CACHE_DIR="${KV_CACHE_DIR-/mnt/ai/cache/}" `# Katalog NVMe; ten sam podaj osobnemu launcherowi glm-kv-cache.sh.` \
   OFFLOAD_GB=0 `# Wagi pozostaja na GPU; KV_OFFLOAD dotyczy tylko cache prefiksow.` \
-  MTP="$mtp_steps" `# 3: checkpoint NextN; puste w target-only kontroli.` \
+  MTP="$mtp_steps" `# Checkpoint NextN; puste w target-only kontroli.` \
   EAGER=0 `# Uzywaj grafow, zamiast wymuszac eager.` \
   CGMODE=FULL_DECODE_ONLY `# Grafy tylko dla decode.` \
-  CGSIZES="$graphs" `# MTP3: C1=4; C2=4,8; C4=4,8,12,16.` \
+  CGSIZES="$graphs" `# Capture sizes = (depth + 1) * concurrency.` \
   REASONING_PARSER=glm45 `# Oddzielanie thinking od odpowiedzi.` \
   TOOL_CALL_PARSER=glm47 `# Parsowanie wywolan narzedzi.` \
   LMONLY= `# Tekst + obrazy; fallback glm-5.3-flash.sh pozostaje tekstowy.` \

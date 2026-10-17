@@ -136,6 +136,32 @@ class Launcher(unittest.TestCase):
                                         env=clean, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 2)
 
+    def test_mtp4_and_mtp5_are_opt_in_with_separate_ports_and_graphs(self):
+        profile = ROOT / "serve/baseline-earkita/glm/glm-5.3-flash-c4-mtp3-lmcache.sh"
+        clean = {k: v for k, v in os.environ.items()
+                 if not k.startswith(("R9K_", "VLLM_", "KV_CACHE_", "MTP_DEPTH"))}
+        for depth, port in ((4, "8084"), (5, "8085")):
+            with self.subTest(depth=depth):
+                out = subprocess.check_output([
+                    "bash", str(profile), "DRYRUN=1", "KV_OFFLOAD=0",
+                    f"MTP_DEPTH={depth}", "NSEQ=4", "MAXLEN=131072",
+                ], env=clean, text=True)
+                args = shlex.split(out)
+                self.assertIn(f"glm53-flash-c4-mtp{depth}-lmcache", args)
+                self.assertEqual(args[args.index("--port") + 1], port)
+                spec = json.loads(args[args.index("--speculative-config") + 1])
+                self.assertEqual(spec, {"method": "mtp", "num_speculative_tokens": depth})
+                graphs = json.loads(args[args.index("--compilation-config") + 1])
+                self.assertEqual(graphs["cudagraph_capture_sizes"],
+                                 [(depth + 1) * c for c in range(1, 5)])
+        for bad in ("MTP_DEPTH=2", "MTP_DEPTH=6", "MTP_DEPTH=bad",
+                    "MTP_DEPTH=4 REFERENCE=1"):
+            with self.subTest(bad=bad):
+                result = subprocess.run(["bash", str(profile), "DRYRUN=1",
+                                         *bad.split()], env=clean, text=True,
+                                        capture_output=True)
+                self.assertEqual(result.returncode, 2)
+
     def test_dflash_is_separate_and_explicit(self):
         args = self.launch("glm-5.3-flash-c2.sh", MODEL="/models/local GLM")
         spec = json.loads(args[args.index("--speculative-config") + 1])
