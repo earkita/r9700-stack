@@ -1,0 +1,44 @@
+diff --git a/python/sglang/srt/layers/attention/dsa/dsa_indexer.py b/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
+index 26a457f..ca976df 100644
+--- a/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
++++ b/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import contextlib
+ import logging
++from functools import lru_cache
+ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
+ 
+ import torch
+@@ -190,9 +191,30 @@ def _broadcast_indexer_topk_from_rank0(
+     return topk_indices
+ 
+ 
++@lru_cache(maxsize=8)
++def _gfx1201_hadamard_matrix(hidden_size: int, device: str) -> torch.Tensor:
++    # Correctness fallback for the ROCm image, which does not ship the CUDA
++    # fast_hadamard_transform extension. Keep the matrix on the input device.
++    matrix = torch.tensor(
++        [[1.0 if ((i & j).bit_count() & 1) == 0 else -1.0
++          for j in range(hidden_size)] for i in range(hidden_size)],
++        dtype=torch.float32,
++    )
++    return (matrix * hidden_size**-0.5).to(device)
++
++
+ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+     if _is_hip:
+-        from fast_hadamard_transform import hadamard_transform
++        try:
++            from fast_hadamard_transform import hadamard_transform
++        except ImportError:
++            arch = torch.cuda.get_device_properties(x.device).gcnArchName.split(":")[0]
++            if arch != "gfx1201":
++                raise
++            hidden_size = x.size(-1)
++            assert hidden_size > 0 and hidden_size & (hidden_size - 1) == 0
++            matrix = _gfx1201_hadamard_matrix(hidden_size, str(x.device))
++            return torch.matmul(x.float(), matrix).to(x.dtype)
+     elif _is_xpu:
+         from sgl_kernel import hadamard_transform
+     else:

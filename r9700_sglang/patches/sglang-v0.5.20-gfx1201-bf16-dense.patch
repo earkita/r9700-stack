@@ -1,0 +1,18 @@
+diff --git a/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4.py b/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4.py
+--- a/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4.py
++++ b/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4.py
+@@ -687,4 +687,14 @@ class QuarkW4A4MXFp4(QuarkScheme):
+         if getattr(layer, "dequantized_bf16", False):
+             if isinstance(x, tuple):
+                 x = x[0]
++            # Opt-in gfx1201 decode path. Packed checkpoint weights were
++            # dequantized once at load time; do not change prefill arithmetic.
++            if (
++                get_bool_env_var("R9K_SGLANG_BF16_DENSE_GEMV", "false")
++                and x.ndim == 2 and x.shape[0] == 1
++                and x.is_contiguous() and layer.weight.is_contiguous()
++                and layer.weight.shape[0] >= 128
++            ):
++                from r9700_sglang.bf16_dense import linear_one_row
++                return linear_one_row(x, layer.weight, bias)
+             return torch.nn.functional.linear(x, layer.weight, bias)

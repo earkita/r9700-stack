@@ -90,6 +90,15 @@ thinking. For each comparison, choose and record one effective effort
 default), identically in every leg. Sampling and effort are independent.
 Requesting `high` does not guarantee nonzero reasoning tokens.
 
+For speculative runtimes, record the **effective verify sampler**, not only the
+request's temperature/top-p. In pinned SGLang v0.5.20, HIP EAGLE verification
+can take an unconditional argmax branch even for temperature 1. Save the actual
+image/source and resolved rejection-sampling setting. A sampled prefill token
+does not prove that subsequent verified tokens follow the requested sampling.
+Label a forced-greedy run explicitly; it cannot validate checkpoint-sampling
+quality or sampling equivalence with a target-only or other speculative server.
+Qualify a sampling fix separately before using it in a matched speed comparison.
+
 For example, the following is a **quality request body**, not a command to
 run a benchmark. The 8192-token budget is an initial pilot choice, not a
 guarantee that thinking will finish:
@@ -246,6 +255,16 @@ hashes and reproduction annotations. No inference or server change occurs.
 
 ### Mandatory comparison protocol
 
+For fixed-output decode tests, use a prompt that naturally needs at least
+the requested output budget. Forcing a short NIAH key or arithmetic answer
+to 256 tokens with EOS ignored can measure repeated answers or generation
+after an end-of-turn token, with artificially favorable speculative acceptance.
+Retain and inspect outputs; expose/audit generated stop markers where supported.
+Such attempts remain synthetic diagnostics or fail the representative-workload
+gate; do not present them as realistic coding decode. Natural-EOS quality checks
+remain separate. A changed workload or EOS-audit protocol requires both comparison
+legs to be rerun, without reusing the old leg's speed as the reference.
+
 Before running an A/B comparison, save the baseline and candidate identities
 and a frozen protocol. Declare the one intended change; hold the remaining
 conditions constant. Reuse the baseline's actual runner and protocol, not
@@ -261,6 +280,14 @@ just its headline prompt length or sampling settings. Record:
   followed by its warm repeat. Warm APC alone does not establish equivalence.
 - Client/version, metric definitions, runtime/image/commit, target/drafter
   identities, speculation settings, GPU power caps, other load and telemetry.
+
+Finish CPU-heavy preparation (tokenizing long corpora, image builds, large
+trace analysis) before timed model comparisons. These jobs can change host
+scheduling even without GPU access. If one overlaps measured requests, retain
+the job interval and affected request identities and label the affected
+comparison **not comparable**. Do not replace selected samples; use a fresh
+complete matched protocol for a performance claim. Ordinary read-only status
+checks and the matched telemetry observer are separate from such preparation.
 
 Do not shorten one comparison leg to save time and compare it with a longer
 historical baseline. If a protocol change is necessary, rerun **both** variants

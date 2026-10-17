@@ -1,0 +1,32 @@
+diff --git a/python/sglang/kernels/ops/layernorm/mhc.py b/python/sglang/kernels/ops/layernorm/mhc.py
+--- a/python/sglang/kernels/ops/layernorm/mhc.py
++++ b/python/sglang/kernels/ops/layernorm/mhc.py
+@@ -1781,6 +1781,28 @@ def _mhc_pre_torch(
+ ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     import torch.nn.functional as F
+ 
++    # Decode-only experiment: preserve the reference projection/mixing and
++    # replace only the eager Sinkhorn loop. gfx1201 is explicitly gated.
++    import os
++    backend = os.environ.get(
++        "R9K_SGLANG_MHC_BACKEND",
++        "sinkhorn" if os.environ.get("R9K_SGLANG_MHC_SINKHORN", "0") == "1" else "torch",
++    )
++    if backend not in ("torch", "sinkhorn", "vllm_tilelang"):
++        raise ValueError("Unknown R9K_SGLANG_MHC_BACKEND")
++    if backend != "torch" and (
++        residual.shape[0] > 0 and residual.shape[0] <= 32
++    ):
++        arch = torch.cuda.get_device_properties(residual.device).gcnArchName.split(":")[0]
++        if arch != "gfx1201":
++            raise RuntimeError("R9K_SGLANG_MHC_SINKHORN requires gfx1201")
++        from r9700_sglang.mhc import pre, pre_tilelang
++        operator = pre if backend == "sinkhorn" else pre_tilelang
++        return operator(
++            residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
++            hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
++        )
++
+     s, n, h = residual.shape
+     dtype = residual.dtype
+ 

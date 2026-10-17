@@ -1,0 +1,16 @@
+--- a/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py
++++ b/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py
+@@ -692,6 +692,13 @@
+             intermediate_cache2 = _swiglu_silu_clamp_mul(
+                 intermediate_cache1.view(-1, N), gemm1_limit
+             )
++        elif (swiglu_limit is not None and _is_hip
++              and __import__("os").environ.get("R9K_SGLANG_GLM_MTP") == "1"):
++            from r9700_sglang.mtp_fp8 import swiglu_clamped_hip
++
++            assert swiglu_limit == 10 and not filter_expert
++            intermediate_cache2 = swiglu_clamped_hip(
++                intermediate_cache1.view(-1, N), swiglu_limit)
+         elif swiglu_limit is not None:
+             # DeepSeek V4: swiglu clamp before silu_and_mul.
+             # Two paths gated by SGLANG_OPT_SWIGLU_CLAMP_FUSION:

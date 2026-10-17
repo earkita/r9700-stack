@@ -1,0 +1,139 @@
+--- a/python/sglang/srt/function_call/function_call_parser.py
++++ b/python/sglang/srt/function_call/function_call_parser.py
+@@ -262,6 +262,8 @@
+         tool_choice: Union[ToolChoice, Literal["auto", "required"]],
+         parallel_tool_calls: bool = True,
+         thinking_mode: bool = False,
++        response_format: Optional[Dict] = None,
++        close_thinking_prefix: bool = False,
+     ) -> Optional[ToolCallConstraint]:
+         """
+         Returns the appropriate structure constraint for tool calls based on the tool_choice.
+@@ -279,6 +281,28 @@
+             any(tool.function.strict for tool in self.tools)
+             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
+         )
++
++        # Opt-in serving supplies this only for GLM47 non-strict tools + JSON.
++        # Keep failures outside the legacy broad exception handler: never fall
++        # back silently to JSON-only when the union cannot be built.
++        if response_format is not None:
++            if not isinstance(self.detector, Glm47MoeDetector) or not self.detector.use_full_assistant_constraint:
++                raise ValueError("Combined tools+JSON currently requires non-strict GLM47 tools")
++            from r9700_sglang.glm_json_tools import response_schema, compose_grammar
++            functions = [tool.function for tool in self.tools
++                         if not isinstance(tool_choice, ToolChoice)
++                         or tool.function.name == tool_choice.function.name]
++            if not functions or tool_choice == "none":
++                raise ValueError("Combined grammar requires a declared selectable tool")
++            native = generate_glm_grammar(
++                enable_thinking=thinking_mode, functions=functions,
++                special_tokens=GlmSpecialTokenConfig(), chat_template_version="glm47",
++                accommodate_chat_template=True, allow_multiple_assistant_turns=False,
++                required=True, parallel_tool_calls=parallel_tool_calls)
++            grammar = compose_grammar(native, response_schema(response_format),
++                "required" if isinstance(tool_choice, ToolChoice) else tool_choice,
++                close_thinking_prefix=close_thinking_prefix)
++            return ("full_assistant_json_ebnf", grammar)
+ 
+         try:
+             if (
+--- a/python/sglang/srt/entrypoints/openai/protocol.py
++++ b/python/sglang/srt/entrypoints/openai/protocol.py
+@@ -258,6 +258,7 @@
+     Tuple[Literal["json_schema"], Any],  # json_schema can be dict/str/None
+     Tuple[Literal["ebnf"], str],
+     Tuple[Literal["full_assistant_ebnf"], str],
++    Tuple[Literal["full_assistant_json_ebnf"], str],
+ ]
+ 
+ 
+@@ -1166,6 +1167,19 @@
+             sampling_params["structural_tag"] = convert_json_schema_to_str(
+                 self.response_format.model_dump(by_alias=True)
+             )
++
++        if tool_call_constraint and tool_call_constraint[0] == "full_assistant_json_ebnf":
++            if (self.regex or self.ebnf or (not self.tools and not any(getattr(message, "role", None) in ("system", "developer") and getattr(message, "tools", None) for message in self.messages)) or self.tool_choice == "none"
++                    or self.response_format is None
++                    or self.response_format.type not in ("json_object", "json_schema")):
++                raise ValueError("Conflicting or missing inputs for combined GLM47 tools+JSON grammar")
++            # The composed full-assistant EBNF already contains the actual JSON
++            # Schema. Keep response_format available to the chat template, but
++            # never install a second JSON-only mask over the whole generation.
++            sampling_params.pop("json_schema", None)
++            sampling_params["ebnf"] = tool_call_constraint[1]
++            sampling_params["ebnf_full_assistant"] = True
++            return sampling_params
+ 
+         # Check if there are already existing output constraints
+         has_existing_constraints = (
+--- a/python/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -4,6 +4,7 @@
+ import json
+ import logging
+ import math
++import os
+ import time
+ import uuid
+ from collections import OrderedDict
+@@ -1241,13 +1242,32 @@
+             enable_thinking = (request.chat_template_kwargs or {}).get(
+                 "enable_thinking"
+             )
+-            parser = FunctionCallParser(request.tools or [], self.tool_call_parser)
++            glm_json_format = None
++            if (os.environ.get("R9K_SGLANG_GLM_JSON_TOOLS", "0") == "1"
++                    and effective_tools and request.tool_choice != "none"
++                    and request.response_format is not None
++                    and request.response_format.type in ("json_object", "json_schema")):
++                if request.regex or request.ebnf:
++                    raise ValueError("Combined GLM47 tools+JSON cannot also specify regex or ebnf")
++                if request.input_ids is not None:
++                    raise ValueError("Combined GLM47 tools+JSON requires chat messages so its format instruction can be rendered")
++                from r9700_sglang.glm_json_tools import final_format_instruction
++                glm_json_format = request.response_format.model_dump(exclude_none=True, by_alias=True)
++                instruction = final_format_instruction(glm_json_format)
++                request.messages = copy.deepcopy(request.messages)
++                if (request.messages and request.messages[0].role == "system"
++                        and isinstance(request.messages[0].content, str)):
++                    request.messages[0].content += "\n\n" + instruction
++                else:
++                    request.messages.insert(0, ChatCompletionMessageGenericParam(role="system", content=instruction))
++            parser = FunctionCallParser(effective_tools if glm_json_format is not None else request.tools or [], self.tool_call_parser)
+             tool_call_constraint = parser.get_structure_constraint(
+                 request.tool_choice,
+                 parallel_tool_calls=request.parallel_tool_calls,
+                 thinking_mode=True
+                 if enable_thinking is None
+                 else bool(enable_thinking),
++                response_format=glm_json_format,
+             )
+ 
+         # Apply chat template and its stop strings
+@@ -1313,6 +1333,24 @@
+             result = self._apply_jinja_template(request, tools, is_multimodal)
+         else:
+             result = self._apply_conversation_template(request, is_multimodal)
++
++        # The actual GLM-5.3 template keeps <think> open even when its
++        # enable_thinking=False kwarg is ignored. Close that rendered prefix
++        # in the grammar before any tool/JSON token; do not move JSON out of
++        # reasoning after generation or double-close another template.
++        if glm_constraint and glm_json_format is not None:
++            from r9700_sglang.glm_json_tools import thinking_prefix_needs_close
++            if thinking_prefix_needs_close(
++                result.prompt, enable_thinking, prompt_ids=result.prompt_ids,
++                tokenizer=self.tokenizer_manager.tokenizer,
++            ):
++                tool_call_constraint = parser.get_structure_constraint(
++                    request.tool_choice,
++                    parallel_tool_calls=request.parallel_tool_calls,
++                    thinking_mode=False,
++                    response_format=glm_json_format,
++                    close_thinking_prefix=True,
++                )
+ 
+         if tool_call_stop is not None:
+             if isinstance(result.stop, str):

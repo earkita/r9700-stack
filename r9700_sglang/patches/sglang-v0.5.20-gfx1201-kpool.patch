@@ -1,0 +1,124 @@
+diff --git a/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py b/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py
+index 38805f7..2c398e6 100644
+--- a/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py
++++ b/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py
+@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
+     BaseIndexerMetadata,
+     rotate_activation,
+ )
++from sglang.kernels.ops.attention.dsa.paged_mqa_logits import aiter_paged_mqa_logits
+ from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+ from sglang.srt.layers.layernorm import LayerNorm
+ from sglang.srt.layers.utils import MultiPlatformOp
+@@ -24,6 +25,9 @@ if is_cuda():
+     except ImportError as e:
+         deep_gemm = e
+ 
++if is_hip():
++    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits as aiter_fp8_mqa_logits
++
+ if is_npu():
+     try:
+         import custom_ops  # noqa: F401
+@@ -823,11 +827,22 @@ class IndexerKPool(MultiPlatformOp):
+                 block_tables,
+                 seqlens_32,
+                 blocksize,
+-                build_schedule_metadata=not use_tilelang_paged_mqa,
++                build_schedule_metadata=not (use_tilelang_paged_mqa or is_hip()),
+             )
+         )
+         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
+-        if use_tilelang_paged_mqa:
++        if is_hip():
++            logits = aiter_paged_mqa_logits(
++                q_fp8.squeeze(1),
++                kv_cache_fp8,
++                weights,
++                pool_seqlens,
++                pool_block_tables,
++                pool_max_seq_len,
++                preshuffle=False,
++                kv_block_size=block_kv,
++            )
++        elif use_tilelang_paged_mqa:
+             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+                 tilelang_fp8_paged_mqa_logits,
+             )
+@@ -922,14 +937,25 @@ class IndexerKPool(MultiPlatformOp):
+                 scale_out=k_scale,
+             )
+             k_fp8 = k_u8.view(torch.float8_e4m3fn)
+-            logits = deep_gemm.fp8_mqa_logits(
+-                q_fp8[:n_real].contiguous(),
+-                (k_fp8.contiguous(), k_scale.contiguous()),
+-                weights[:n_real].contiguous(),
+-                ks_per_q,
+-                ke_per_q,
+-                clean_logits=True,
+-            )
++            if is_hip():
++                logits = aiter_fp8_mqa_logits(
++                    q_fp8[:n_real].contiguous(),
++                    k_fp8.contiguous(),
++                    k_scale.contiguous(),
++                    weights[:n_real].contiguous(),
++                    ks_per_q,
++                    ke_per_q,
++                    clean_logits=True,
++                )
++            else:
++                logits = deep_gemm.fp8_mqa_logits(
++                    q_fp8[:n_real].contiguous(),
++                    (k_fp8.contiguous(), k_scale.contiguous()),
++                    weights[:n_real].contiguous(),
++                    ks_per_q,
++                    ke_per_q,
++                    clean_logits=True,
++                )
+         else:
+             logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
+ 
+@@ -1154,14 +1180,25 @@ class IndexerKPool(MultiPlatformOp):
+                     and zero_starts_by_batch[i] is not None
+                     else torch.zeros((q_len,), dtype=torch.int32, device=q_fp8.device)
+                 )
+-                local_logits = deep_gemm.fp8_mqa_logits(
+-                    q_fp8[q_slice].contiguous(),
+-                    (k_fp8.contiguous(), k_scale.contiguous()),
+-                    weights[q_slice].contiguous(),
+-                    row_starts,
+-                    local_pool_lens,
+-                    clean_logits=True,
+-                )
++                if is_hip():
++                    local_logits = aiter_fp8_mqa_logits(
++                        q_fp8[q_slice].contiguous(),
++                        k_fp8.contiguous(),
++                        k_scale.contiguous(),
++                        weights[q_slice].contiguous(),
++                        row_starts,
++                        local_pool_lens,
++                        clean_logits=True,
++                    )
++                else:
++                    local_logits = deep_gemm.fp8_mqa_logits(
++                        q_fp8[q_slice].contiguous(),
++                        (k_fp8.contiguous(), k_scale.contiguous()),
++                        weights[q_slice].contiguous(),
++                        row_starts,
++                        local_pool_lens,
++                        clean_logits=True,
++                    )
+             else:
+                 local_logits = torch.empty(
+                     (q_len, 0), dtype=torch.float32, device=q_fp8.device
+@@ -1536,7 +1573,7 @@ class IndexerKPool(MultiPlatformOp):
+         if weights is None:
+             weights = self._get_logits_head_gate(x, q_scale)
+ 
+-        if is_cuda():
++        if is_cuda() or is_hip():
+             if (
+                 forward_batch.forward_mode.is_decode_or_idle()
+                 or forward_batch.forward_mode.is_target_verify()

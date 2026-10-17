@@ -1,0 +1,58 @@
+--- a/python/sglang/srt/mem_cache/unified_radix_cache.py
++++ b/python/sglang/srt/mem_cache/unified_radix_cache.py
+@@ -1,4 +1,6 @@
+ from __future__ import annotations
++
++from r9700_sglang.profile_ranges import profile_range
+ 
+ import atexit
+ import logging
+@@ -552,6 +554,7 @@
+         same_params=["params"],
+         same_results=["result.full_kv_hit_length", "result.swa_host_hit_length"],
+     )
++    @profile_range('cache.lookup')
+     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+         result = self.session.try_match_prefix(params)
+         if result is not None:
+@@ -956,6 +959,7 @@
+         return self.tree_core.dec_host_lock_ref(node_id, params)
+ 
+     @rank_consensus(same_params=["req.rid", "is_insert", "kv_len_to_handle"])
++    @profile_range('cache.persist_finished')
+     def cache_finished_req(
+         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
+     ) -> None:
+@@ -1095,6 +1099,7 @@
+                 self.session_refs.register_session_ref(req)
+ 
+     @rank_consensus(same_params=["req.rid", "chunked"])
++    @profile_range('cache.persist_chunk')
+     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
+         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
+             return
+--- a/python/sglang/srt/mem_cache/unified_cache/components/mamba.py
++++ b/python/sglang/srt/mem_cache/unified_cache/components/mamba.py
+@@ -1,4 +1,6 @@
+ from __future__ import annotations
++
++from r9700_sglang.profile_ranges import profile_range
+ 
+ from collections import defaultdict
+ from typing import TYPE_CHECKING, Callable, Optional, Sequence
+@@ -184,6 +186,7 @@
+ 
+         return result._replace(mamba_branching_seqlen=branching_seqlen)
+ 
++    @profile_range('cache.kda_restore_plan')
+     def finalize_match_result_in_cache(
+         self, params: MatchPrefixParams, result: MatchResult
+     ) -> MatchResult:
+@@ -522,6 +525,7 @@
+         else:
+             self.cache.req_to_token_pool.mamba_allocator.free(mamba_value)
+ 
++    @profile_range('cache.kda_persist_plan')
+     def prepare_for_caching_req(
+         self,
+         req: Req,

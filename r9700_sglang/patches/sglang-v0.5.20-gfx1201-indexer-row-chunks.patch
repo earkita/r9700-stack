@@ -1,0 +1,17 @@
+--- a/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py
++++ b/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py
+@@ -901,6 +901,14 @@
+         weights: torch.Tensor,
+         metadata: BaseIndexerMetadata,
+     ) -> torch.Tensor:
++        # Independent opt-in prefill experiment; decode/verify never enter here.
++        import os
++        if os.environ.get("R9K_SGLANG_INDEXER_PREFILL_ROWS", "0") != "0":
++            from r9700_sglang.indexer_prefill import apply as bounded_prefill
++            selected = bounded_prefill(self, layer_id, q_fp8, weights, metadata)
++            if selected is not None:
++                return selected
++
+         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+             gather_index_k_scale_prefix_into,
+         )

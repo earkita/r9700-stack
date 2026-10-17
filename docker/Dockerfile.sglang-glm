@@ -1,0 +1,214 @@
+# Experimental SGLang GLM-5.3-Flash on 8x gfx1201. Keep separate from vLLM.
+# Both the runtime base and SGLang source are immutable pins.
+FROM vllm/vllm-openai-rocm@sha256:7164f874815b44cfd639126cee25d80a5c4872a6f8e59c4495a2b172cc7e5d15
+
+ARG SGLANG_COMMIT=94602c9c2b7cbdb8efd5c52802dac6a1c180089e
+RUN git clone --filter=blob:none --depth=1 --branch=v0.5.20 https://github.com/sgl-project/sglang.git /opt/sglang \
+ && cd /opt/sglang \
+ && git checkout --detach "$SGLANG_COMMIT" \
+ && test "$(git rev-parse HEAD)" = "$SGLANG_COMMIT"
+
+COPY r9700_sglang/patches/sglang-v0.5.20-gfx1201.patch /tmp/sglang-gfx1201.patch
+RUN cd /opt/sglang \
+ && git apply --check /tmp/sglang-gfx1201.patch \
+ && git apply /tmp/sglang-gfx1201.patch \
+ && git diff --check
+
+# ROCm wheels in the base image must not be replaced by PyPI CUDA wheels.
+# SGLang's torch-free runtime_base declares only Python dependencies.
+RUN python3 -m pip install --no-cache-dir setuptools-scm setuptools-rust \
+ && cd /opt/sglang \
+ && cp python/pyproject_other.toml python/pyproject.toml \
+ && SGLANG_BUILD_RUST_EXTS=none SETUPTOOLS_SCM_PRETEND_VERSION=0.5.20 python3 -m pip install --no-cache-dir --no-build-isolation -e 'python[runtime_base]' \
+ && python3 -m pip install --no-cache-dir --no-deps 'outlines==0.1.11' 'timm==1.0.16'
+
+# Build the ROCm operator package for RDNA4; source and build target are pinned.
+RUN cd /opt/sglang/python/sglang/kernels/aot \
+ && cp pyproject_rocm.toml pyproject.toml \
+ && AMDGPU_TARGET=gfx1201 MAX_JOBS=8 python3 setup_rocm.py install
+
+# GLM checkpoint names omit `language_model.` at runtime. Its first dense
+# MLP layers use FP8 block scales even though the global Quark format is MXFP4.
+COPY r9700_sglang/patches/sglang-v0.5.20-glm-quark-fp8.patch /tmp/sglang-glm-quark-fp8.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-glm-quark-fp8.patch \
+ && git apply /tmp/sglang-glm-quark-fp8.patch
+
+# gfx1201 reports capability major 12; that is not NVIDIA SM120. Avoid the
+# FlashInfer/TRT-LLM DSA buffer when using the requested Triton path on HIP.
+COPY r9700_sglang/patches/sglang-v0.5.20-rocm-dsa.patch /tmp/sglang-rocm-dsa.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-rocm-dsa.patch \
+ && git apply /tmp/sglang-rocm-dsa.patch
+
+# GLM's sparse MLA has no RoPE tail. Skip zero-width Triton loads and dot products.
+COPY r9700_sglang/patches/sglang-v0.5.20-dsa-zero-tail.patch /tmp/sglang-dsa-zero-tail.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-dsa-zero-tail.patch \
+ && git apply /tmp/sglang-dsa-zero-tail.patch
+
+# The generic AITER Triton FP8 group quantizer is also required on gfx1201.
+COPY r9700_sglang/patches/sglang-v0.5.20-rocm-fp8-quant-import.patch /tmp/sglang-rocm-fp8-quant-import.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-rocm-fp8-quant-import.patch \
+ && git apply /tmp/sglang-rocm-fp8-quant-import.patch
+
+# SGLang's ROCm indexer expects a CUDA Hadamard package. Use a checked
+# reference transform for gfx1201 until a native kernel is qualified.
+COPY r9700_sglang/patches/sglang-v0.5.20-gfx1201-hadamard.patch /tmp/sglang-gfx1201-hadamard.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-gfx1201-hadamard.patch \
+ && git apply /tmp/sglang-gfx1201-hadamard.patch
+
+# Match SGLang's KPool=4 metadata and use AITER FP8 MQA on ROCm instead of
+# DeepGEMM's CUDA-only paged/ragged logits kernels.
+COPY r9700_sglang/patches/sglang-v0.5.20-gfx1201-kpool.patch /tmp/sglang-gfx1201-kpool.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-gfx1201-kpool.patch \
+ && git apply /tmp/sglang-gfx1201-kpool.patch
+
+# The fused pooled top-k selector includes CUDA headers. Keep its token-index
+# expansion on GPU with a ROCm PyTorch selector until a fused HIP path is tested.
+COPY r9700_sglang/patches/sglang-v0.5.20-gfx1201-kpool-topk.patch /tmp/sglang-gfx1201-kpool-topk.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-gfx1201-kpool-topk.patch \
+ && git apply /tmp/sglang-gfx1201-kpool-topk.patch
+
+# Isolated GLM loader diagnostic. This patch is separate so a loader fix does
+# not force the Python dependency and HIP-extension layers to rebuild.
+COPY r9700_sglang/patches/sglang-v0.5.20-glm-loader-diagnostic.patch /tmp/sglang-glm-loader.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-glm-loader.patch \
+ && git apply /tmp/sglang-glm-loader.patch
+
+# AITER's generic FP4 MoE returned all-zero output on gfx1201 in the
+# real-shape numerical probe. Keep the isolated packed GEMV fallback here.
+COPY r9700_sglang/patches/sglang-v0.5.20-gfx1201-packed-moe.patch /tmp/sglang-gfx1201-packed-moe.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-gfx1201-packed-moe.patch \
+ && git apply /tmp/sglang-gfx1201-packed-moe.patch
+
+# Opt-in one-row dense BF16 GEMV after the load-time Quark MXFP4 dequant.
+COPY r9700_sglang/patches/sglang-v0.5.20-gfx1201-bf16-dense.patch /tmp/sglang-gfx1201-bf16-dense.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-gfx1201-bf16-dense.patch \
+ && git apply /tmp/sglang-gfx1201-bf16-dense.patch
+COPY r9700_sglang/__init__.py r9700_sglang/packed_moe.py r9700_sglang/bf16_dense.py r9700_sglang/hip_w4a4.py /opt/r9700_sglang/
+
+# Reuse only the audited gfx1201 MoE source from the vLLM plugin. The W4A4
+# C1 entry consumes the original Quark layout; it stays opt-in in SGLang.
+COPY kernels/r9k_moe_mxfp4a8.hip /opt/r9700_sglang/r9k_moe_mxfp4a8.hip
+RUN hipcc -O3 -std=c++17 -fPIC -DNDEBUG --offload-arch=gfx1201 \
+    -ffp-contract=off -shared /opt/r9700_sglang/r9k_moe_mxfp4a8.hip \
+    -o /opt/r9700_sglang/libr9k_moe.so \
+ && nm -D /opt/r9700_sglang/libr9k_moe.so | grep -q ' T r9k_moe_mxfp4a4_c1$' \
+ && ! grep -q -a hidden_hostcall_buffer /opt/r9700_sglang/libr9k_moe.so
+
+# Isolated opt-in: replace the eager reference Sinkhorn loop for decode only.
+COPY r9700_sglang/mhc.py /opt/r9700_sglang/mhc.py
+COPY r9700_sglang/patches/sglang-v0.5.20-gfx1201-mhc-sinkhorn.patch /tmp/sglang-mhc-sinkhorn.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-mhc-sinkhorn.patch \
+ && git apply /tmp/sglang-mhc-sinkhorn.patch
+
+# Keep a shared KPool page table; map query rows inside the integer kernel.
+# Materializing one full-context page-table row per prefill token costs GiBs.
+COPY r9700_sglang/kpool.py /opt/r9700_sglang/kpool.py
+COPY r9700_sglang/patches/sglang-v0.5.20-gfx1201-shared-kpool-map.patch /tmp/sglang-shared-kpool-map.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-shared-kpool-map.patch \
+ && git apply /tmp/sglang-shared-kpool-map.patch
+
+ENV PYTHONPATH=/opt:/opt/sglang/python \
+    SGLANG_USE_AITER=1 \
+    AITER_FORCE_A8W4=1
+WORKDIR /opt/sglang
+ENTRYPOINT ["python3", "-m", "sglang.launch_server"]
+
+# Quark metadata keeps checkpoint names; NextN constructs model.decoder and
+# model.eh_proj. Keep exclusions and per-layer formats, including the MTP head.
+COPY r9700_sglang/mtp_names.py /opt/r9700_sglang/mtp_names.py
+COPY r9700_sglang/patches/sglang-v0.5.20-glm-nextn-quark-names.patch /tmp/sglang-nextn-quark-names.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-nextn-quark-names.patch \
+ && git apply /tmp/sglang-nextn-quark-names.patch
+
+COPY r9700_sglang/mtp_names.py r9700_sglang/mtp_fp8.py /opt/r9700_sglang/
+COPY r9700_sglang/patches/sglang-v0.5.20-glm-nextn-block-fp8.patch /tmp/sglang-nextn-block-fp8.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-nextn-block-fp8.patch \
+ && git apply /tmp/sglang-nextn-block-fp8.patch
+
+COPY r9700_sglang/patches/sglang-v0.5.20-glm-nextn-loader-coverage.patch /tmp/sglang-nextn-loader-coverage.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-nextn-loader-coverage.patch \
+ && git apply /tmp/sglang-nextn-loader-coverage.patch
+
+COPY r9700_sglang/mtp_fp8.py /opt/r9700_sglang/mtp_fp8.py
+COPY r9700_sglang/patches/sglang-v0.5.20-glm-nextn-hip-activation.patch /tmp/sglang-nextn-hip-activation.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-nextn-hip-activation.patch \
+ && git apply /tmp/sglang-nextn-hip-activation.patch
+
+COPY r9700_sglang/patches/sglang-v0.5.20-glm-nextn-kpool-verify.patch /tmp/sglang-nextn-kpool-verify.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-nextn-kpool-verify.patch \
+ && git apply /tmp/sglang-nextn-kpool-verify.patch
+
+# Disabled by default; snapshots synchronize and are forbidden in throughput.
+COPY r9700_sglang/mtp_trace.py /opt/r9700_sglang/mtp_trace.py
+COPY r9700_sglang/patches/sglang-v0.5.20-glm-nextn-trace.patch /tmp/sglang-nextn-trace.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-nextn-trace.patch \
+ && git apply /tmp/sglang-nextn-trace.patch
+
+COPY r9700_sglang/mtp_trace.py /opt/r9700_sglang/mtp_trace.py
+COPY r9700_sglang/patches/sglang-v0.5.20-glm-nextn-attention-trace.patch /tmp/sglang-nextn-attention-trace.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-nextn-attention-trace.patch \
+ && git apply /tmp/sglang-nextn-attention-trace.patch
+
+# HIP verify must fill the allocated KPool plan, including historical lengths.
+COPY r9700_sglang/patches/sglang-v0.5.20-glm-nextn-kpool-plan.patch /tmp/sglang-nextn-kpool-plan.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-nextn-kpool-plan.patch \
+ && git apply /tmp/sglang-nextn-kpool-plan.patch
+
+# Opt-in grouped W4A4 prefill experiment. The existing batch HIP entry keeps
+# per-row/group activation scales; defaults preserve packed MoE and MTP3.
+COPY r9700_sglang/prefill_moe.py r9700_sglang/hip_w4a4.py r9700_sglang/packed_moe.py /opt/r9700_sglang/
+RUN nm -D /opt/r9700_sglang/libr9k_moe.so | grep -q ' T r9k_moe_mxfp4a4_batch$'
+
+# Host annotations for separate prefill traces. Disabled decorators return the
+# original function; never enable these ranges in unprofiled speed comparisons.
+COPY r9700_sglang/profile_ranges.py /opt/r9700_sglang/profile_ranges.py
+COPY r9700_sglang/patches/sglang-v0.5.20-glm-profile-ranges.patch /tmp/sglang-glm-profile-ranges.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-glm-profile-ranges.patch \
+ && git apply /tmp/sglang-glm-profile-ranges.patch
+
+# Independent, opt-in KPool query-row memory guard. Never enable alongside the
+# first MoE experiment; large chunks need separate numerical/model validation.
+COPY r9700_sglang/indexer_prefill.py /opt/r9700_sglang/indexer_prefill.py
+COPY r9700_sglang/patches/sglang-v0.5.20-gfx1201-indexer-row-chunks.patch /tmp/sglang-indexer-row-chunks.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-indexer-row-chunks.patch \
+ && git apply /tmp/sglang-indexer-row-chunks.patch
+LABEL org.r9700.sglang.indexer-prefill-rows="1" \
+      org.r9700.sglang.grouped-prefill="1"
+
+# The pinned default cache is UnifiedRadixCache; legacy-only ranges miss its
+# lookup/persist path. Opt-in host annotations, disabled serving path unchanged.
+COPY r9700_sglang/patches/sglang-v0.5.20-unified-cache-profile-ranges.patch /tmp/sglang-unified-cache-profile.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-unified-cache-profile.patch \
+ && git apply /tmp/sglang-unified-cache-profile.patch
+LABEL org.r9700.sglang.unified-cache-profile="1"
+
+# Opt-in diagnostic child-start workaround for inherited ROCm profiler flags.
+# Disabled by default; runtime kernels, spawn method and math stay unchanged.
+COPY r9700_sglang/profile_worker_env.py /opt/r9700_sglang/profile_worker_env.py
+COPY r9700_sglang/patches/sglang-v0.5.20-profile-worker-env.patch /tmp/sglang-profile-worker-env.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-profile-worker-env.patch \
+ && git apply /tmp/sglang-profile-worker-env.patch
+LABEL org.r9700.sglang.profile-worker-env="1"
+
+# Separate correctness candidate: complete upstream PR #37134, including
+# draft-proposal graph lifetime and invalid-probability guards. Existing images
+# and default builds retain their baseline behavior until model qualification.
+ARG R9K_ROCM_EAGLE_SAMPLING_FIX=0
+COPY r9700_sglang/patches/sglang-v0.5.20-rocm-eagle-sampling.patch /tmp/sglang-rocm-eagle-sampling.patch
+RUN case "$R9K_ROCM_EAGLE_SAMPLING_FIX" in \
+      0) ;; \
+      1) cd /opt/sglang \
+         && git apply --check /tmp/sglang-rocm-eagle-sampling.patch \
+         && git apply /tmp/sglang-rocm-eagle-sampling.patch ;; \
+      *) echo "R9K_ROCM_EAGLE_SAMPLING_FIX must be 0 or 1" >&2; exit 1 ;; \
+    esac
+LABEL org.r9700.sglang.rocm-eagle-sampling-enabled="${R9K_ROCM_EAGLE_SAMPLING_FIX}" \
+      org.r9700.sglang.rocm-eagle-sampling-source="7eedd57ab0970dab586fa8ab00d4e4de93392ff5"
+
+# Independent prefill post-mixing candidate. Runtime defaults to Torch; the
+# Triton path needs R9K_SGLANG_MHC_POST=triton and keeps decode/verify unchanged.
+COPY r9700_sglang/mhc_post.py /opt/r9700_sglang/mhc_post.py
+COPY r9700_sglang/patches/sglang-v0.5.20-gfx1201-mhc-post.patch /tmp/sglang-mhc-post.patch
+RUN cd /opt/sglang && git apply --check /tmp/sglang-mhc-post.patch \
+ && git apply /tmp/sglang-mhc-post.patch
+LABEL org.r9700.sglang.mhc-post="1"

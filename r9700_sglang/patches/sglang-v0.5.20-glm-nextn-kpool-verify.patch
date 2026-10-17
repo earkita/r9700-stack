@@ -1,0 +1,16 @@
+--- a/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py
++++ b/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py
+@@ -1325,7 +1325,12 @@
+         enable_dual_stream: bool,
+         return_indices: bool = True,
+     ) -> Optional[torch.Tensor]:
+-        assert is_cuda(), "DSA kpool target_verify is CUDA-only"
++        if not is_cuda():
++            import os
++
++            if not (is_hip() and os.environ.get("R9K_SGLANG_GLM_MTP") == "1"
++                    and torch.cuda.get_device_properties(x.device).gcnArchName.split(":")[0] == "gfx1201"):
++                raise RuntimeError("DSA KPool verify requires CUDA or the explicit gfx1201 GLM MTP adapter")
+         plan = metadata.attn_metadata.kpool_write_plan
+         assert plan is not None, "DSA kpool target_verify requires kpool_write_plan"
+         num_draft_tokens = plan.num_draft_tokens

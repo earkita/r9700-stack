@@ -13,6 +13,16 @@ def events(*items):
 
 
 class Stream(unittest.TestCase):
+    def test_null_tool_calls_in_text_stream(self):
+        result = api.collect_stream(events(
+            {"choices": [{"delta": {"content": "12", "tool_calls": None}}]},
+            {"choices": [{"delta": {"tool_calls": None}, "finish_reason": "stop"}],
+             "usage": {"completion_tokens": 1}}, "[DONE]"))
+        self.assertEqual(result["content"], "12")
+        self.assertEqual(result["tool_calls"], [])
+        self.assertEqual(result["finish_reason"], "stop")
+        self.assertEqual(result["usage"]["completion_tokens"], 1)
+
     def test_tool_fragments(self):
         stream = events(
             {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1",

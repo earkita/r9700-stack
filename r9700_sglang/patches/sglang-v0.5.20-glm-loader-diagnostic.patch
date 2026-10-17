@@ -1,0 +1,90 @@
+diff --git a/python/sglang/srt/models/glm5_next.py b/python/sglang/srt/models/glm5_next.py
+index c6ec665..a9c385d 100644
+--- a/python/sglang/srt/models/glm5_next.py
++++ b/python/sglang/srt/models/glm5_next.py
+@@ -1423,6 +1423,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
+ 
+         params_dict = dict(self.named_parameters())
+         weight_names = []
++        loaded_params = set()
++        skipped_critical = []
+         for name, loaded_weight in weights:
+             is_visual_weight = "visual" in name
+             if getattr(self, "encoder_only", False) and not is_visual_weight:
+@@ -1500,10 +1502,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
+                 if name.endswith(".bias") and name not in params_dict:
+                     continue
+                 if name not in params_dict:
++                    if name.startswith(("model.layers.0.", "model.layers.1.", "model.layers.2.")):
++                        skipped_critical.append(name)
+                     continue
+                 param = params_dict[name]
+                 weight_loader = param.weight_loader
+                 weight_loader(param, loaded_weight, shard_id)
++                loaded_params.add(name)
+                 break
+             else:
+                 is_expert_weight = False
+@@ -1514,6 +1519,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
+                     is_expert_weight = True
+                     name = name.replace(weight_name, param_name)
+                     if name not in params_dict:
++                        if name.startswith(("model.layers.0.", "model.layers.1.", "model.layers.2.")):
++                            skipped_critical.append(name)
+                         continue
+                     param = params_dict[name]
+                     weight_loader = param.weight_loader
+@@ -1524,6 +1531,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
+                         shard_id=shard_id,
+                         expert_id=expert_id,
+                     )
++                    loaded_params.add(name)
+                     break
+                 else:
+                     if is_expert_weight:
+@@ -1570,11 +1578,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
+                                     param, "weight_loader", default_weight_loader
+                                 )
+                                 weight_loader(param, fused_weight)
++                                loaded_params.add(target)
+                             cached_a_proj.pop(q_a_proj_name, None)
+                             cached_a_proj.pop(kv_a_proj_name, None)
+                         continue
+ 
+                     if name not in params_dict:
++                        if name.startswith(("model.layers.0.", "model.layers.1.", "model.layers.2.")) or name in {"model.embed_tokens.weight", "lm_head.weight"}:
++                            skipped_critical.append(name)
+                         continue
+ 
+                     if name.endswith(".A_log") and loaded_weight.dim() == 1:
+@@ -1584,7 +1595,29 @@ class Glm5NextForConditionalGeneration(nn.Module):
+                     weight_loader = getattr(
+                         param, "weight_loader", default_weight_loader
+                     )
+-                    weight_loader(param, loaded_weight)
++                    try:
++                        weight_loader(param, loaded_weight)
++                        loaded_params.add(name)
++                    except AssertionError as exc:
++                        raise AssertionError(
++                            f"GLM weight load mismatch: {name}, param={tuple(param.shape)}, "
++                            f"checkpoint={tuple(loaded_weight.shape)}"
++                        ) from exc
++
++        if not is_nextn:
++            critical = ("model.layers.0.", "model.layers.1.", "model.layers.2.")
++            missing_all = sorted(name for name in params_dict if name not in loaded_params)
++            missing_critical = sorted(
++                name for name in params_dict
++                if (name.startswith(critical) or name in {"model.embed_tokens.weight", "lm_head.weight"})
++                and name not in loaded_params
++            )
++            logger.warning(
++                "GLM loader coverage: loaded=%d/%d, missing=%d %s, critical missing=%d %s, skipped=%d %s",
++                len(loaded_params), len(params_dict), len(missing_all), missing_all,
++                len(missing_critical), missing_critical[:32],
++                len(skipped_critical), skipped_critical[:32],
++            )
+ 
+         if getattr(self, "encoder_only", False):
+             run_post = False

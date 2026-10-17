@@ -1,0 +1,29 @@
+--- a/python/sglang/srt/layers/attention/dsa/kpool_plan.py
++++ b/python/sglang/srt/layers/attention/dsa/kpool_plan.py
+@@ -17,7 +17,7 @@
+ from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+ from sglang.srt.model_executor.forward_context import get_req_to_token_pool
+ from sglang.srt.runtime_context import get_parallel
+-from sglang.srt.utils import is_cuda
++from sglang.srt.utils import is_cuda, is_hip
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+@@ -732,8 +732,16 @@
+     slots_per_page: int,
+     effective_n_per_batch: Optional[torch.Tensor] = None,
+ ) -> None:
+-    if not _is_kpool_layout_enabled(pool_size, real_page_size) or not is_cuda():
++    if not _is_kpool_layout_enabled(pool_size, real_page_size):
+         return
++    if not is_cuda():
++        import os
++
++        # Allocated verify buffers must be updated on HIP too. Leaving their
++        # initial zeros silently discards all pooled history in target verify.
++        if not (is_hip() and os.environ.get("R9K_SGLANG_GLM_MTP") == "1"
++                and torch.cuda.get_device_properties(write_start.device).gcnArchName.split(":")[0] == "gfx1201"):
++            return
+     is_verify = forward_mode.is_target_verify()
+     is_decode = forward_mode.is_decode_or_idle()
+     is_v2 = forward_mode.is_draft_extend_v2()

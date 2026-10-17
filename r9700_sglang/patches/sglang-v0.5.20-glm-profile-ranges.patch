@@ -1,0 +1,162 @@
+--- a/python/sglang/srt/mem_cache/mamba_radix_cache.py
++++ b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+@@ -18,6 +18,8 @@
+ """
+ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
+ """
++
++from r9700_sglang.profile_ranges import profile_range
+ 
+ import os
+ from array import array
+@@ -500,6 +502,7 @@
+         self.mamba_lru_list = LRUList(mamba=True)
+         self.kv_events.record_all_cleared()
+ 
++    @profile_range('cache.lookup')
+     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+         """Find the matching prefix from the radix tree.
+         Args:
+@@ -543,6 +546,7 @@
+         )
+         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
+ 
++    @profile_range('cache.persist_finished')
+     def cache_finished_req(
+         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+     ) -> None:
+@@ -685,6 +689,7 @@
+ 
+         self.dec_lock_ref(req.last_node)
+ 
++    @profile_range('cache.persist_chunk')
+     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
+         """Cache request when it is unfinished."""
+ 
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -21,6 +21,8 @@
+ """
+ 
+ from __future__ import annotations
++
++from r9700_sglang.profile_ranges import profile_range
+ 
+ import abc
+ import copy
+@@ -1017,6 +1019,7 @@
+             t = self.mamba_cache.temporal
+             t[:, indices] = 0
+ 
++    @profile_range('kda.state_copy')
+     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
+         """Clone mamba state (conv + temporal) from src slots into dst slots.
+ 
+@@ -1544,6 +1547,7 @@
+     def set_ngram_intermediate_context(self, context: torch.Tensor) -> None:
+         self.ngram_pool.set_intermediate_context(context)
+ 
++    @profile_range('kda.restore')
+     def copy_mamba_state(
+         self, src_index: torch.Tensor, dst_index: torch.Tensor
+     ) -> None:
+--- a/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py
++++ b/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py
+@@ -1,4 +1,6 @@
+ from __future__ import annotations
++
++from r9700_sglang.profile_ranges import profile_range
+ 
+ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+ 
+@@ -483,6 +485,7 @@
+ 
+         return compressed_by_batch
+ 
++    @profile_range('kpool.compress_write', attributes=('layer_id',))
+     def _compress_write(
+         self,
+         x,
+@@ -775,6 +778,7 @@
+         num_heads = q_fp8.shape[2]
+         return arch_major == 9 and num_heads not in (32, 64)
+ 
++    @profile_range('indexer.paged', attributes=('layer_id',))
+     def _get_topk_paged(
+         self,
+         forward_batch: ForwardBatch,
+@@ -893,6 +897,7 @@
+         need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
+         return need_chunk, free_mem
+ 
++    @profile_range('indexer.ragged_plan', attributes=('layer_id',))
+     def _get_topk_ragged_kpool_plan(
+         self,
+         forward_batch: ForwardBatch,
+@@ -982,6 +987,7 @@
+             page_table_row_index=page_table_row_index_all,
+         )
+ 
++    @profile_range('indexer.ragged', attributes=('layer_id',))
+     def _get_topk_ragged_kpool(
+         self,
+         forward_batch: ForwardBatch,
+--- a/python/sglang/srt/models/glm5_next.py
++++ b/python/sglang/srt/models/glm5_next.py
+@@ -1,3 +1,5 @@
++from r9700_sglang.profile_ranges import profile_range
++
+ import logging
+ from contextlib import nullcontext
+ from functools import partial
+@@ -520,6 +522,7 @@
+             g_proj_states,
+         )
+ 
++    @profile_range('kda.forward', attributes=('layer_idx',))
+     def forward(
+         self,
+         hidden_states: torch.Tensor,
+@@ -706,6 +709,7 @@
+         else:
+             self.layer_communicator = LayerCommunicator(**shared_kwargs)
+ 
++    @profile_range('mhc.pre', attributes=('layer_id',))
+     def _hc_pre(
+         self, hc_fn, hc_scale, hc_base, hidden_states, out_norm_weight, out_norm_eps
+     ):
+@@ -744,6 +748,7 @@
+             out_norm_eps,
+         )
+ 
++    @profile_range('mhc.post', attributes=('layer_id',))
+     def hc_post(self, hidden_states, residual, h_res, h_post):
+         assert self.config.mhc, "hc_post is only valid when config.mhc=True"
+         return _hc_post_fn(
+@@ -761,6 +766,7 @@
+             and layer_id % self.config.moe_layer_freq == 0
+         )
+ 
++    @profile_range('layer.forward', attributes=('layer_id', 'is_nextn'))
+     def forward(
+         self,
+         positions: torch.Tensor,
+--- a/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py
++++ b/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ from __future__ import annotations
++
++from r9700_sglang.profile_ranges import profile_range
+ 
+ import logging
+ import threading
+@@ -909,6 +911,7 @@
+             # TODO(cwan): refactor other backends
+             pass
+ 
++    @profile_range('moe.w4a4')
+     def apply_weights(
+         self,
+         layer: torch.nn.Module,

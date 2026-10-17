@@ -1,0 +1,1004 @@
+diff --git a/python/sglang/kernels/aot/python/sgl_kernel/__init__.py b/python/sglang/kernels/aot/python/sgl_kernel/__init__.py
+index 2820b649..f6389b27 100644
+--- a/python/sglang/kernels/aot/python/sgl_kernel/__init__.py
++++ b/python/sglang/kernels/aot/python/sgl_kernel/__init__.py
+@@ -16,7 +16,10 @@ else:
+     )
+ 
+     # Initialize the ops library based on current GPU
+-    common_ops = _load_architecture_specific_ops()
++    try:
++        common_ops = _load_architecture_specific_ops()
++    except ImportError:
++        common_ops = None
+ 
+     # Preload the CUDA library to avoid the issue of libcudart.so.12 not found
+     if torch.version.cuda is not None:
+@@ -59,10 +62,14 @@ else:
+         shuffle_rows,
+     )
+     from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
+-    from sgl_kernel.infllm_v2 import (
+-        infllmv2_attn_stage1,
+-        max_pooling_1d_varlen,
+-    )
++    try:
++        from sgl_kernel.infllm_v2 import (
++            infllmv2_attn_stage1,
++            max_pooling_1d_varlen,
++        )
++    except ImportError:
++        infllmv2_attn_stage1 = None
++        max_pooling_1d_varlen = None
+     from sgl_kernel.kvcacheio import (
+         copy_all_layer_kv_cache_cpu,
+         transfer_kv_all_layer,
+diff --git a/python/sglang/kernels/aot/setup_rocm.py b/python/sglang/kernels/aot/setup_rocm.py
+index dbd71555..60121e0b 100644
+--- a/python/sglang/kernels/aot/setup_rocm.py
++++ b/python/sglang/kernels/aot/setup_rocm.py
+@@ -74,9 +74,9 @@ if torch.cuda.is_available():
+ else:
+     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
+ 
+-if amdgpu_target not in ["gfx942", "gfx950", "gfx1250"]:
++if amdgpu_target not in ["gfx942", "gfx950", "gfx1250", "gfx1201"]:
+     print(
+-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942', 'gfx950', or 'gfx1250'."
++        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942', 'gfx950', 'gfx1250', or 'gfx1201'."
+     )
+     sys.exit(1)
+ 
+@@ -89,7 +89,7 @@ fp8_macro = (
+ #   (leaves room for static shared allocations in the kernel).
+ # - gfx95x (MI350) and gfx1250: LDS is larger. Large dynamic budget wastes LDS
+ #   and pins occupancy to 1 block/CU. Keep it small (40KB) for better occupancy.
+-topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 40 * 1024
++topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target in ("gfx942", "gfx1201") else 40 * 1024
+ 
+ hipcc_flags = [
+     "-DNDEBUG",
+diff --git a/python/sglang/kernels/ops/attention/dsa/triton_sparse_mla.py b/python/sglang/kernels/ops/attention/dsa/triton_sparse_mla.py
+index 3a41c126..74e4c8ce 100644
+--- a/python/sglang/kernels/ops/attention/dsa/triton_sparse_mla.py
++++ b/python/sglang/kernels/ops/attention/dsa/triton_sparse_mla.py
+@@ -334,7 +334,8 @@ def _sparse_mla_fwd_split_dim_kernel(
+     s_i = tl.program_id(0)
+ 
+     h = tl.arange(0, H)
+-    dt = tl.arange(0, D_TAIL)
++    if D_TAIL > 0:
++        dt = tl.arange(0, D_TAIL)
+     g = tl.arange(0, _G)
+ 
+     input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
+@@ -346,9 +347,10 @@ def _sparse_mla_fwd_split_dim_kernel(
+         q2 = tl.load(q_row + (2 * _G + g)[None, :]).to(input_type)
+     if NUM_GROUPS >= 4:
+         q3 = tl.load(q_row + (3 * _G + g)[None, :]).to(input_type)
+-    q_tail = tl.load(
+-        q_rope_ptr + s_i * STRIDE_QR_T + h[:, None] * STRIDE_QR_H + dt[None, :]
+-    ).to(input_type)
++    if D_TAIL > 0:
++        q_tail = tl.load(
++            q_rope_ptr + s_i * STRIDE_QR_T + h[:, None] * STRIDE_QR_H + dt[None, :]
++        ).to(input_type)
+ 
+     neg_large = -3.4028234663852886e38
+     m_i = tl.full([H], neg_large, tl.float32)
+@@ -386,9 +388,10 @@ def _sparse_mla_fwd_split_dim_kernel(
+             kv3 = tl.load(
+                 kbase + (3 * _G + g)[None, :], mask=valid[:, None], other=0.0
+             ).to(input_type)
+-        kv_tail = tl.load(
+-            kbase + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
+-        ).to(input_type)
++        if D_TAIL > 0:
++            kv_tail = tl.load(
++                kbase + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
++            ).to(input_type)
+ 
+         qk = tl.dot(q0, tl.trans(kv0))
+         if NUM_GROUPS >= 2:
+@@ -397,7 +400,8 @@ def _sparse_mla_fwd_split_dim_kernel(
+             qk += tl.dot(q2, tl.trans(kv2))
+         if NUM_GROUPS >= 4:
+             qk += tl.dot(q3, tl.trans(kv3))
+-        qk += tl.dot(q_tail, tl.trans(kv_tail))
++        if D_TAIL > 0:
++            qk += tl.dot(q_tail, tl.trans(kv_tail))
+         qk = qk * qk_scale
+         qk = tl.where(valid[None, :], qk, neg_large)
+ 
+@@ -615,7 +619,8 @@ def _sparse_mla_fused_kernel(
+ 
+     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+     h_mask = h_offs < H
+-    dt = tl.arange(0, D_TAIL)
++    if D_TAIL > 0:
++        dt = tl.arange(0, D_TAIL)
+     g = tl.arange(0, _G)
+ 
+     input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
+@@ -644,11 +649,12 @@ def _sparse_mla_fused_kernel(
+             mask=h_mask[:, None],
+             other=0.0,
+         ).to(input_type)
+-    q_tail = tl.load(
+-        q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
+-        mask=h_mask[:, None],
+-        other=0.0,
+-    ).to(input_type)
++    if D_TAIL > 0:
++        q_tail = tl.load(
++            q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
++            mask=h_mask[:, None],
++            other=0.0,
++        ).to(input_type)
+ 
+     neg_large = -3.4028234663852886e38
+     m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
+@@ -699,9 +705,10 @@ def _sparse_mla_fused_kernel(
+                 mask=valid[:, None],
+                 other=0.0,
+             ).to(input_type)
+-        kv_tail = tl.load(
+-            kv_base + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
+-        ).to(input_type)
++        if D_TAIL > 0:
++            kv_tail = tl.load(
++                kv_base + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
++            ).to(input_type)
+ 
+         scores = tl.dot(q0, tl.trans(kv0))
+         if NUM_GROUPS >= 2:
+@@ -710,7 +717,8 @@ def _sparse_mla_fused_kernel(
+             scores += tl.dot(q2, tl.trans(kv2))
+         if NUM_GROUPS >= 4:
+             scores += tl.dot(q3, tl.trans(kv3))
+-        scores += tl.dot(q_tail, tl.trans(kv_tail))
++        if D_TAIL > 0:
++            scores += tl.dot(q_tail, tl.trans(kv_tail))
+         scores = scores * qk_scale
+         scores = tl.where(valid[None, :], scores, neg_large)
+ 
+@@ -807,7 +815,8 @@ def _sparse_mla_split_k_kernel(
+ 
+     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+     h_mask = h_offs < H
+-    dt = tl.arange(0, D_TAIL)
++    if D_TAIL > 0:
++        dt = tl.arange(0, D_TAIL)
+     g = tl.arange(0, _G)
+ 
+     input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
+@@ -836,11 +845,12 @@ def _sparse_mla_split_k_kernel(
+             mask=h_mask[:, None],
+             other=0.0,
+         ).to(input_type)
+-    q_tail = tl.load(
+-        q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
+-        mask=h_mask[:, None],
+-        other=0.0,
+-    ).to(input_type)
++    if D_TAIL > 0:
++        q_tail = tl.load(
++            q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
++            mask=h_mask[:, None],
++            other=0.0,
++        ).to(input_type)
+ 
+     tiles_per_segment = tl.cdiv(topk, KV_SPLITS * BLOCK_K)
+     if pid_k * tiles_per_segment * BLOCK_K >= topk:
+@@ -886,9 +896,10 @@ def _sparse_mla_split_k_kernel(
+             kv3 = tl.load(
+                 kv_base + (3 * _G + g)[None, :], mask=valid[:, None], other=0.0
+             ).to(input_type)
+-        kv_tail = tl.load(
+-            kv_base + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
+-        ).to(input_type)
++        if D_TAIL > 0:
++            kv_tail = tl.load(
++                kv_base + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
++            ).to(input_type)
+ 
+         scores = tl.dot(q0, tl.trans(kv0))
+         if NUM_GROUPS >= 2:
+@@ -897,7 +908,8 @@ def _sparse_mla_split_k_kernel(
+             scores += tl.dot(q2, tl.trans(kv2))
+         if NUM_GROUPS >= 4:
+             scores += tl.dot(q3, tl.trans(kv3))
+-        scores += tl.dot(q_tail, tl.trans(kv_tail))
++        if D_TAIL > 0:
++            scores += tl.dot(q_tail, tl.trans(kv_tail))
+         scores = scores * qk_scale
+         scores = tl.where(valid[None, :], scores, neg_large)
+ 
+diff --git a/python/sglang/kernels/ops/attention/dsa/triton_sparse_mla_decode.py b/python/sglang/kernels/ops/attention/dsa/triton_sparse_mla_decode.py
+index c4b7a3d3..97ea002a 100644
+--- a/python/sglang/kernels/ops/attention/dsa/triton_sparse_mla_decode.py
++++ b/python/sglang/kernels/ops/attention/dsa/triton_sparse_mla_decode.py
+@@ -118,7 +118,8 @@ def _sparse_mla_decode_fused_kernel(
+ 
+     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+     h_mask = h_offs < H
+-    dt = tl.arange(0, D_TAIL)
++    if D_TAIL > 0:
++        dt = tl.arange(0, D_TAIL)
+     g = tl.arange(0, _G)
+ 
+     input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
+@@ -152,11 +153,12 @@ def _sparse_mla_decode_fused_kernel(
+             mask=h_mask[:, None],
+             other=0.0,
+         ).to(input_type)
+-    q_tail = tl.load(
+-        q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
+-        mask=h_mask[:, None],
+-        other=0.0,
+-    ).to(input_type)
++    if D_TAIL > 0:
++        q_tail = tl.load(
++            q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
++            mask=h_mask[:, None],
++            other=0.0,
++        ).to(input_type)
+ 
+     neg_large = -3.4028234663852886e38
+     m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
+@@ -207,11 +209,12 @@ def _sparse_mla_decode_fused_kernel(
+                 mask=valid[:, None],
+                 other=0.0,
+             ).to(input_type)
+-        kv_tail = tl.load(
+-            kv_base + (D_V + dt)[None, :],
+-            mask=valid[:, None],
+-            other=0.0,
+-        ).to(input_type)
++        if D_TAIL > 0:
++            kv_tail = tl.load(
++                kv_base + (D_V + dt)[None, :],
++                mask=valid[:, None],
++                other=0.0,
++            ).to(input_type)
+ 
+         scores = tl.dot(q0, tl.trans(kv0))
+         if NUM_GROUPS >= 2:
+@@ -220,7 +223,8 @@ def _sparse_mla_decode_fused_kernel(
+             scores += tl.dot(q2, tl.trans(kv2))
+         if NUM_GROUPS >= 4:
+             scores += tl.dot(q3, tl.trans(kv3))
+-        scores += tl.dot(q_tail, tl.trans(kv_tail))
++        if D_TAIL > 0:
++            scores += tl.dot(q_tail, tl.trans(kv_tail))
+         scores = scores * qk_scale
+         scores = tl.where(valid[None, :], scores, neg_large)
+ 
+@@ -317,7 +321,8 @@ def _sparse_mla_decode_split_kernel(
+ 
+     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+     h_mask = h_offs < H
+-    dt = tl.arange(0, D_TAIL)
++    if D_TAIL > 0:
++        dt = tl.arange(0, D_TAIL)
+     g = tl.arange(0, _G)
+ 
+     input_type = kv_ptr.dtype.element_ty if USE_FP8_DOT else tl.bfloat16
+@@ -351,11 +356,12 @@ def _sparse_mla_decode_split_kernel(
+             mask=h_mask[:, None],
+             other=0.0,
+         ).to(input_type)
+-    q_tail = tl.load(
+-        q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
+-        mask=h_mask[:, None],
+-        other=0.0,
+-    ).to(input_type)
++    if D_TAIL > 0:
++        q_tail = tl.load(
++            q_rope_ptr + t * STRIDE_QR_T + h_offs[:, None] * STRIDE_QR_H + dt[None, :],
++            mask=h_mask[:, None],
++            other=0.0,
++        ).to(input_type)
+ 
+     tiles_per_segment = tl.cdiv(topk, KV_SPLITS * BLOCK_K)
+     if pid_k * tiles_per_segment * BLOCK_K >= topk:
+@@ -409,11 +415,12 @@ def _sparse_mla_decode_split_kernel(
+                 mask=valid[:, None],
+                 other=0.0,
+             ).to(input_type)
+-        kv_tail = tl.load(
+-            kv_base + (D_V + dt)[None, :],
+-            mask=valid[:, None],
+-            other=0.0,
+-        ).to(input_type)
++        if D_TAIL > 0:
++            kv_tail = tl.load(
++                kv_base + (D_V + dt)[None, :],
++                mask=valid[:, None],
++                other=0.0,
++            ).to(input_type)
+ 
+         scores = tl.dot(q0, tl.trans(kv0))
+         if NUM_GROUPS >= 2:
+@@ -422,7 +429,8 @@ def _sparse_mla_decode_split_kernel(
+             scores += tl.dot(q2, tl.trans(kv2))
+         if NUM_GROUPS >= 4:
+             scores += tl.dot(q3, tl.trans(kv3))
+-        scores += tl.dot(q_tail, tl.trans(kv_tail))
++        if D_TAIL > 0:
++            scores += tl.dot(q_tail, tl.trans(kv_tail))
+         scores = scores * qk_scale
+         scores = tl.where(valid[None, :], scores, neg_large)
+ 
+diff --git a/python/sglang/kernels/ops/layernorm/mhc.py b/python/sglang/kernels/ops/layernorm/mhc.py
+index bc7c7035..e5a055d5 100644
+--- a/python/sglang/kernels/ops/layernorm/mhc.py
++++ b/python/sglang/kernels/ops/layernorm/mhc.py
+@@ -1933,6 +1933,28 @@ def _mhc_pre_torch(
+ ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     import torch.nn.functional as F
+ 
++    # Decode-only experiment: preserve the reference projection/mixing and
++    # replace only the eager Sinkhorn loop. gfx1201 is explicitly gated.
++    import os
++    backend = os.environ.get(
++        "R9K_SGLANG_MHC_BACKEND",
++        "sinkhorn" if os.environ.get("R9K_SGLANG_MHC_SINKHORN", "0") == "1" else "torch",
++    )
++    if backend not in ("torch", "sinkhorn", "vllm_tilelang"):
++        raise ValueError("Unknown R9K_SGLANG_MHC_BACKEND")
++    if backend != "torch" and (
++        residual.shape[0] > 0 and residual.shape[0] <= 32
++    ):
++        arch = torch.cuda.get_device_properties(residual.device).gcnArchName.split(":")[0]
++        if arch != "gfx1201":
++            raise RuntimeError("R9K_SGLANG_MHC_SINKHORN requires gfx1201")
++        from r9700_sglang.mhc import pre, pre_tilelang
++        operator = pre if backend == "sinkhorn" else pre_tilelang
++        return operator(
++            residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps,
++            hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
++        )
++
+     s, n, h = residual.shape
+     dtype = residual.dtype
+ 
+@@ -1967,6 +1989,15 @@ def _mhc_post_torch(
+     post_layer_mix: torch.Tensor,
+     comb_res_mix: torch.Tensor,
+ ) -> torch.Tensor:
++    # Independent prefill-only experiment; decode/verify keep Torch.
++    import os
++    backend = os.environ.get("R9K_SGLANG_MHC_POST", "torch")
++    if backend not in ("torch", "triton"):
++        raise ValueError("R9K_SGLANG_MHC_POST must be torch or triton")
++    if backend == "triton" and residual.shape[0] >= 128:
++        from r9700_sglang.mhc_post import post
++        return post(x, residual, post_layer_mix, comb_res_mix)
++
+     out = post_layer_mix * x.unsqueeze(1) + (
+         comb_res_mix.unsqueeze(-1) * residual.unsqueeze(2)
+     ).sum(dim=1)
+diff --git a/python/sglang/srt/entrypoints/engine.py b/python/sglang/srt/entrypoints/engine.py
+index 275546c0..cce9a919 100644
+--- a/python/sglang/srt/entrypoints/engine.py
++++ b/python/sglang/srt/entrypoints/engine.py
+@@ -19,6 +19,8 @@ This file implements python APIs for the inference engine.
+ 
+ from __future__ import annotations
+ 
++from r9700_sglang.profile_worker_env import profile_child_environment
++
+ import asyncio
+ import atexit
+ import copy
+@@ -952,6 +954,7 @@ class Engine(EngineScoreMixin, EngineBase):
+                         with (
+                             memory_saver_adapter.configure_subprocess(),
+                             numa_utils.configure_subprocess(server_args, gpu_id),
++                            profile_child_environment(),
+                         ):
+                             proc.start()
+ 
+diff --git a/python/sglang/srt/layers/attention/dsa/dsa_backend_kpool.py b/python/sglang/srt/layers/attention/dsa/dsa_backend_kpool.py
+index 6d32c5dd..876308ff 100644
+--- a/python/sglang/srt/layers/attention/dsa/dsa_backend_kpool.py
++++ b/python/sglang/srt/layers/attention/dsa/dsa_backend_kpool.py
+@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
+     update_pooled_paged_mqa_metadata,
+ )
+ from sglang.srt.layers.cp.interleave_kpool import local_query_inputs
++from sglang.srt.utils import is_hip
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
+@@ -52,6 +53,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
+             topk_indices is None
+             or self.dsa_index_kpool <= 1
+             or dsa_impl in ("fa3", "tilelang", "trtllm")
++            or (is_hip() and dsa_impl == "triton")
+         ):
+             return
+         raise NotImplementedError(
+diff --git a/python/sglang/srt/layers/attention/dsa/dsa_indexer.py b/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
+index 91350f04..61d1225d 100644
+--- a/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
++++ b/python/sglang/srt/layers/attention/dsa/dsa_indexer.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import contextlib
+ import logging
++from functools import lru_cache
+ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
+ 
+ import torch
+@@ -238,9 +239,28 @@ def _make_eager_idle_topk_result(
+     )
+ 
+ 
++@lru_cache(maxsize=8)
++def _gfx1201_hadamard_matrix(hidden_size: int, device: str) -> torch.Tensor:
++    matrix = torch.tensor(
++        [[1.0 if ((i & j).bit_count() & 1) == 0 else -1.0
++          for j in range(hidden_size)] for i in range(hidden_size)],
++        dtype=torch.float32,
++    )
++    return (matrix * hidden_size**-0.5).to(device)
++
++
+ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+     if _is_hip:
+-        from fast_hadamard_transform import hadamard_transform
++        try:
++            from fast_hadamard_transform import hadamard_transform
++        except ImportError:
++            arch = torch.cuda.get_device_properties(x.device).gcnArchName.split(":")[0]
++            if arch != "gfx1201":
++                raise
++            hidden_size = x.size(-1)
++            assert hidden_size > 0 and hidden_size & (hidden_size - 1) == 0
++            matrix = _gfx1201_hadamard_matrix(hidden_size, str(x.device))
++            return torch.matmul(x.float(), matrix).to(x.dtype)
+     elif _is_xpu:
+         from sgl_kernel import hadamard_transform
+     else:
+diff --git a/python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py b/python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py
+index 614b93ef..f0fe901e 100644
+--- a/python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py
++++ b/python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py
+@@ -624,7 +624,9 @@ def topk_from_pooled_history_logits(
+             f"is disabled. Got device={logits.device}, dtype={logits.dtype}."
+         )
+ 
+-    if group_topk in (128, 160, 192, 224, 256, 512):
++    # The fused selector includes CUDA headers; keep the same pooled
++    # selection and expansion on the device when running on ROCm.
++    if torch.version.hip is None and group_topk in (128, 160, 192, 224, 256, 512):
+         from sglang.kernels.ops.attention.dsa.kpool_topk_transform import (
+             fast_kpool_topk_transform_fused,
+         )
+@@ -648,18 +650,36 @@ def topk_from_pooled_history_logits(
+         padded[: result.shape[0]] = result
+         return padded
+ 
+-    assert page_table_row_index is None, (
+-        "page_table_row_index requires the fused fast_kpool group_topk path"
+-    )
++    if torch.version.hip is not None:
++        from r9700_sglang.kpool import mask_pooled_logits
+ 
+-    from sgl_kernel import fast_topk_v2
++        masked_scores = mask_pooled_logits(
++            logits, group_lengths, row_starts, min_cols=group_topk
++        )
++        selected_groups = torch.topk(masked_scores, group_topk, dim=1).indices.to(
++            torch.int32
++        )
++        # Short histories use chronological groups, matching the CUDA path.
++        chronological = torch.arange(
++            group_topk, device=logits.device, dtype=torch.int32
++        )[None, :]
++        selected_groups = torch.where(
++            group_lengths[:, None] <= group_topk,
++            chronological,
++            selected_groups,
++        )
++    else:
++        assert page_table_row_index is None, (
++            "page_table_row_index requires the fused fast_kpool group_topk path"
++        )
++        from sgl_kernel import fast_topk_v2
+ 
+-    selected_groups = fast_topk_v2(
+-        logits,
+-        group_lengths.to(torch.int32),
+-        group_topk,
+-        row_starts=row_starts,
+-    )
++        selected_groups = fast_topk_v2(
++            logits,
++            group_lengths.to(torch.int32),
++            group_topk,
++            row_starts=row_starts,
++        )
+ 
+     rank = torch.arange(group_topk, device=logits.device, dtype=torch.int32)
+     max_valid_groups = min(cols, group_topk)
+@@ -668,6 +688,16 @@ def topk_from_pooled_history_logits(
+         torch.full_like(group_lengths.to(torch.int32), max_valid_groups),
+     )
+     group_valid = rank.unsqueeze(0) < valid_counts.unsqueeze(1)
++    if torch.version.hip is not None and page_table_row_index is not None:
++        if topk_offsets is not None:
++            raise ValueError("Mapped KPool page table and topk offsets are mutually exclusive")
++        from r9700_sglang.kpool import expand_mapped_groups
++
++        return expand_mapped_groups(
++            selected_groups, group_lengths, page_table, page_table_row_index,
++            pool_size=kpool, logit_cols=cols, seq_lens=seq_lens,
++            out_rows=out_rows,
++        )
+     expanded = expand_pooled_groups_to_topk(
+         selected_groups.contiguous(),
+         group_valid,
+diff --git a/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py b/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py
+index ad6b8c9d..56aac1b3 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py
++++ b/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py
+@@ -745,6 +745,13 @@ def _fused_moe_kernel_sequence(
+             intermediate_cache2 = _swiglu_silu_clamp_mul(
+                 intermediate_cache1.view(-1, N), gemm1_limit
+             )
++        elif (swiglu_limit is not None and _is_hip
++              and __import__("os").environ.get("R9K_SGLANG_GLM_MTP") == "1"):
++            from r9700_sglang.mtp_fp8 import swiglu_clamped_hip
++
++            assert swiglu_limit == 10 and not filter_expert
++            intermediate_cache2 = swiglu_clamped_hip(
++                intermediate_cache1.view(-1, N), swiglu_limit)
+         elif swiglu_limit is not None:
+             # DeepSeek V4: swiglu clamp before silu_and_mul.
+             # Two paths gated by SGLANG_OPT_SWIGLU_CLAMP_FUSION:
+diff --git a/python/sglang/srt/layers/quantization/quark/quark.py b/python/sglang/srt/layers/quantization/quark/quark.py
+index 19effc3d..6099a757 100644
+--- a/python/sglang/srt/layers/quantization/quark/quark.py
++++ b/python/sglang/srt/layers/quantization/quark/quark.py
+@@ -30,6 +30,9 @@ from sglang.srt.layers.quantization.quark.schemes import (
+     QuarkW8A8Fp8,
+     QuarkW8A8FP8MoE,
+ )
++from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_block_fp8 import (
++    QuarkW8A8BlockFp8,
++)
+ from sglang.srt.layers.quantization.quark.utils import (
+     Nvfp4SourceConfig,
+     deep_compare,
+@@ -334,6 +337,7 @@ class QuarkConfig(QuantizationConfig):
+         # spelled None as often as it is spelled absent -- ModelConfig defaults
+         # the same field to None -- so coerce rather than let range() raise.
+         self.num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
++        self.model_type = getattr(hf_config, "model_type", None)
+         self.num_nextn_predict_layers = int(
+             getattr(hf_config, "num_nextn_predict_layers", 0) or 0
+         )
+@@ -350,6 +354,10 @@ class QuarkConfig(QuantizationConfig):
+ 
+         if isinstance(self.dequantization_config, Fp8Config):
+             self.weight_block_size = self.dequantization_config.weight_block_size
++        elif self.model_type == "glm5_next":
++            # MergedColumnParallelLinear reads this value when sharding the
++            # checkpoint's dense FP8 scale tensor (first three MLP layers).
++            self.weight_block_size = [128, 128]
+ 
+     @property
+     def quantized_layers(self) -> tuple[list[str], int]:
+@@ -858,6 +866,14 @@ class QuarkConfig(QuantizationConfig):
+         self, layer_name: str, module: torch.nn.Module
+     ) -> dict[str, Any]:
+ 
++        # GLM removes `language_model.` when constructing layer names, while
++        # Quark's per-layer overrides retain the checkpoint's original names.
++        checkpoint_layer_name = layer_name
++        if self.model_type == "glm5_next":
++            from r9700_sglang.mtp_names import checkpoint_name
++
++            checkpoint_layer_name = checkpoint_name(layer_name, self.num_hidden_layers)
++
+         proj_name = layer_name.split(".")[-1]
+         if proj_name in self.packed_modules_mapping:
+             shard_proj_names = self.packed_modules_mapping[proj_name]
+@@ -885,7 +901,7 @@ class QuarkConfig(QuantizationConfig):
+                 dict[str, Any], self.quant_config.get("layer_quant_config")
+             )
+             for name_pattern in layer_quant_config:
+-                if fnmatch.fnmatch(layer_name, name_pattern):
++                if fnmatch.fnmatch(checkpoint_layer_name, name_pattern) or fnmatch.fnmatch(layer_name, name_pattern):
+                     return layer_quant_config[name_pattern]
+ 
+             # entries may name experts individually, so they resolve the fused module
+@@ -965,6 +981,19 @@ class QuarkConfig(QuantizationConfig):
+                 is_checkpoint_mxfp4_serialized=self.is_prequantized,
+                 dequantization_config=self.dequantization_config,
+             )
++        if (
++            weight_config is not None
++            and input_config is not None
++            and weight_config.get("dtype") == "fp8_e4m3"
++            and weight_config.get("qscheme") == "per_block"
++            and weight_config.get("block_size") == [128, 128]
++            and weight_config.get("is_dynamic") is False
++            and input_config.get("dtype") == "fp8_e4m3"
++            and input_config.get("qscheme") == "per_group"
++            and input_config.get("group_size") == 128
++            and input_config.get("is_dynamic") is True
++        ):
++            return QuarkW8A8BlockFp8()
+         if self._is_fp8_w8a8(weight_config, input_config):
+             is_fp8_w8a8_supported = self._check_scheme_supported(
+                 QuarkW8A8Fp8.get_min_capability(), error=False
+@@ -998,6 +1027,12 @@ class QuarkConfig(QuantizationConfig):
+         module: torch.nn.Module,
+         layer_name: str,
+     ) -> "QuarkMoEScheme":
++        if self.model_type == "glm5_next" and layer_name == "model.decoder.mlp.experts":
++            from r9700_sglang.mtp_names import nextn_expert_fp8_config
++            from r9700_sglang.mtp_fp8 import NextNBlockFp8
++
++            nextn_expert_fp8_config(self.quant_config, self.num_hidden_layers)
++            return NextNBlockFp8()
+         layer_quant_config = self._find_matched_config(layer_name, module)
+ 
+         if layer_quant_config.get("output_tensors") or layer_quant_config.get("bias"):
+diff --git a/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4.py b/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4.py
+index f860a3fb..96d55409 100644
+--- a/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4.py
++++ b/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4.py
+@@ -687,6 +687,16 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
+         if getattr(layer, "dequantized_bf16", False):
+             if isinstance(x, tuple):
+                 x = x[0]
++            # Opt-in gfx1201 decode path. Packed checkpoint weights were
++            # dequantized once at load time; do not change prefill arithmetic.
++            if (
++                get_bool_env_var("R9K_SGLANG_BF16_DENSE_GEMV", "false")
++                and x.ndim == 2 and x.shape[0] == 1
++                and x.is_contiguous() and layer.weight.is_contiguous()
++                and layer.weight.shape[0] >= 128
++            ):
++                from r9700_sglang.bf16_dense import linear_one_row
++                return linear_one_row(x, layer.weight, bias)
+             return torch.nn.functional.linear(x, layer.weight, bias)
+ 
+         # Bias will be added after the GEMM if provided
+diff --git a/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py b/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py
+index 53425911..282246c1 100644
+--- a/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py
++++ b/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py
+@@ -99,6 +99,12 @@ def _rank_chunk_padding_loader(weight_loader, *, tp_size: int):
+ # (moe_shuffle_scale -> shuffle_scale_n32k4), not the e8m0_shuffle layout used by
+ # gfx950. Using the wrong layout silently corrupts the dequant scales.
+ _is_gfx1250 = is_gfx1250_supported()
++_is_gfx1201 = (
++    _is_hip
++    and torch.cuda.is_available()
++    and getattr(torch.cuda.get_device_properties(0), "gcnArchName", "").split(":")[0]
++    == "gfx1201"
++)
+ 
+ # The gfx1250 a8w4 grouped MoE kernel consumes (16,16)-preshuffled FP4 weights
+ # (see aiter op_tests/test_flydsl_grouped_gemm_gfx1250.py, which always does
+@@ -942,7 +948,11 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
+             return
+ 
+         # Pre-shuffle weight scales
+-        if _is_gfx1250:
++        if _is_gfx1201:
++            # The local packed GEMV consumes checkpoint-order E8M0 scales.
++            # AITER's e8m0_shuffle is only valid for its own MoE kernel.
++            pass
++        elif _is_gfx1250:
+             # gfx1250 grouped MoE GEMM consumes B-scales in the n32k4 layout.
+             num_experts = layer.w13_weight_scale.shape[0]
+             layer.w13_weight_scale.data = moe_shuffle_scale(
+@@ -1017,6 +1027,11 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
+         layer: torch.nn.Module,
+         dispatch_output: StandardDispatchOutput,
+     ) -> CombineInput:
++        if _is_gfx1201:
++            from r9700_sglang.packed_moe import apply_sglang
++
++            return apply_sglang(layer, dispatch_output)
++
+         from sglang.srt.layers.moe.moe_runner.aiter import (
+             AiterMoeQuantInfo,
+             AiterQuantType,
+diff --git a/python/sglang/srt/layers/quantization/quark/schemes/quark_w8a8_block_fp8.py b/python/sglang/srt/layers/quantization/quark/schemes/quark_w8a8_block_fp8.py
+new file mode 100644
+index 00000000..73d8104f
+--- /dev/null
++++ b/python/sglang/srt/layers/quantization/quark/schemes/quark_w8a8_block_fp8.py
+@@ -0,0 +1,105 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Quark FP8 128x128 dense weights used by GLM's first three MLP layers."""
++
++from typing import Callable, Optional
++
++import torch
++from torch.nn import Parameter
++
++from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
++from sglang.srt.layers.parameter import BlockQuantScaleParameter, ModelWeightParameter
++from sglang.srt.layers.quantization.fp8_utils import (
++    dispatch_w8a8_block_fp8_linear,
++    normalize_e4m3fn_to_e4m3fnuz,
++    validate_fp8_block_shape,
++)
++from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
++
++
++class QuarkW8A8BlockFp8(QuarkLinearScheme):
++    """Keep Quark's weight_scale name and original per-block arithmetic."""
++
++    block_size = [128, 128]
++
++    def __init__(self):
++        self.kernel = dispatch_w8a8_block_fp8_linear()
++
++    @classmethod
++    def get_min_capability(cls) -> int:
++        return 89
++
++    def create_weights(
++        self,
++        layer: torch.nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        weight_loader: Callable,
++        **kwargs,
++    ):
++        output_size_per_partition = sum(output_partition_sizes)
++        layer.logical_widths = output_partition_sizes
++        layer.orig_dtype = params_dtype
++        validate_fp8_block_shape(
++            layer,
++            input_size,
++            output_size,
++            input_size_per_partition,
++            output_partition_sizes,
++            self.block_size,
++        )
++        layer.register_parameter(
++            "weight",
++            ModelWeightParameter(
++                data=torch.empty(
++                    output_size_per_partition,
++                    input_size_per_partition,
++                    dtype=torch.float8_e4m3fn,
++                ),
++                input_dim=1,
++                output_dim=0,
++                weight_loader=weight_loader,
++            ),
++        )
++        scale = BlockQuantScaleParameter(
++            data=torch.empty(
++                (output_size_per_partition + 127) // 128,
++                (input_size_per_partition + 127) // 128,
++                dtype=torch.float32,
++            ),
++            input_dim=1,
++            output_dim=0,
++            weight_loader=weight_loader,
++        )
++        scale[:] = torch.finfo(torch.float32).min
++        scale.format_ue8m0 = False
++        layer.register_parameter("weight_scale", scale)
++
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        if is_fp8_fnuz():
++            weight, scale, _ = normalize_e4m3fn_to_e4m3fnuz(
++                weight=layer.weight, weight_scale=layer.weight_scale
++            )
++            layer.weight = Parameter(weight.data, requires_grad=False)
++            layer.weight_scale = Parameter(scale.data, requires_grad=False)
++        else:
++            layer.weight.requires_grad_(False)
++            layer.weight_scale.requires_grad_(False)
++        layer.input_scale = None
++
++    def apply_weights(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        bias: Optional[torch.Tensor] = None,
++    ) -> torch.Tensor:
++        return self.kernel(
++            input=x,
++            weight=layer.weight,
++            block_size=self.block_size,
++            weight_scale=layer.weight_scale,
++            input_scale=None,
++            bias=bias,
++        )
+diff --git a/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla_rocm.py b/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla_rocm.py
+index 5b265075..15c70967 100644
+--- a/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla_rocm.py
++++ b/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla_rocm.py
+@@ -33,6 +33,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
+     materialize_bpreshuffle_fp8_scale_tuple,
+     view_aiter_fused_rms_transposed_fp8_scale_tuple,
+ )
++from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_block_fp8 import (
++    QuarkW8A8BlockFp8,
++)
+ from sglang.srt.lora.deepseek_mla_correction import (
+     apply_q_correction as apply_kv_b_lora_q_correction,
+ )
+@@ -79,6 +82,10 @@ if TYPE_CHECKING:
+     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+ 
+ if _use_aiter:
++    # The Triton FP8 flatten/quantize op is used by block-scaled o_proj on
++    # gfx1201 as well as gfx95. It does not require a gfx95-only CK kernel.
++    from aiter.ops.triton.fused_fp8_quant import fused_flatten_fp8_group_quant
++
+     # On gfx1250 the aiter `module_fused_qk_norm_rope_cache_quant_shuffle` kernel
+     # fails to JIT-build (its `rope_common.h` / `ck_tile/vec_convert.h` are
+     # incompatible with this image's composable_kernel), which crashes the very
+@@ -134,7 +141,6 @@ if _use_aiter:
+ 
+ if _use_aiter_gfx95:
+     from aiter.ops.triton.fused_fp8_quant import (
+-        fused_flatten_fp8_group_quant,
+         fused_rms_fp8_group_quant,
+     )
+ 
+@@ -193,6 +199,14 @@ def _absorb_weight_bf16(w: torch.Tensor, w_scale) -> torch.Tensor:
+     return w.to(torch.bfloat16) * w_scale
+ 
+ 
++def _can_prefuse_block_fp8(proj: torch.nn.Module) -> bool:
++    # Quark's block-FP8 scheme quantizes its own BF16 input and cannot consume
++    # the (FP8 tensor, scale) tuple returned by fused_flatten_fp8_group_quant.
++    return _is_block_scale_fp8(proj) and not isinstance(
++        getattr(proj, "scheme", None), QuarkW8A8BlockFp8
++    )
++
++
+ def rocm_absorb_q_bmm(
+     attn: DeepseekV2AttentionMLA,
+     q_nope: torch.Tensor,
+@@ -324,7 +338,7 @@ def rocm_absorb_v_bmm(
+         # _bmm_buf is already (batch, heads, dim) contiguous
+         if attn.o_proj.weight.dtype == torch.uint8:
+             attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)
+-        elif _is_block_scale_fp8(attn.o_proj):
++        elif _can_prefuse_block_fp8(attn.o_proj):
+             # No-copy fp8 scale: emit the bpreshuffle scale already transposed and
+             # reinterpret it with a stride swap, instead of relaying out a copy.
+             # Falls back to the materialize (copy) path at M == 1 / non-gfx95.
+@@ -351,7 +365,7 @@ def rocm_absorb_v_bmm(
+     elif attn.o_proj.weight.dtype == torch.uint8:
+         attn_bmm_output = attn_bmm_output.transpose(0, 1)
+         attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
+-    elif _is_block_scale_fp8(attn.o_proj):
++    elif _can_prefuse_block_fp8(attn.o_proj):
+         attn_bmm_output = attn_bmm_output.transpose(0, 1)
+         # No-copy fp8 scale: emit the bpreshuffle scale already transposed and
+         # reinterpret it with a stride swap, instead of relaying out a copy.
+diff --git a/python/sglang/srt/models/glm5_next.py b/python/sglang/srt/models/glm5_next.py
+index 862203e6..eba6018e 100644
+--- a/python/sglang/srt/models/glm5_next.py
++++ b/python/sglang/srt/models/glm5_next.py
+@@ -1308,6 +1308,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
+             )
+         )
+         self.capture_aux_hidden_states = False
++        if __import__("os").environ.get("R9K_SGLANG_MTP_TRACE_DIR"):
++            from r9700_sglang.mtp_trace import install
++
++            install(self.model)
+ 
+         if not self.encoder_only:
+             get_attn_tp_context().init_context(
+@@ -1751,6 +1755,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
+             return name
+ 
+         weight_names = []
++        loaded_params = set()
++        skipped_critical = []
+         for name, loaded_weight in weights:
+             is_visual_weight = "visual" in name
+             if getattr(self, "encoder_only", False) and not is_visual_weight:
+@@ -1830,10 +1836,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
+                 if name.endswith(".bias") and name not in params_dict:
+                     continue
+                 if name not in params_dict:
++                    if name.startswith(("model.layers.0.", "model.layers.1.", "model.layers.2.")):
++                        skipped_critical.append(name)
+                     continue
+                 param = params_dict[name]
+                 weight_loader = param.weight_loader
+                 weight_loader(param, loaded_weight, shard_id)
++                loaded_params.add(name)
+                 break
+             else:
+                 is_expert_weight = False
+@@ -1845,6 +1854,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
+                     name = name.replace(weight_name, param_name)
+                     name = maybe_map_fp8_block_scale_name(name)
+                     if name not in params_dict:
++                        if name.startswith(("model.layers.0.", "model.layers.1.", "model.layers.2.")):
++                            skipped_critical.append(name)
+                         continue
+                     param = params_dict[name]
+                     weight_loader = param.weight_loader
+@@ -1855,6 +1866,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
+                         shard_id=shard_id,
+                         expert_id=expert_id,
+                     )
++                    loaded_params.add(name)
+                     break
+                 else:
+                     if is_expert_weight:
+@@ -1902,12 +1914,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
+                                     param, "weight_loader", default_weight_loader
+                                 )
+                                 weight_loader(param, fused_weight)
++                                loaded_params.add(target)
+                             cached_a_proj.pop(q_a_proj_name, None)
+                             cached_a_proj.pop(kv_a_proj_name, None)
+                         continue
+ 
+                     name = maybe_map_fp8_block_scale_name(name)
+                     if name not in params_dict:
++                        if name.startswith(("model.layers.0.", "model.layers.1.", "model.layers.2.")) or name in {"model.embed_tokens.weight", "lm_head.weight"}:
++                            skipped_critical.append(name)
+                         continue
+ 
+                     if name.endswith(".A_log") and loaded_weight.dim() == 1:
+@@ -1917,7 +1932,40 @@ class Glm5NextForConditionalGeneration(nn.Module):
+                     weight_loader = getattr(
+                         param, "weight_loader", default_weight_loader
+                     )
+-                    weight_loader(param, loaded_weight)
++                    try:
++                        weight_loader(param, loaded_weight)
++                        loaded_params.add(name)
++                    except AssertionError as exc:
++                        raise AssertionError(
++                            f"GLM weight load mismatch: {name}, param={tuple(param.shape)}, "
++                            f"checkpoint={tuple(loaded_weight.shape)}"
++                        ) from exc
++
++        if is_nextn:
++            required = ("model.decoder.", "model.eh_proj.", "model.enorm.",
++                        "model.hnorm.", "model.shared_head.norm.")
++            missing = sorted(name for name in params_dict
++                             if name.startswith(required) and name not in loaded_params
++                             and not name.endswith((".k_scale", ".v_scale")))
++            logger.warning("GLM NextN loader coverage: loaded=%d/%d, missing required=%s",
++                           len(loaded_params), len(params_dict), missing)
++            if missing:
++                raise RuntimeError(f"GLM NextN required checkpoint tensors were not loaded: {missing}")
++
++        if not is_nextn:
++            critical = ("model.layers.0.", "model.layers.1.", "model.layers.2.")
++            missing_all = sorted(name for name in params_dict if name not in loaded_params)
++            missing_critical = sorted(
++                name for name in params_dict
++                if (name.startswith(critical) or name in {"model.embed_tokens.weight", "lm_head.weight"})
++                and name not in loaded_params
++            )
++            logger.warning(
++                "GLM loader coverage: loaded=%d/%d, missing=%d %s, critical missing=%d %s, skipped=%d %s",
++                len(loaded_params), len(params_dict), len(missing_all), missing_all,
++                len(missing_critical), missing_critical[:32],
++                len(skipped_critical), skipped_critical[:32],
++            )
+ 
+         if getattr(self, "encoder_only", False):
+             run_post = False

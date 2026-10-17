@@ -9,7 +9,7 @@ def command(*args):
     return subprocess.check_output(args, text=True, timeout=30)
 
 
-def hip_mapping(container):
+def hip_mapping(container, expected_count=8):
     code = '''import ctypes,json
 h=ctypes.CDLL("libamdhip64.so")
 n=ctypes.c_int()
@@ -21,8 +21,8 @@ for i in range(n.value):
  out.append(dict(hip=i,worker_rank=i,bdf=b.value.decode().lower()))
 print(json.dumps(out))'''
     result = json.loads(command('docker', 'exec', container, 'python3', '-c', code))
-    if len(result) != 8 or len({x['bdf'] for x in result}) != 8:
-        raise RuntimeError('This TP8 protocol requires eight distinct HIP devices')
+    if len(result) != expected_count or len({x['bdf'] for x in result}) != expected_count:
+        raise RuntimeError(f'This protocol requires {expected_count} distinct HIP devices')
     return result
 
 
@@ -54,8 +54,19 @@ def number(value):
 
 
 def expected_links(snapshot):
-    return {bdf: dict(speed=number(v['max_link_speed']), width=number(v['max_link_width']))
-            for bdf, v in snapshot['devices'].items()}
+    # A bridge can advertise x16 while its parent port is only x4. The
+    # negotiated link is capped by *both* ends of that link; expecting the
+    # child's x16 capability here would reject a healthy x4 uplink.
+    expected = {bdf: dict(speed=number(v['max_link_speed']),
+                          width=number(v['max_link_width']))
+                for bdf, v in snapshot['devices'].items()}
+    for chain in snapshot['paths'].values():
+        for child, parent in zip(chain, chain[1:]):
+            expected[child]['speed'] = min(expected[child]['speed'],
+                                           number(snapshot['devices'][parent]['max_link_speed']))
+            expected[child]['width'] = min(expected[child]['width'],
+                                           number(snapshot['devices'][parent]['max_link_width']))
+    return expected
 
 
 def check_loaded(samples, idle, expected):

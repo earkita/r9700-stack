@@ -1,0 +1,482 @@
+diff --git a/python/sglang/kernels/ops/speculative/reject_sampling.py b/python/sglang/kernels/ops/speculative/reject_sampling.py
+index fd32ca3ea1b9..7d5ad9e9cdf0 100644
+--- a/python/sglang/kernels/ops/speculative/reject_sampling.py
++++ b/python/sglang/kernels/ops/speculative/reject_sampling.py
+@@ -68,7 +68,15 @@ def speculative_sampling_classic_kernel(
+ 
+         coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
+ 
+-        if coin * q < p:
++        # X was sampled from q, so q(X) has to be a positive probability.
++        # Anything else means this row is not the distribution X came from, and
++        # `coin * q < p` would then accept unconditionally -- -inf < p for an
++        # -inf q, 0 < p for a zero one, and the range guard the residual passes
++        # use lets zero through. Reject instead: the residual path resamples
++        # from the target, which is the safe direction to fail in.
++        q_is_prob = (q > 0.0) & (q <= 1.0)
++
++        if q_is_prob & (coin * q < p):
+             num_accept += 1
+             cur_prob_row = step
+             tl.store(Predicts + last_accepted_global_idx, draft_token)
+@@ -111,8 +119,10 @@ def speculative_sampling_classic_kernel(
+         else:
+             q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
+             q_val = tl.load(q_ptr, mask=mask, other=0.0)
+-            # Treat NaN q (degenerate draft rows) as 0: residual falls back to p.
+-            q_val = tl.where(q_val == q_val, q_val, 0.0)
++            # Treat any non-probability q (NaN, +-inf, negative) as 0: the
++            # residual falls back to p. A comparison against NaN is false, so
++            # the range test rejects it along with the infinities.
++            q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
+             diff = p_val - q_val
+             val = tl.where(diff > 0.0, diff, 0.0)
+ 
+@@ -139,8 +149,8 @@ def speculative_sampling_classic_kernel(
+             else:
+                 q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
+                 q_val = tl.load(q_ptr, mask=mask, other=0.0)
+-                # Same NaN-q guard as pass 1.
+-                q_val = tl.where(q_val == q_val, q_val, 0.0)
++                # Same guard as pass 1.
++                q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
+                 diff = p_val - q_val
+                 val = tl.where(diff > 0.0, diff, 0.0)
+ 
+diff --git a/python/sglang/srt/arg_groups/speculative_hook.py b/python/sglang/srt/arg_groups/speculative_hook.py
+index 954e78d2451d..5f8d5c8c9eca 100644
+--- a/python/sglang/srt/arg_groups/speculative_hook.py
++++ b/python/sglang/srt/arg_groups/speculative_hook.py
+@@ -24,6 +24,37 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _should_auto_enable_hip_rejection_sampling(
++    *,
++    is_hip: bool,
++    use_rejection_sampling: bool,
++    algorithm: Optional[str],
++    token_map: Optional[str],
++    eagle_topk: int,
++    accept_threshold_single: float,
++    accept_threshold_acc: float,
++    enable_deterministic_inference: bool,
++) -> bool:
++    """Whether HIP may default ``speculative_use_rejection_sampling`` on.
++
++    Rejection sampling still cannot consume a reduced / hot draft vocab
++    (``eagle_worker_v2`` FIXME: scatter via the d2t map). Auto-enabling there
++    would crash configs that previously ran greedy on HIP, including EAGLE3
++    stage-a ``test_basic_sanity_eagle3`` (draft 32000 vs target 128256). Skip
++    EAGLE3 and any EAGLE run that already has a token map.
++    """
++    return (
++        is_hip
++        and not use_rejection_sampling
++        and algorithm == "EAGLE"
++        and token_map is None
++        and eagle_topk == 1
++        and accept_threshold_single == 1.0
++        and accept_threshold_acc == 1.0
++        and not enable_deterministic_inference
++    )
++
++
+ def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
+     cfg = resolving_view(server_args)
+     if cfg.device != "cpu" or cfg.disable_overlap_schedule:
+@@ -813,7 +844,6 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
+ 
+ 
+ def _handle_eagle_family(server_args: ServerArgs) -> None:
+-
+     cfg = resolving_view(server_args)
+ 
+     if (
+@@ -920,7 +950,34 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
+                 "trtllm_mha backend only supports topk = 1 for speculative decoding."
+             )
+ 
+-    if cfg.speculative_use_rejection_sampling:
++    # ROCm/HIP has no CUDA/MUSA sampling-verify kernels, so EAGLE verify would
++    # otherwise fall back to greedy (argmax) and silently ignore temperature and
++    # top_p. Default rejection sampling on -- it routes verify through the Triton
++    # chain sampler -- for configs that support it. See
++    # _should_auto_enable_hip_rejection_sampling for the cases we must not flip.
++    if _should_auto_enable_hip_rejection_sampling(
++        is_hip=get_platform().is_hip,
++        use_rejection_sampling=cfg.speculative_use_rejection_sampling,
++        algorithm=cfg.speculative_algorithm,
++        token_map=cfg.speculative_token_map,
++        eagle_topk=cfg.speculative_eagle_topk,
++        accept_threshold_single=cfg.speculative_accept_threshold_single,
++        accept_threshold_acc=cfg.speculative_accept_threshold_acc,
++        enable_deterministic_inference=cfg.enable_deterministic_inference,
++    ):
++        declare_resolution(
++            server_args,
++            "_handle_eagle_family",
++            speculative_use_rejection_sampling=True,
++        )
++        logger.info(
++            "ROCm needs rejection sampling for EAGLE spec-decode to sample at all; "
++            "enabling speculative_use_rejection_sampling by default."
++        )
++
++    # resolved_view, not cfg: the block above may have just decided this field,
++    # and declare_resolution writes to the stash rather than the dataclass.
++    if resolved_view(server_args).speculative_use_rejection_sampling:
+         # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.
+         # Only the EAGLE/EAGLE3 draft workers emit a target-vocab proposal that
+         # the rejection-sampling kernel consumes; everything else (STANDALONE,
+diff --git a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
+index 0c6d80e3dfdd..e247d34f8fbb 100644
+--- a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
++++ b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
+@@ -42,6 +42,7 @@
+     get_spec,
+ )
+ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
++from sglang.srt.sampling.sampling_params import TOP_K_ALL
+ from sglang.srt.speculative.eagle_info import EagleDraftInput
+ from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
+ from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
+@@ -213,6 +214,14 @@ def __init__(
+             )
+ 
+             self.temperatures = torch.ones((self.max_bs, 1), dtype=torch.float)
++            # Real per-request top_k, for the same reason temperatures are
++            # carried: the draft proposal cannot tell a greedy request from a
++            # T=1 one by temperature alone, because SamplingParams rewrites
++            # temperature 0 to temperature=1.0 with top_k=1.
++            # TOP_K_ALL, not -1: -1 is not a top_k this pipeline ever carries
++            # (SamplingParams rewrites it), and it would read as top_k <= 1, i.e.
++            # greedy, for the padded rows and for a run that never copies in.
++            self.top_ks = torch.full((self.max_bs,), TOP_K_ALL, dtype=torch.int32)
+ 
+             if self.require_gathered_buffer:
+                 if self.require_mlp_tp_gather:
+@@ -417,7 +426,7 @@ def capture_one_shape(
+         sampling_info = SamplingBatchInfo(
+             temperatures=self.temperatures[:num_seqs],
+             top_ps=torch.ones((num_seqs,), dtype=torch.float),
+-            top_ks=torch.full((num_seqs,), -1, dtype=torch.int32),
++            top_ks=self.top_ks[:num_seqs],
+             min_ps=torch.zeros((num_seqs,), dtype=torch.float),
+             is_all_greedy=False,
+             is_any_greedy=False,
+@@ -624,6 +633,7 @@ def execute(self, forward_batch: ForwardBatch):
+             self.temperatures[:raw_bs].copy_(
+                 forward_batch.sampling_info.temperatures[:raw_bs]
+             )
++            self.top_ks[:raw_bs].copy_(forward_batch.sampling_info.top_ks[:raw_bs])
+ 
+         # TODO(ch-wan): support num_token_non_padded
+         if self.require_gathered_buffer:
+diff --git a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
+index 616f808d7ba6..17bbd876ee54 100644
+--- a/python/sglang/srt/speculative/eagle_utils.py
++++ b/python/sglang/srt/speculative/eagle_utils.py
+@@ -685,6 +685,24 @@ def _verify_coins(
+     return coins, coins_for_final_sampling
+ 
+ 
++def _verify_uses_greedy(
++    *,
++    is_all_greedy: bool,
++    is_cpu: bool,
++    is_hip: bool,
++    is_xpu: bool,
++    use_rejection_sampling: bool,
++) -> bool:
++    """Whether EAGLE verify must commit argmax instead of taking the sampling path.
++
++    HIP has no CUDA/MUSA sampling-verify kernels, so it used to be listed here
++    unconditionally. Rejection sampling routes it through the pure-Triton chain
++    sampler instead, so only a HIP run without that still has to go greedy. Every
++    other platform reduces to the original predicate.
++    """
++    return is_all_greedy or is_cpu or is_xpu or (is_hip and not use_rejection_sampling)
++
++
+ def _can_use_sparse_uno_tree_target_sampling(
+     max_top_k: Optional[int],
+     sampling_info: SamplingBatchInfo,
+@@ -781,7 +799,14 @@ def eagle_sample(
+ 
+     # Sample tokens
+     target_predict = None
+-    if sampling_info.is_all_greedy or _is_cpu or _is_hip or _is_xpu:
++    use_rejection_sampling = get_spec().speculative_use_rejection_sampling
++    if _verify_uses_greedy(
++        is_all_greedy=sampling_info.is_all_greedy,
++        is_cpu=_is_cpu,
++        is_hip=_is_hip,
++        is_xpu=_is_xpu,
++        use_rejection_sampling=use_rejection_sampling,
++    ):
+         target_predict = torch.argmax(next_token_logits, dim=-1)
+         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+@@ -855,23 +880,30 @@ def eagle_sample(
+                 tree_speculative_sampling_target_only,
+             )
+         else:
+-            from sgl_kernel import (
+-                top_k_renorm_prob,
+-                top_p_renorm_prob,
+-                tree_speculative_sampling_target_only,
+-            )
+-
+             from sglang.kernels.ops.speculative.reject_sampling import (
+                 chain_speculative_sampling_triton,
+             )
+ 
+-        use_rejection_sampling = get_spec().speculative_use_rejection_sampling
++        # if/else, not a ternary: the CUDA-only name still has to resolve in the
++        # branch not taken, and HIP only reaches here with rejection sampling on.
++        if use_rejection_sampling:
++            sampling_fn = chain_speculative_sampling_triton
++        else:
++            if not _is_npu:
++                from sgl_kernel import tree_speculative_sampling_target_only
+ 
+-        sampling_fn = (
+-            chain_speculative_sampling_triton
+-            if use_rejection_sampling
+-            else tree_speculative_sampling_target_only
+-        )
++            sampling_fn = tree_speculative_sampling_target_only
++
++        if _is_hip:
++            # Same names, same contract: dflash_utils.py aliases these too.
++            from sglang.kernels.ops.sampling.renorm_triton import (
++                top_k_renorm_probs_triton as top_k_renorm_prob,
++            )
++            from sglang.kernels.ops.sampling.renorm_triton import (
++                top_p_renorm_probs_triton as top_p_renorm_prob,
++            )
++        elif not _is_npu:
++            from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+ 
+         expanded_temperature = torch.repeat_interleave(
+             sampling_info.temperatures, verify_input.draft_token_num, dim=0
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index 539b96eb0b41..3b0dae9dba03 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -628,6 +628,13 @@ def draft(self, batch: ScheduleBatch):
+                 parent_list, top_scores_index, draft_tokens, draft_probs = (
+                     self.cuda_graph_runner.execute(forward_batch)
+                 )
++                if draft_probs is not None:
++                    # draft_probs is the one graph output read after the target
++                    # forward rather than by it, and it points into the graph's
++                    # private memory pool. The pool recycles that block in the
++                    # meantime -- in practice the DSA top-k mask lands there and
++                    # eagle_sample sees -inf. Copy out at the boundary.
++                    draft_probs = draft_probs.clone()
+             else:
+                 if (
+                     not forward_batch.forward_mode.is_idle()
+@@ -767,6 +774,7 @@ def draft_forward(self, forward_batch: ForwardBatch):
+                     probs, topk_p, topk_index = sample_draft_proposal(
+                         logits_output.next_token_logits,
+                         forward_batch.sampling_info.temperatures,
++                        forward_batch.sampling_info.top_ks,
+                     )
+                     draft_probs_list.append(probs)
+                     forward_batch.positions.add_(1)
+@@ -1117,6 +1125,7 @@ def _draft_extend_for_decode(
+             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
+                 draft_logits_output.next_token_logits,
+                 batch.sampling_info.temperatures,
++                batch.sampling_info.top_ks,
+             )
+         elif self.topk == 1 and not _is_hip:
+             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
+diff --git a/python/sglang/srt/speculative/spec_utils.py b/python/sglang/srt/speculative/spec_utils.py
+index 89bc4e2d9579..84d0bbad3560 100644
+--- a/python/sglang/srt/speculative/spec_utils.py
++++ b/python/sglang/srt/speculative/spec_utils.py
+@@ -165,15 +165,46 @@ def renorm_draft_probs(
+     return torch.softmax(next_token_logits / sampling_info.temperatures, dim=-1)
+ 
+ 
+-def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.Tensor):
++def sample_draft_proposal(
++    next_token_logits: torch.Tensor,
++    temperatures: torch.Tensor,
++    top_ks: Optional[torch.Tensor] = None,
++):
+     """Leviathan draft proposal: q = softmax(logits / T), X ~ q.
+ 
+     Returns (q, q(X), X). The verify's accept test coin*q(X) < p(X) is unbiased
+     only if q is exactly the distribution X was drawn from, so callers must hand
+     the returned q (not a recomputed one) to the verify.
++
++    A greedy row (``top_k == 1``) proposes its argmax instead. SamplingParams
++    rewrites temperature 0 to ``temperature=1.0, top_k=1``, so T alone cannot
++    tell a greedy request from a T=1 one, and sampling a sharp-but-not-
++    degenerate distribution proposes a non-argmax token often enough to cost
++    real accept length.
++
++    That row's X is then not drawn from the q returned beside it, which the
++    unbiasedness argument above otherwise rests on. It stays correct because
++    eagle_sample renormalises the target by the same per-row ``top_ks`` before
++    the accept test, so a greedy row's p is one-hot: X equal to the target
++    argmax accepts (p(X) = 1), any other X rejects (p(X) = 0) and the residual
++    (p - q)+ it resamples from is p itself. Both arms commit the target argmax,
++    which is what greedy means. Drop that renorm and this stops holding.
+     """
+     probs = torch.softmax(next_token_logits / temperatures, dim=-1)
+     topk_p, topk_index = fast_sample(probs, num_samples=1)
++    if top_ks is not None:
++        # Assert rather than skip on a device mismatch: a host-side top_ks would
++        # make this correction silently vanish, and the symptom -- draft accept
++        # length quietly dropping about 20% -- reads as a model problem, not a
++        # plumbing one.
++        assert top_ks.device == probs.device, (
++            f"top_ks must be on {probs.device} to reach the draft proposal, "
++            f"got {top_ks.device}; the caller has to carry the real per-request "
++            "top_k, not a host placeholder"
++        )
++        greedy = (top_ks <= 1).view(-1, 1)
++        topk_index = torch.where(greedy, probs.argmax(dim=-1, keepdim=True), topk_index)
++        topk_p = probs.gather(1, topk_index)
+     return probs, topk_p, topk_index
+ 
+ 
+diff --git a/test/registered/unit/spec/test_eagle_gate_routing.py b/test/registered/unit/spec/test_eagle_gate_routing.py
+new file mode 100644
+index 000000000000..708660d8c743
+--- /dev/null
++++ b/test/registered/unit/spec/test_eagle_gate_routing.py
+@@ -0,0 +1,127 @@
++"""Gate-routing tests for EAGLE verify: sampling vs. greedy (argmax).
++
++Guards the correctness contract of the ROCm fix in
++``eagle_utils._verify_uses_greedy``: on every non-HIP platform the gate must
++reduce byte-for-byte to the pre-patch predicate
++(``is_all_greedy or is_cpu or is_hip or is_xpu``), and HIP may take the
++sampling path only when rejection sampling is on and the batch isn't all-greedy.
++A regression that forced greedy on CUDA, or that let HIP sample without rejection
++sampling, would turn a case here red. Pure-boolean logic, so it runs on CPU CI.
++"""
++
++import itertools
++import unittest
++
++from sglang.srt.arg_groups.speculative_hook import (
++    _should_auto_enable_hip_rejection_sampling,
++)
++from sglang.srt.speculative.eagle_utils import _verify_uses_greedy
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cpu_ci(est_time=5, suite="base-a-test-cpu")
++
++
++def _pre_patch_gate(is_all_greedy, is_cpu, is_hip, is_xpu):
++    # eagle_utils.py gate before this PR. Non-HIP behavior must match this exactly.
++    return is_all_greedy or is_cpu or is_hip or is_xpu
++
++
++# (name, is_cpu, is_npu, is_hip, is_xpu); CUDA == no platform flag set.
++_PLATFORMS = {
++    "cuda": (False, False, False, False),
++    "hip": (False, False, True, False),
++    "cpu": (True, False, False, False),
++    "npu": (False, True, False, False),
++    "xpu": (False, False, False, True),
++}
++
++
++class TestEagleGateRouting(CustomTestCase):
++    def _gate(self, is_all_greedy, platform, use_rej):
++        is_cpu, _, is_hip, is_xpu = _PLATFORMS[platform]
++        return _verify_uses_greedy(
++            is_all_greedy=is_all_greedy,
++            is_cpu=is_cpu,
++            is_hip=is_hip,
++            is_xpu=is_xpu,
++            use_rejection_sampling=use_rej,
++        )
++
++    def test_non_hip_is_byte_identical_to_pre_patch(self):
++        for platform, is_all_greedy, use_rej in itertools.product(
++            _PLATFORMS, (False, True), (False, True)
++        ):
++            is_cpu, _, is_hip, is_xpu = _PLATFORMS[platform]
++            if is_hip:
++                continue
++            got = self._gate(is_all_greedy, platform, use_rej)
++            expected = _pre_patch_gate(is_all_greedy, is_cpu, is_hip, is_xpu)
++            self.assertEqual(
++                got,
++                expected,
++                f"{platform} greedy={is_all_greedy} rej={use_rej}: gate diverged "
++                f"from pre-patch ({got} != {expected})",
++            )
++
++    def test_hip_samples_only_with_rejection_and_non_greedy(self):
++        # The single new sampling entry: HIP + rejection sampling + not all-greedy.
++        self.assertFalse(self._gate(False, "hip", True))
++        # Every other HIP combination still commits greedy (argmax).
++        self.assertTrue(self._gate(True, "hip", True))
++        self.assertTrue(self._gate(True, "hip", False))
++        self.assertTrue(self._gate(False, "hip", False))
++
++    def test_cuda_and_npu_keyed_on_all_greedy_only(self):
++        # Both sample whenever the batch isn't all-greedy, regardless of the flag.
++        for platform in ("cuda", "npu"):
++            self.assertFalse(self._gate(False, platform, False))
++            self.assertFalse(self._gate(False, platform, True))
++            self.assertTrue(self._gate(True, platform, False))
++            self.assertTrue(self._gate(True, platform, True))
++
++    def test_cpu_xpu_always_greedy(self):
++        for platform in ("cpu", "xpu"):
++            for is_all_greedy in (False, True):
++                for use_rej in (False, True):
++                    self.assertTrue(
++                        self._gate(is_all_greedy, platform, use_rej),
++                        f"{platform} must force greedy",
++                    )
++
++
++def _hip_auto_enable(**overrides):
++    kwargs = dict(
++        is_hip=True,
++        use_rejection_sampling=False,
++        algorithm="EAGLE",
++        token_map=None,
++        eagle_topk=1,
++        accept_threshold_single=1.0,
++        accept_threshold_acc=1.0,
++        enable_deterministic_inference=False,
++    )
++    kwargs.update(overrides)
++    return _should_auto_enable_hip_rejection_sampling(**kwargs)
++
++
++class TestHipAutoEnableRejectionSampling(CustomTestCase):
++    def test_same_vocab_eagle_on_hip(self):
++        self.assertTrue(_hip_auto_enable())
++
++    def test_eagle3_stays_off(self):
++        # Reduced hot-token vocab; stage-a test_basic_sanity_eagle3.
++        self.assertFalse(_hip_auto_enable(algorithm="EAGLE3"))
++
++    def test_token_map_stays_off(self):
++        self.assertFalse(_hip_auto_enable(token_map="d2t.pt"))
++
++    def test_cuda_never_flips(self):
++        self.assertFalse(_hip_auto_enable(is_hip=False))
++
++    def test_already_on_is_a_no_op(self):
++        self.assertFalse(_hip_auto_enable(use_rejection_sampling=True))
++
++
++if __name__ == "__main__":
++    unittest.main()

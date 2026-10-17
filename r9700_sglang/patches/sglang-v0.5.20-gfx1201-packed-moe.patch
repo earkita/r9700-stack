@@ -1,0 +1,42 @@
+diff --git a/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py b/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py
+index 12243eb..399cf6b 100644
+--- a/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py
++++ b/python/sglang/srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py
+@@ -53,6 +53,12 @@ if _use_aiter:
+ # (moe_shuffle_scale -> shuffle_scale_n32k4), not the e8m0_shuffle layout used by
+ # gfx950. Using the wrong layout silently corrupts the dequant scales.
+ _is_gfx1250 = is_gfx1250_supported()
++_is_gfx1201 = (
++    _is_hip
++    and torch.cuda.is_available()
++    and getattr(torch.cuda.get_device_properties(0), "gcnArchName", "").split(":")[0]
++    == "gfx1201"
++)
+ 
+ # The gfx1250 a8w4 grouped MoE kernel consumes (16,16)-preshuffled FP4 weights
+ # (see aiter op_tests/test_flydsl_grouped_gemm_gfx1250.py, which always does
+@@ -833,7 +839,11 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
+             assert layer.w2_weight_scale.dtype == torch.uint8
+ 
+         # Pre-shuffle weight scales
+-        if _is_gfx1250:
++        if _is_gfx1201:
++            # The local packed GEMV consumes checkpoint-order E8M0 scales.
++            # AITER's e8m0_shuffle is only valid for its own MoE kernel.
++            pass
++        elif _is_gfx1250:
+             # gfx1250 grouped MoE GEMM consumes B-scales in the n32k4 layout.
+             num_experts = layer.w13_weight_scale.shape[0]
+             layer.w13_weight_scale.data = moe_shuffle_scale(
+@@ -904,6 +914,11 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
+         layer: torch.nn.Module,
+         dispatch_output: StandardDispatchOutput,
+     ) -> CombineInput:
++        if _is_gfx1201:
++            from r9700_sglang.packed_moe import apply_sglang
++
++            return apply_sglang(layer, dispatch_output)
++
+         from sglang.srt.layers.moe.moe_runner.aiter import (
+             AiterMoeQuantInfo,
+             AiterQuantType,
