@@ -1,0 +1,22 @@
+diff --git a/lmcache/v1/platform/devices/cuda/__init__.py b/lmcache/v1/platform/devices/cuda/__init__.py
+index 84e909f..43869d1 100644
+--- a/lmcache/v1/platform/devices/cuda/__init__.py
++++ b/lmcache/v1/platform/devices/cuda/__init__.py
+@@ -38,4 +38,17 @@ def _select_event_ipc_backend(device_type: str) -> "EventIPCBackend":
+     """
++    # Opt-in GLM ROCm transfers must never silently select another event ABI.
++    # Check this before isolated_ipc so a policy change cannot bypass it.
++    import os
++
++    if os.environ.get("R9K_SGLANG_GLM_LMCACHE_SYNC_EVENTS") == "1":
++        import torch
++
++        if not torch.version.hip:
++            raise RuntimeError("GLM LMCache synchronized events require ROCm")
++        from r9700_sglang.lmcache_events import SynchronizedEvents
++
++        return SynchronizedEvents(torch.cuda)
++
+     if get_ipc_policy().isolated_ipc:
+         # First Party
+         from lmcache.v1.platform.devices.cuda.timeline_semaphore_event_ipc import (

@@ -1,0 +1,24 @@
+diff --git a/lmcache/integration/sglang/unified_kv_adapter.py b/lmcache/integration/sglang/unified_kv_adapter.py
+index 299b26e..31b7ad2 100644
+--- a/lmcache/integration/sglang/unified_kv_adapter.py
++++ b/lmcache/integration/sglang/unified_kv_adapter.py
+@@ -458,10 +458,15 @@ class SGLangUnifiedKVAdapter:
+             slice_axis,
+             layer_id,
+         ) in mamba_pool._iter_transfer_state_entries():
+-            if slice_axis != 0:
+-                raise NotImplementedError(
+-                    f"LMCache MP does not support {field} state with slot "
+-                    f"slice_axis={slice_axis}"
++            # SGLang's slice_axis describes the TP slice axis *within* a
++            # per-slot state entry. It is not the slot axis: the iterator has
++            # already selected one model layer, leaving slots on dimension 0.
++            # GLM KDA conv uses slice_axis=1, but each TP rank stores its own
++            # complete contiguous slot entries through this connector.
++            if slice_axis is not None and not 0 <= slice_axis < layer_tensor.ndim - 1:
++                raise ValueError(
++                    f"Invalid TP slice_axis={slice_axis} for {field} state "
++                    f"of Mamba layer {layer_id} with shape {tuple(layer_tensor.shape)}"
+                 )
+             if not layer_tensor.is_contiguous():
+                 raise NotImplementedError(
