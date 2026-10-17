@@ -14,11 +14,15 @@ def target_model(cfg):
                 and cfg.parallel_config.tensor_parallel_size == 8)
 
 
-def target_prefix(prefix):
+def target_prefix(prefix, *, native_glm=False):
     # Transformers backend traverses its model with prefix="model".
     # Native wrappers may instead place model under language_model.
     import re
-    return re.search(r"(?:^|\.)(?:model\.language_model|language_model\.model)\.layers\.\d+\.", prefix) is not None
+    if re.search(r"(?:^|\.)(?:model\.language_model|language_model\.model)\.layers\.\d+\.", prefix):
+        return True
+    # vLLM 77154ca6's native Glm5NextForCausalLM owns `model.layers`.
+    # Require the exact root so draft.model.layers and vision layers stay out.
+    return bool(native_glm and re.match(r"^model\.layers\.\d+\.", prefix))
 
 
 def prepare(scheme, layer, pack):
@@ -70,14 +74,17 @@ def patch():
     import torch
     from vllm.platforms import current_platform
     from .gate import vllm_commit
-    if (not current_platform.is_rocm() or not vllm_commit().startswith("e97573215")
+    commit = vllm_commit()
+    if (not current_platform.is_rocm()
+            or not commit.startswith(("e97573215", "77154ca6"))
             or torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(":")[0] != "gfx1201"):
-        raise RuntimeError("GLM dense FP8 requires gfx1201 and vLLM e97573215")
+        raise RuntimeError("GLM dense FP8 requires gfx1201 and vLLM e97573215 or 77154ca6")
     from vllm.model_executor.layers.quantization.quark.schemes.quark_w8a8_fp8 import QuarkW8A8Fp8PerBlock as Scheme
     if getattr(Scheme, "_r9k_glm_dense_installed", False):
         return True
-    if list(inspect.signature(Scheme.apply_weights).parameters) != ["self", "layer", "x", "bias"]:
-        raise RuntimeError("Quark apply interface changed; revalidate GLM dense FP8")
+    if (list(inspect.signature(Scheme.apply_weights).parameters) != ["self", "layer", "x", "bias"]
+            or list(inspect.signature(Scheme.process_weights_after_loading).parameters) != ["self", "layer"]):
+        raise RuntimeError("Quark FP8 interface changed; revalidate GLM dense FP8")
     from ..kernels.glm_fp8 import gemm, bind
     from ..kernels.fp8 import permute_fp8
     bind()  # Reject a stale library before weight loading.
@@ -94,7 +101,8 @@ def patch():
     def after_load(self, layer):
         process(self, layer)
         # Exclude vision and drafters even if constructed under target config.
-        if not target_prefix(getattr(layer, "prefix", "")):
+        if not target_prefix(getattr(layer, "prefix", ""),
+                             native_glm=commit.startswith("77154ca6")):
             return
         from vllm.logger import init_logger
         if prepare(self, layer, permute_fp8):

@@ -79,8 +79,11 @@ def patch() -> bool:
         return True
     source = inspect.getsource(sparse_indexer.SparseAttnIndexerKpool.forward_hip)
     from .gate import check, vllm_commit
-    if not vllm_commit().startswith("e97573215") or source.count("if not rocm_aiter_ops.is_enabled():") != 1:
-        raise RuntimeError("GLM RDNA4 indexer adapter requires audited vLLM e97573215; revalidate the new pin")
+    version = vllm_commit()
+    latest = version.startswith("77154ca6")
+    if (not (version.startswith("e97573215") or latest)
+            or source.count("if not rocm_aiter_ops.is_enabled():") != 1):
+        raise RuntimeError("GLM RDNA4 indexer adapter requires audited vLLM e97573215 or 77154ca6")
     check("glm_rdna_indexer")
     from vllm.models.glm5next.common.attention import Glm5NextIndexerCache, Indexer
     from r9700_vllm.attn.glm_indexer import get_glm_indexer_backend
@@ -89,10 +92,12 @@ def patch() -> bool:
         raise ValueError("R9K_GLM_INDEXER_WORKSPACE must be bounded or stock")
     if workspace == "bounded":
         init_source = inspect.getsource(Indexer.__init__)
-        if init_source.count("self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)") != 1:
+        expected = ("get_max_prefill_buffer_size(vllm_config) // self.index_kpool" if latest
+                    else "self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)")
+        if init_source.count(expected) != 1:
             raise RuntimeError("GLM indexer workspace sizing changed; revalidate the pinned adapter")
         install_workspace_sizing(Indexer, init_logger("vllm.r9700_vllm"))
-    if os.environ.get("R9K_GLM_CACHE_GEOMETRY", "aligned") != "stock":
+    if not latest and os.environ.get("R9K_GLM_CACHE_GEOMETRY", "aligned") != "stock":
         Glm5NextIndexerCache.get_attn_backend = get_glm_indexer_backend
     sparse_indexer.rocm_aiter_ops = _GlmAiterGate(sparse_indexer.rocm_aiter_ops)
     init_logger("vllm.r9700_vllm").info(

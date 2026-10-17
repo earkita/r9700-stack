@@ -26,32 +26,46 @@ def main():
     p.add_argument("--label", required=True)
     p.add_argument("--passes", type=int, default=3)
     p.add_argument("--output-tokens", type=int, default=256)
+    p.add_argument("--power-cap-w", type=float, default=225,
+                   help="Expected cap for each GPU; freeze this value in the run protocol")
+    p.add_argument("--cases", nargs="+", choices=("8k", "32k", "128k", "256k"),
+                   default=("8k", "32k"), help="Frozen exact input lengths to measure")
+    p.add_argument("--cache-mode", choices=("cold", "warm"), default="cold",
+                   help="Cold uses a unique salt per request; warm reuses the excluded warmup salt")
     p.add_argument("--spec-metrics", action="store_true", help="Save per-request speculative acceptance by position")
     args = p.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
     version = importlib.metadata.version("betterbench")
     assert version == "0.6.0", version
+    with read_url(args.base, "/v1/models") as response:
+        models = json.load(response)["data"]
+    model = next(m for m in models if m["id"] == args.model)
     hardware = json.loads(subprocess.check_output(
         ["amd-smi", "static", "--gpu", *map(str, range(8)), "--asic", "--limit", "--json"]))
     assert len(hardware["gpu_data"]) == 8
     for gpu in hardware["gpu_data"]:
         assert gpu["asic"]["target_graphics_version"] == "gfx1201"
-        assert float(gpu["limit"]["ppt0"]["socket_power_limit"]["value"]) == 225
+        assert float(gpu["limit"]["ppt0"]["socket_power_limit"]["value"]) == args.power_cap_w
     (args.out / "hardware.json").write_text(json.dumps(hardware, indent=2) + "\n")
     rows = []
-    for name, target in [("context_8k", 8192), ("context_32k", 32768)]:
+    targets = {"8k": 8192, "32k": 32768, "128k": 130816, "256k": 261888}
+    selected = [("context_" + case, targets[case]) for case in args.cases]
+    for name, target in selected:
         messages = json.loads((args.corpus / (name + ".jsonl")).read_text())["messages"]
         with read_url(args.base, "/tokenize", dict(model=args.model, messages=messages,
                       add_generation_prompt=True, chat_template_kwargs={"reasoning_effort": "high"})) as r:
             count = json.load(r)["count"]
         assert count == target, (name, count, target)
+        assert target + args.output_tokens <= model["max_model_len"]
+        shared_salt = "glm-decode-" + uuid.uuid4().hex
         for i in range(args.passes + 1):
             before = metrics(args.base)
             assert not before["num_requests_running"] and not before["num_requests_waiting"]
             if args.spec_metrics:
                 with read_url(args.base, "/metrics") as r:
                     spec_before = r.read().decode()
-            extra = dict(cache_salt="glm-decode-" + uuid.uuid4().hex, ignore_eos=True,
+            extra = dict(cache_salt=shared_salt if args.cache_mode == "warm"
+                         else "glm-decode-" + uuid.uuid4().hex, ignore_eos=True,
                          min_p=0.0, presence_penalty=0.0, frequency_penalty=0.0,
                          repetition_penalty=1.0, chat_template_kwargs={"reasoning_effort": "high"})
             result = stream_chat_sync(args.base + "/v1", args.model, messages,
@@ -76,16 +90,21 @@ def main():
                 f.write(json.dumps(row) + "\n")
             assert result.ok and result.prompt_tokens == target, result.as_dict()
             assert result.completion_tokens == args.output_tokens and result.finish_reason == "length"
-            assert row["cached_tokens"] == 0
+            if args.cache_mode == "cold" or i == 0:
+                assert row["cached_tokens"] == 0
+            else:
+                assert row["cached_tokens"] >= target * .95, row["cached_tokens"]
             assert abs(result.decode_tps - (args.output_tokens - 1) / (sum(result.update_gaps_ms) / 1000)) < 1e-8
             rows.append(row)
             print(json.dumps(dict(category=name, warmup=i == 0, decode_tps=result.decode_tps,
                                   ttft_ms=result.ttft_ms, chunking=result.chunking)), flush=True)
     summary = dict(label=args.label, betterbench=version, concurrency=1,
+                   input_tokens=dict(selected), output_tokens=args.output_tokens,
+                   cache_mode=args.cache_mode, power_cap_w=args.power_cap_w,
                    formula="(completion_tokens - 1) / (last content-bearing SSE - first content-bearing SSE)",
                    limits="Native BetterBench convention; for batched speculation first burst may contain multiple tokens. No per-token ITL claim for batched output. Three samples do not qualify tail latency.",
                    groups={})
-    for name in ("context_8k", "context_32k"):
+    for name, _ in selected:
         group = [r["result"] for r in rows if r["category"] == name and not r["warmup"]]
         summary["groups"][name] = {field: dict(mean=statistics.mean(r[field] for r in group),
                     median=statistics.median(r[field] for r in group), min=min(r[field] for r in group),

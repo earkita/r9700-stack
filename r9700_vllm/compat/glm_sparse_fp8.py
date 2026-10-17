@@ -40,7 +40,7 @@ def _private_build(original):
     return build
 
 
-def forward_fp8(self, q, kv_cache, meta, layer):
+def forward_fp8(self, q, kv_cache, meta, layer, *, latest=False):
     """Pinned upstream forward_mqa with BF16 Q and explicitly scaled E4M3 KV."""
     import torch
     from vllm.platforms import current_platform
@@ -55,12 +55,30 @@ def forward_fp8(self, q, kv_cache, meta, layer):
         q.copy_(nope)
     if q.dtype != torch.bfloat16 or q.shape[-1] != 512:
         raise ValueError('GLM FP8 adapter requires BF16 Q with latent dimension 512')
+    block_stride_rows = None
+    if latest:
+        # Newer vLLM packs different KV groups side by side in one physical
+        # block. Its remap uses the physical row stride, not the logical page.
+        kv_cache, block_stride_rows = backend.flat_kv_row_view(kv_cache, meta.block_size)
+    # In mixed decode/prefill batches the newest metadata's num_actual_tokens
+    # covers the whole batch, while this MQA call and its request IDs cover
+    # only the sparse portion. Mirror upstream forward_mqa's q-sized remap.
+    num_mqa_tokens = q.shape[0] if latest else meta.num_actual_tokens
+    if latest and (meta.req_id_per_token.shape[0] < num_mqa_tokens
+                   or meta.paged_kv_indptr.shape[0] < num_mqa_tokens + 1):
+        raise RuntimeError('GLM sparse FP8 metadata does not cover MQA tokens')
     topk = backend.fit_kpool_indices_to_aiter(
-        self.topk_indices_buffer[:meta.num_actual_tokens], meta.topk_tokens)
+        self.topk_indices_buffer[:num_mqa_tokens], meta.topk_tokens)
+    remap_kwargs = dict(BLOCK_SIZE=meta.block_size, NUM_TOPK_TOKENS=meta.topk_tokens)
+    if latest:
+        remap_kwargs['BLOCK_STRIDE_ROWS'] = block_stride_rows
     backend.triton_convert_req_index_to_global_index(
-        meta.req_id_per_token, meta.block_table, topk,
-        meta.paged_kv_indptr, meta.paged_kv_indices,
-        BLOCK_SIZE=meta.block_size, NUM_TOPK_TOKENS=meta.topk_tokens)
+        meta.req_id_per_token[:num_mqa_tokens] if latest else meta.req_id_per_token,
+        meta.block_table, topk, meta.paged_kv_indptr, meta.paged_kv_indices,
+        **remap_kwargs)
+    if latest:
+        meta.remapped_buf = self.topk_indices_buffer
+        meta.remapped_epoch = self.index_epoch
     kv = kv_cache.view(current_platform.fp8_dtype())
     q = helper.get_mla_padded_q(self.num_heads, q)
     output = torch.empty((q.shape[0], q.shape[1], self.kv_lora_rank),
@@ -88,14 +106,20 @@ def patch():
     import torch
     from vllm.platforms import current_platform
     from .gate import check, vllm_commit
-    if (not current_platform.is_rocm() or not vllm_commit().startswith('e97573215')
+    version = vllm_commit()
+    latest = version.startswith('77154ca6')
+    if (not current_platform.is_rocm() or not (version.startswith('e97573215') or latest)
             or torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(':')[0] != 'gfx1201'):
-        raise RuntimeError('GLM FP8 adapter requires gfx1201 and audited vLLM e97573215')
+        raise RuntimeError('GLM FP8 adapter requires gfx1201 and audited vLLM e97573215 or 77154ca6')
     from vllm.v1.attention.backends.mla import rocm_aiter_mla_sparse as backend
     from vllm.v1.attention.ops import rocm_aiter_mla_sparse as ops
     # Reject already source-patched images too: do not stack two integrations.
-    for module, expected in [(backend, '7444de2f0a2e85f74c5e06e6c2109b290936b32167594bb8a2583c72393e9e83'),
-                             (ops, '40fccd0466ed53e26c618a5f85b0c120c5ea3ff83c0423027010857bea81c984')]:
+    hashes = (
+        ('52d589e61c3a1c31b30aeca1773227e1acf3c2047f19c56673339ce0ef8755d7',
+         'fa6a9c47537abdc156bfa07987d17e66f481937e0535a3bc6be957740ab53584') if latest else
+        ('7444de2f0a2e85f74c5e06e6c2109b290936b32167594bb8a2583c72393e9e83',
+         '40fccd0466ed53e26c618a5f85b0c120c5ea3ff83c0423027010857bea81c984'))
+    for module, expected in zip((backend, ops), hashes):
         if hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest() != expected:
             raise RuntimeError('GLM FP8 adapter requires unmodified pinned vLLM sources; revalidate this image')
     impl = backend.ROCMAiterMLASparseImpl
@@ -111,7 +135,7 @@ def patch():
     @wraps(original_forward)
     def forward(self, q, kv_cache, meta, layer):
         if getattr(self, '_r9700_glm_fp8_instance', False):
-            return forward_fp8(self, q, kv_cache, meta, layer)
+            return forward_fp8(self, q, kv_cache, meta, layer, latest=latest)
         return original_forward(self, q, kv_cache, meta, layer)
     forward._r9700_glm_fp8 = True
     builder = backend.ROCMAiterMLASparseMetadataBuilder
