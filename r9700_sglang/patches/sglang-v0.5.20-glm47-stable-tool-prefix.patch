@@ -1,0 +1,39 @@
+--- a/python/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -4,6 +4,7 @@
+ import json
+ import logging
+ import math
++import os
+ import time
+ import uuid
+ from collections import OrderedDict
+@@ -1297,6 +1298,28 @@
+                 )
+                 tool_call_constraint = ("json_schema", json_schema)
+ 
++        # Keep the GLM tool-bearing prompt prefix stable for a final structured
++        # answer. tool_choice=none still disables tool parsing/calls, and the
++        # existing response_format grammar is unchanged. Default off; qualify
++        # the actual template, constrained output and prefix-state reuse.
++        if (
++            os.environ.get("R9K_SGLANG_GLM_STABLE_TOOL_PREFIX") == "1"
++            and glm_constraint
++            and request.tools
++            and request.tool_choice == "none"
++            and request.response_format is not None
++            and request.response_format.type in ("json_object", "json_schema")
++            and request.input_ids is None
++            and all(
++                message.content is None or isinstance(message.content, str)
++                for message in request.messages
++            )
++            and self.chat_encoding_spec is None
++            and self.template_manager.chat_template_name is None
++            and self.tokenizer_manager.model_config.hf_config.model_type == "glm5_next"
++        ):
++            tools = [item.model_dump() for item in request.tools]
++
+         # When input_ids are provided, skip template tokenization entirely;
+         # only stop tokens and tool_call_constraint are needed.
+         if request.input_ids is not None:

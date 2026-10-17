@@ -34,7 +34,7 @@ def collect_stream(lines):
             delta = choice.get("delta", {})
             content.append(delta.get("content") or "")
             reasoning.append(delta.get("reasoning") or delta.get("reasoning_content") or "")
-            for call in delta.get("tool_calls", []):
+            for call in delta.get("tool_calls") or []:
                 target = calls.setdefault(call["index"], {"id": "", "name": "", "arguments": ""})
                 target["id"] += call.get("id") or ""
                 function = call.get("function") or {}

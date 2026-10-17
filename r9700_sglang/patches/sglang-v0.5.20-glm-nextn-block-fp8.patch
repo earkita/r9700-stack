@@ -1,0 +1,15 @@
+--- a/python/sglang/srt/layers/quantization/quark/quark.py
++++ b/python/sglang/srt/layers/quantization/quark/quark.py
+@@ -904,6 +904,12 @@
+         module: torch.nn.Module,
+         layer_name: str,
+     ) -> "QuarkMoEScheme":
++        if self.model_type == "glm5_next" and layer_name == "model.decoder.mlp.experts":
++            from r9700_sglang.mtp_names import nextn_expert_fp8_config
++            from r9700_sglang.mtp_fp8 import NextNBlockFp8
++
++            nextn_expert_fp8_config(self.quant_config, self.num_hidden_layers)
++            return NextNBlockFp8()
+         layer_quant_config = self._find_matched_config(layer_name, module)
+ 
+         if layer_quant_config.get("output_tensors") or layer_quant_config.get("bias"):

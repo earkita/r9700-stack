@@ -138,6 +138,23 @@ class HardwareAndReport(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'topology'):
             b.hardware.check_loaded([after],before,b.hardware.expected_links(before))
 
+    def test_shared_x4_uplink_is_not_mistaken_for_downtraining(self):
+        idle = self.links()
+        idle['paths']['0000:01:00.0'] = ['0000:01:00.0', '0000:00:02.0', '0000:00:01.0']
+        idle['devices']['0000:00:02.0'] = dict(
+            max_link_speed='32.0 GT/s PCIe', max_link_width='16',
+            current_link_speed='32.0 GT/s PCIe', current_link_width='4', numa_node='0')
+        idle['devices']['0000:00:01.0'] = dict(
+            max_link_speed='32.0 GT/s PCIe', max_link_width='4',
+            current_link_speed='32.0 GT/s PCIe', current_link_width='4', numa_node='0')
+        expected = b.hardware.expected_links(idle)
+        self.assertEqual(expected['0000:00:02.0']['width'], 4)
+        b.hardware.check_loaded([idle], idle, expected)
+        downtrained = json.loads(json.dumps(idle))
+        downtrained['devices']['0000:00:02.0']['current_link_width'] = '2'
+        with self.assertRaisesRegex(RuntimeError, 'width'):
+            b.hardware.check_loaded([downtrained], idle, expected)
+
     def test_decode_not_blended_with_ttft_or_aggregate(self):
         rows = [dict(case=str(i),start=0.,end=12.,result=dict(completion_tokens=101,
             ttft_ms=2000.,ttfa_ms=3000.,update_gaps_ms=[100.]*100,decode_tps=10.)) for i in range(2)]

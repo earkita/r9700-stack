@@ -1,0 +1,21 @@
+# Isolated, default-off GLM47 tools+JSON candidate. No #33946 parser change.
+# Build only after timed series; controller must verify the local base tag is
+# sha256:db8baa997cf1687c4486bce9259d2d3511385dcc6aeacd05dc9e412c96b26e97.
+ARG BASE_IMAGE=r9700/sglang:glm53-v0.5.20-gfx1201-mhc-post-v1
+FROM ${BASE_IMAGE}
+
+COPY r9700_sglang/glm_json_tools.py /opt/r9700_sglang/glm_json_tools.py
+COPY r9700_sglang/patches/sglang-v0.5.20-glm47-json-tools.patch /tmp/glm47-json-tools.patch
+RUN cd /opt/sglang \
+ && test "$(git rev-parse HEAD)" = 94602c9c2b7cbdb8efd5c52802dac6a1c180089e \
+ && echo '016eb8f8ce84f76c35b84dc905a9f68ecd4f2d32a6832e43e3a603ab5bddc8c4  python/sglang/srt/function_call/function_call_parser.py' | sha256sum --check \
+ && echo '9125d49034cc3c5650bed2bb046b1bfaee2591478d689a7b35724dff92335971  python/sglang/srt/entrypoints/openai/protocol.py' | sha256sum --check \
+ && echo '047e4391dc87816a62da34392eea9379fcb1f93025e70c3b327de8b596f59b09  python/sglang/srt/entrypoints/openai/serving_chat.py' | sha256sum --check \
+ && git apply --check /tmp/glm47-json-tools.patch \
+ && git apply /tmp/glm47-json-tools.patch \
+ && echo '87cd4bbdeac0e3b300dcb5d8db7c838d7bea6cc3a1cea8a4796ad64f072eb0c4  python/sglang/srt/function_call/function_call_parser.py' | sha256sum --check \
+ && echo '238084a251d62f3f4583b3f48d2c5f5b178c89cc43e535cbfab3452a61d843b7  python/sglang/srt/entrypoints/openai/protocol.py' | sha256sum --check \
+ && echo '2cd63efb496cb7ccd5a6d35b3aa1b418363fcb870adcbddb0c4696f48747d185  python/sglang/srt/entrypoints/openai/serving_chat.py' | sha256sum --check
+
+# Enable only in the dedicated qualification command, not through this image.
+LABEL io.r9700.sglang.glm47-json-tools="experimental-v2"

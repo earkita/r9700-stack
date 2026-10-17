@@ -1,0 +1,13 @@
+--- a/python/sglang/srt/models/glm5_next.py
++++ b/python/sglang/srt/models/glm5_next.py
+@@ -1161,6 +1161,10 @@
+             )
+         )
+         self.capture_aux_hidden_states = False
++        if __import__("os").environ.get("R9K_SGLANG_MTP_TRACE_DIR"):
++            from r9700_sglang.mtp_trace import install
++
++            install(self.model)
+ 
+         if not self.encoder_only:
+             get_attn_tp_context().init_context(

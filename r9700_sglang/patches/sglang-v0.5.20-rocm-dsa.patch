@@ -1,0 +1,44 @@
+diff --git a/python/sglang/srt/layers/attention/dsa/dsa_backend_kpool.py b/python/sglang/srt/layers/attention/dsa/dsa_backend_kpool.py
+index acf04fc..9f37221 100644
+--- a/python/sglang/srt/layers/attention/dsa/dsa_backend_kpool.py
++++ b/python/sglang/srt/layers/attention/dsa/dsa_backend_kpool.py
+@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
+     update_kpool_write_plan,
+     update_pooled_paged_mqa_metadata,
+ )
++from sglang.srt.utils import is_hip
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
+@@ -42,6 +43,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
+             topk_indices is None
+             or self.dsa_index_kpool <= 1
+             or dsa_impl in ("fa3", "tilelang", "trtllm")
++            # The ROCm Triton sparse-MLA prefill/decode kernels mask -1
++            # entries and accept the extra live tail columns from KPool.
++            or (is_hip() and dsa_impl == "triton")
+         ):
+             return
+         raise NotImplementedError(
+diff --git a/python/sglang/srt/layers/attention/dsa_backend.py b/python/sglang/srt/layers/attention/dsa_backend.py
+index 8fdd7ba..768f371 100644
+--- a/python/sglang/srt/layers/attention/dsa_backend.py
++++ b/python/sglang/srt/layers/attention/dsa_backend.py
+@@ -531,7 +531,7 @@ class DeepseekSparseAttnBackend(
+                 ),
+             )
+         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
+-        elif self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
++        elif (not _is_hip and self.device_sm_major >= 10) or self.dsa_decode_impl == "trtllm":
+             self.workspace_buffer = get_buffer(
+                 "dsa_trtllm_workspace",
+                 lambda: torch.empty(
+@@ -2920,7 +2920,7 @@ class DeepseekSparseAttnBackend(
+         # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues.
+         # gfx950 reports device capability sm_(9,5), so it never enters this SM100+
+         # branch and falls through to the aiter flash_attn_varlen_func path below.
+-        if self.device_sm_major >= 10:
++        if not _is_hip and self.device_sm_major >= 10:
+             import flashinfer
+ 
+             seq_lens = metadata.cache_seqlens_int32

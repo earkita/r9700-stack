@@ -1,0 +1,48 @@
+--- a/python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py
++++ b/python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py
+@@ -601,24 +601,11 @@
+ 
+     if torch.version.hip is not None:
+         if cols:
+-            positions = torch.arange(cols, device=logits.device, dtype=torch.int64)
+-            starts = (
+-                row_starts.to(torch.int64)
+-                if row_starts is not None
+-                else torch.zeros_like(group_lengths, dtype=torch.int64)
++            from r9700_sglang.kpool import mask_pooled_logits
++
++            masked_scores = mask_pooled_logits(
++                logits, group_lengths, row_starts, min_cols=group_topk
+             )
+-            gather_positions = starts[:, None] + positions[None, :]
+-            masked_scores = torch.gather(
+-                logits, 1, gather_positions.clamp(max=cols - 1)
+-            )
+-            valid_positions = (positions[None, :] < group_lengths[:, None]) & (
+-                gather_positions < cols
+-            )
+-            masked_scores = masked_scores.masked_fill(~valid_positions, -float("inf"))
+-            if cols < group_topk:
+-                masked_scores = torch.nn.functional.pad(
+-                    masked_scores, (0, group_topk - cols), value=-float("inf")
+-                )
+             selected_groups = torch.topk(masked_scores, group_topk, dim=1).indices.to(
+                 torch.int32
+             )
+@@ -655,6 +642,16 @@
+         torch.full_like(group_lengths.to(torch.int32), max_valid_groups),
+     )
+     group_valid = rank.unsqueeze(0) < valid_counts.unsqueeze(1)
++    if torch.version.hip is not None and page_table_row_index is not None:
++        if topk_offsets is not None:
++            raise ValueError("Mapped KPool page table and topk offsets are mutually exclusive")
++        from r9700_sglang.kpool import expand_mapped_groups
++
++        return expand_mapped_groups(
++            selected_groups, group_lengths, page_table, page_table_row_index,
++            pool_size=pool_size, logit_cols=cols, seq_lens=seq_lens,
++            out_rows=out_rows,
++        )
+     if page_table_row_index is not None:
+         page_table = page_table.index_select(0, page_table_row_index.to(torch.int64))
+     expanded = expand_pooled_groups_to_topk(

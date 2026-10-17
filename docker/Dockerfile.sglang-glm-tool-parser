@@ -1,0 +1,16 @@
+# Isolated parser qualification image. The control image stays immutable.
+# Build only after timed model runs; no GPU is required for this build.
+# Local image ID (not a registry manifest digest): the build controller must
+# verify this tag resolves to db8baa997cf1687c4486bce9259d2d3511385dcc6aeacd05dc9e412c96b26e97.
+ARG BASE_IMAGE=r9700/sglang:glm53-v0.5.20-gfx1201-mhc-post-v1
+FROM ${BASE_IMAGE}
+
+COPY r9700_sglang/patches/sglang-v0.5.20-glm47-buffer-drain.patch /tmp/glm47-buffer-drain.patch
+RUN cd /opt/sglang \
+ && test "$(git rev-parse HEAD)" = 94602c9c2b7cbdb8efd5c52802dac6a1c180089e \
+ && echo '61a62420d07e3986ae36d0f6fa44b9232f4c331ebd8fc3b32ba0889523bdfb0e  python/sglang/srt/function_call/glm47_moe_detector.py' | sha256sum --check \
+ && git apply --check /tmp/glm47-buffer-drain.patch \
+ && git apply /tmp/glm47-buffer-drain.patch \
+ && echo 'a5be7bad12f0fd99d775c1680abdcfcb1b6f9bdb4d9863eb7c0bd259ff1de863  python/sglang/srt/function_call/glm47_moe_detector.py' | sha256sum --check
+
+LABEL io.r9700.sglang.glm47-buffer-drain="33946-8fafb2ac44e389647b395b6e5923304bf45f5a95"

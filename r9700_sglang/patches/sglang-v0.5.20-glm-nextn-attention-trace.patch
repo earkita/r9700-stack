@@ -1,0 +1,23 @@
+--- a/python/sglang/srt/layers/attention/dsa_backend.py
++++ b/python/sglang/srt/layers/attention/dsa_backend.py
+@@ -2018,7 +2018,7 @@
+                 triton_sparse_mla_fwd,
+             )
+ 
+-            return triton_sparse_mla_fwd(
++            result = triton_sparse_mla_fwd(
+                 q_nope=q_nope,
+                 q_rope=q_rope,
+                 kv=kv_cache,
+@@ -2026,6 +2026,11 @@
+                 sm_scale=layer.scaling,
+                 d_v=layer.v_head_dim,
+             )
++            if __import__("os").environ.get("R9K_SGLANG_MTP_TRACE_DIR"):
++                from r9700_sglang.mtp_trace import attention
++
++                attention(q_nope,q_rope,kv_cache,page_table_1,result,layer,forward_batch)
++            return result
+         elif dsa_impl in ("flashmla_sparse", "flashmla_sparse_q8"):
+             if topk_transform_method == TopkTransformMethod.RAGGED:
+                 _has_prefix = any(forward_batch.extend_prefix_lens_cpu)

@@ -1,0 +1,20 @@
+--- a/python/sglang/srt/models/glm5_next.py
++++ b/python/sglang/srt/models/glm5_next.py
+@@ -1604,6 +1604,17 @@
+                             f"checkpoint={tuple(loaded_weight.shape)}"
+                         ) from exc
+ 
++        if is_nextn:
++            required = ("model.decoder.", "model.eh_proj.", "model.enorm.",
++                        "model.hnorm.", "model.shared_head.norm.")
++            missing = sorted(name for name in params_dict
++                             if name.startswith(required) and name not in loaded_params
++                             and not name.endswith((".k_scale", ".v_scale")))
++            logger.warning("GLM NextN loader coverage: loaded=%d/%d, missing required=%s",
++                           len(loaded_params), len(params_dict), missing)
++            if missing:
++                raise RuntimeError(f"GLM NextN required checkpoint tensors were not loaded: {missing}")
++
+         if not is_nextn:
+             critical = ("model.layers.0.", "model.layers.1.", "model.layers.2.")
+             missing_all = sorted(name for name in params_dict if name not in loaded_params)

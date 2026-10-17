@@ -1,0 +1,18 @@
+--- a/python/sglang/kernels/ops/layernorm/mhc.py
++++ b/python/sglang/kernels/ops/layernorm/mhc.py
+@@ -1836,6 +1836,15 @@
+     post_layer_mix: torch.Tensor,
+     comb_res_mix: torch.Tensor,
+ ) -> torch.Tensor:
++    # Independent prefill-only experiment; decode/verify keep Torch.
++    import os
++    backend = os.environ.get("R9K_SGLANG_MHC_POST", "torch")
++    if backend not in ("torch", "triton"):
++        raise ValueError("R9K_SGLANG_MHC_POST must be torch or triton")
++    if backend == "triton" and residual.shape[0] >= 128:
++        from r9700_sglang.mhc_post import post
++        return post(x, residual, post_layer_mix, comb_res_mix)
++
+     out = post_layer_mix * x.unsqueeze(1) + (
+         comb_res_mix.unsqueeze(-1) * residual.unsqueeze(2)
+     ).sum(dim=1)

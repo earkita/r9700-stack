@@ -1,0 +1,65 @@
+--- a/aiter/ops/triton/attention/pa_mqa_logits.py
++++ b/aiter/ops/triton/attention/pa_mqa_logits.py
+@@ -625,7 +625,14 @@
+                 hidden_dim,
+             )
+     else:
+-        assert not Preshuffle, "Preshuffle mode is only supported on gluon kernel."
++        # gfx1201 has no Gluon paged-MQA implementation in this AITER image.
++        # Its Triton reader below accepts the same 16x16 K-cache layout that
++        # SGLang writes for 64-token KPool pages. Keep every other arch on its
++        # original dispatch until it is independently validated.
++        assert not Preshuffle or get_gfx() == "gfx1201", (
++            "Preshuffle mode is only supported on the Gluon kernel or the "
++            "gfx1201 Triton KPool reader."
++        )
+         kv_cache_values = kv_cache_fp8.view(num_block, KVBlockSize, hidden_dim)
+         kv_cache_scales = kv_cache_scale.view(num_block, KVBlockSize)
+         kernel = _deepgemm_fp8_paged_mqa_logits[grid](
+@@ -656,5 +663,6 @@
+             SplitKV=SplitKV,
+             HiddenDim=hidden_dim,
+             KVBlockSize=KVBlockSize,
++            Preshuffle=Preshuffle,
+         )
+     return triton.runtime.cache.get_cache_manager(kernel.hash).key
+--- a/aiter/ops/triton/_triton_kernels/attention/pa_mqa_logits.py
++++ b/aiter/ops/triton/_triton_kernels/attention/pa_mqa_logits.py
+@@ -442,6 +442,7 @@
+     ChunkK: tl.constexpr,
+     HiddenDim: tl.constexpr,
+     KVBlockSize: tl.constexpr,
++    Preshuffle: tl.constexpr = False,
+     SplitKV: tl.constexpr = 1,
+ ):
+     pid = tl.program_id(0)
+@@ -488,11 +489,25 @@
+         )
+         block_offset = logical_kv_idx % KVBlockSize
+ 
++        if Preshuffle:
++            # SGLang's KPool writer stores each page in 16x16 tiles. Address
++            # the packed K bytes in-place; scales remain in token order.
++            tile: tl.constexpr = 16
++            col = tl.arange(0, HiddenDim)[None, :]
++            slot = block_offset[:, None]
++            k_offset = (
++                (slot // tile) * (tile * HiddenDim)
++                + (col // tile) * (tile * tile)
++                + (slot % tile) * tile
++                + col % tile
++            )
++        else:
++            k_offset = (
++                block_offset[:, None] * stride_k_token
++                + tl.arange(0, HiddenDim)[None, :]
++            )
+         k = tl.load(
+-            KV_buffer
+-            + physical_block_idx[:, None] * stride_k_block
+-            + block_offset[:, None] * stride_k_token
+-            + tl.arange(0, HiddenDim)[None, :],
++            KV_buffer + physical_block_idx[:, None] * stride_k_block + k_offset,
+             mask=mask_kv[:, None],
+             other=0.0,
+         )

@@ -1,0 +1,91 @@
+diff --git a/python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py b/python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py
+index db8d3a8..8c5130f 100644
+--- a/python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py
++++ b/python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py
+@@ -572,7 +572,10 @@ def topk_from_pooled_history_logits(
+             f"is disabled. Got device={logits.device}, dtype={logits.dtype}."
+         )
+ 
+-    if group_topk in (128, 160, 192, 224, 256, 512):
++    # The fused JIT kernel below includes CUDA headers and cannot build on HIP.
++    # Keep the same pooled selection/expansion semantics with device-side
++    # PyTorch topk until a dedicated gfx1201 fused selector is qualified.
++    if torch.version.hip is None and group_topk in (128, 160, 192, 224, 256, 512):
+         from sglang.kernels.ops.moe.kpool_topk_transform import (
+             fast_kpool_topk_transform_fused,
+         )
+@@ -596,18 +599,54 @@ def topk_from_pooled_history_logits(
+         padded[: result.shape[0]] = result
+         return padded
+ 
+-    assert page_table_row_index is None, (
+-        "page_table_row_index requires the fused fast_kpool group_topk path"
+-    )
+-
+-    from sgl_kernel import fast_topk_v2
++    if torch.version.hip is not None:
++        if cols:
++            positions = torch.arange(cols, device=logits.device, dtype=torch.int64)
++            starts = (
++                row_starts.to(torch.int64)
++                if row_starts is not None
++                else torch.zeros_like(group_lengths, dtype=torch.int64)
++            )
++            gather_positions = starts[:, None] + positions[None, :]
++            masked_scores = torch.gather(
++                logits, 1, gather_positions.clamp(max=cols - 1)
++            )
++            valid_positions = (positions[None, :] < group_lengths[:, None]) & (
++                gather_positions < cols
++            )
++            masked_scores = masked_scores.masked_fill(~valid_positions, -float("inf"))
++            if cols < group_topk:
++                masked_scores = torch.nn.functional.pad(
++                    masked_scores, (0, group_topk - cols), value=-float("inf")
++                )
++            selected_groups = torch.topk(masked_scores, group_topk, dim=1).indices.to(
++                torch.int32
++            )
++        else:
++            selected_groups = torch.empty(
++                (logits.shape[0], group_topk), dtype=torch.int32, device=logits.device
++            )
++        # For short histories the CUDA path emits chronological groups.
++        chronological = torch.arange(
++            group_topk, device=logits.device, dtype=torch.int32
++        )[None, :]
++        selected_groups = torch.where(
++            group_lengths[:, None] <= group_topk,
++            chronological,
++            selected_groups,
++        )
++    else:
++        assert page_table_row_index is None, (
++            "page_table_row_index requires the fused fast_kpool group_topk path"
++        )
++        from sgl_kernel import fast_topk_v2
+ 
+-    selected_groups = fast_topk_v2(
+-        logits,
+-        group_lengths.to(torch.int32),
+-        group_topk,
+-        row_starts=row_starts,
+-    )
++        selected_groups = fast_topk_v2(
++            logits,
++            group_lengths.to(torch.int32),
++            group_topk,
++            row_starts=row_starts,
++        )
+ 
+     rank = torch.arange(group_topk, device=logits.device, dtype=torch.int32)
+     max_valid_groups = min(cols, group_topk)
+@@ -616,6 +655,8 @@ def topk_from_pooled_history_logits(
+         torch.full_like(group_lengths.to(torch.int32), max_valid_groups),
+     )
+     group_valid = rank.unsqueeze(0) < valid_counts.unsqueeze(1)
++    if page_table_row_index is not None:
++        page_table = page_table.index_select(0, page_table_row_index.to(torch.int64))
+     expanded = expand_pooled_groups_to_topk(
+         selected_groups.contiguous(),
+         group_valid,
