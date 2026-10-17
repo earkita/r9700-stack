@@ -125,6 +125,23 @@ class Quality(unittest.TestCase):
         self.assertEqual(result["reasoning"], "think")
         self.assertEqual(timing, {"ttft_ms": 1000, "first_content_ms": 2000, "end_to_end_ms": 3000})
 
+    def test_gpu_cache_reset_retries_until_completed_blocks_are_free(self):
+        class Response:
+            def __init__(self, success):
+                self.success = success
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def read(self):
+                return json.dumps({"success": self.success}).encode()
+        with patch.object(quality, "read_url", side_effect=[Response(False), Response(True)]) as request, \
+             patch.object(quality.time, "sleep"):
+            quality.reset_gpu_prefix_cache("http://test")
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args.args[1],
+                         "/reset_prefix_cache?reset_running_requests=false&reset_external=false")
+
 
 if __name__ == "__main__":
     unittest.main()

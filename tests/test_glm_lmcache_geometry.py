@@ -19,6 +19,27 @@ class Config:
 
 
 class Geometry(unittest.TestCase):
+    def test_mtp_relocated_mamba_scratch_is_not_saved_as_state(self):
+        pytest.importorskip('lmcache')
+        from lmcache.integration.vllm.lmcache_mp_metadata import LMCacheMPRequestTracker
+
+        tracker = LMCacheMPRequestTracker.__new__(LMCacheMPRequestTracker)
+        tracker.allocated_block_ids = {}
+        tracker.append_block_ids(([50, 51], [10, 11, 12, 13, 14]), 3)
+        tracker.append_block_ids(([52], [15]), 3)
+        # With MTP3, vLLM may move one of the last three speculative
+        # blocks to the tail and silently null its old slot.
+        tracker.append_block_ids(([53, 54], [13, 16]), 3)
+        self.assertEqual(tracker.allocated_block_ids[1],
+                         [10, 11, 12, 0, 14, 15, 13, 16])
+        self.assertEqual(tracker.allocated_block_ids[0], [50, 51, 52, 53, 54])
+
+        ordinary = LMCacheMPRequestTracker.__new__(LMCacheMPRequestTracker)
+        ordinary.allocated_block_ids = {}
+        ordinary.append_block_ids(([1, 2],), 0)
+        ordinary.append_block_ids(([2, 3],), 0)
+        self.assertEqual(ordinary.allocated_block_ids[0], [1, 2, 2, 3])
+
     def test_upstream_store_gate_with_and_without_circular_scratch(self):
         pytest.importorskip('vllm')
         pytest.importorskip('lmcache')
@@ -57,6 +78,46 @@ class Geometry(unittest.TestCase):
         self.assertEqual(select_block_ids(([1, 2], [99], [3, 4]), kept, 3), ([1, 2], [3, 4]))
         with self.assertRaises(ValueError):
             select_block_ids(([1],), kept, 3)
+
+    def test_checkpoint_mtp_attention_is_stored_but_its_tail_is_rebuilt(self):
+        torch = pytest.importorskip('torch')
+        pytest.importorskip('vllm')
+        from vllm.v1.core import kv_cache_utils as kv
+        from vllm.v1.kv_cache_interface import (
+            KpoolTailSpec, MLAAttentionSpec, MambaSpec,
+        )
+
+        cfg = NS(parallel_config=NS(pipeline_parallel_size=1,
+                                    decode_context_parallel_size=1,
+                                    prefill_context_parallel_size=1),
+                 model_config=NS(hf_config=NS(model_type='glm5_next')))
+        specs = {}
+        for prefix in ('target0', 'target1', 'mtp45'):
+            specs[prefix + '.attn'] = MLAAttentionSpec(
+                1152, num_kv_heads=1, head_size=512, dtype=torch.uint8)
+            specs[prefix + '.indexer'] = MLAAttentionSpec(
+                1152, num_kv_heads=1, head_size=132, dtype=torch.uint8,
+                tokens_per_state=4)
+            specs[prefix + '.tail'] = KpoolTailSpec(
+                4, num_kv_heads=2, head_size=128, head_size_v=0,
+                dtype=torch.bfloat16, sliding_window=4)
+        for i in range(6):
+            specs[f'mamba{i}'] = MambaSpec(
+                1152, shapes=((1024,),), dtypes=(torch.float32,))
+
+        groups = kv._get_kv_cache_groups_glm5_next(cfg, specs)
+        self.assertIsNotNone(groups)
+        filtered, kept, scratch = select_cache_groups(Config(groups))
+        stored = {name for group in filtered.kv_cache_groups
+                  for name in group.layer_names}
+        self.assertIn('mtp45.attn', stored)
+        self.assertIn('mtp45.indexer', stored)
+        self.assertNotIn('mtp45.tail', stored)
+        self.assertIn('mtp45.tail', scratch)
+        self.assertEqual(len(kept), len(groups) - 1)
+        block_ids = tuple((i, i + 10) for i in range(len(groups)))
+        self.assertEqual(select_block_ids(block_ids, kept, len(groups)),
+                         tuple(block_ids[i] for i in kept))
 
     def test_scheduler_copy_including_empty_deltas(self):
         ids = ([1, 2], [99], [3, 4])

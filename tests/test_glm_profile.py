@@ -83,6 +83,59 @@ class Launcher(unittest.TestCase):
                 self.assertIn(flag, cache)
                 self.assertIn(flag, model)
 
+    def test_mtp3_lmcache_candidate_is_isolated_from_k4(self):
+        profile = ROOT / "serve/baseline-earkita/glm/glm-5.3-flash-c4-mtp3-lmcache.sh"
+        clean = {k: v for k, v in os.environ.items()
+                 if not k.startswith(("R9K_", "VLLM_", "KV_CACHE_"))}
+        out = subprocess.check_output(["bash", str(profile), "DRYRUN=1", "MAXLEN=131072"],
+                                      env=clean, text=True)
+        cache_line, model_line = out.splitlines()
+        cache, model = shlex.split(cache_line), shlex.split(model_line)
+        self.assertIn("glm53-kv-cache-mtp3", cache)
+        self.assertIn("glm53-e975-fp8-mtp3-v1", cache_line)
+        self.assertIn("glm53-flash-c4-mtp3-lmcache", model)
+        self.assertEqual(model[model.index("--port") + 1], "8081")
+        self.assertEqual(model[model.index("--max-model-len") + 1], "131072")
+        spec = json.loads(model[model.index("--speculative-config") + 1])
+        self.assertEqual(spec, {"method": "mtp", "num_speculative_tokens": 3})
+        graphs = json.loads(model[model.index("--compilation-config") + 1])
+        self.assertEqual(graphs["cudagraph_capture_sizes"], [4, 8, 12, 16])
+        transfer = json.loads(model[model.index("--kv-transfer-config") + 1])
+        self.assertEqual(transfer["kv_connector"], "GlmLMCacheMPConnector")
+        self.assertEqual(transfer["kv_connector_extra_config"]["lmcache.mp.port"], 5556)
+        self.assertIn("R9K_GLM_DFLASH=0", model)
+        self.assertNotIn("R9K_GLM_DFLASH_CACHE=shared", model)
+        self.assertNotIn("R9K_GLM_DFLASH_SHARD_FC=1", model)
+        self.assertIn("r9700/vllm:glm53-lmcache055-mtp5004", cache)
+        self.assertIn("r9700/vllm:glm53-lmcache055-mtp5004", model)
+        for arg in ("MTP=4", "DRAFT=/models/draft", "SPEC=4"):
+            with self.subTest(arg=arg):
+                result = subprocess.run(["bash", str(profile), "DRYRUN=1", arg],
+                                        env=clean, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 2)
+
+    def test_mtp3_target_only_reference_has_no_drafter_and_separate_cache(self):
+        profile = ROOT / "serve/baseline-earkita/glm/glm-5.3-flash-c4-mtp3-lmcache.sh"
+        clean = {k: v for k, v in os.environ.items()
+                 if not k.startswith(("R9K_", "VLLM_", "KV_CACHE_"))}
+        out = subprocess.check_output(["bash", str(profile), "DRYRUN=1", "REFERENCE=1",
+                                       "MAXLEN=131072"], env=clean, text=True)
+        cache_line, model_line = out.splitlines()
+        cache, model = shlex.split(cache_line), shlex.split(model_line)
+        self.assertIn("glm53-kv-cache-target", cache)
+        self.assertIn("glm53-e975-fp8-target-v1", cache_line)
+        self.assertIn("glm53-flash-c4-target-lmcache", model)
+        self.assertEqual(model[model.index("--port") + 1], "8082")
+        self.assertNotIn("--speculative-config", model)
+        self.assertIn("R9K_GLM_DFLASH=0", model)
+        transfer = json.loads(model[model.index("--kv-transfer-config") + 1])
+        self.assertEqual(transfer["kv_connector_extra_config"]["lmcache.mp.port"], 5557)
+        for arg in ("REFERENCE=2", "REFERENCE=-1"):
+            with self.subTest(arg=arg):
+                result = subprocess.run(["bash", str(profile), "DRYRUN=1", arg],
+                                        env=clean, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 2)
+
     def test_dflash_is_separate_and_explicit(self):
         args = self.launch("glm-5.3-flash-c2.sh", MODEL="/models/local GLM")
         spec = json.loads(args[args.index("--speculative-config") + 1])

@@ -36,12 +36,51 @@ def metrics(base):
         if not values:
             raise RuntimeError("Missing metric: " + name)
         result[name] = sum(values)
+    external = [float(line.rsplit(" ", 1)[1]) for line in raw.splitlines()
+                if line.startswith("vllm:external_prefix_cache_hits_total{")]
+    result["external_prefix_cache_hits_total"] = sum(external) if external else None
     cache = [line for line in raw.splitlines() if line.startswith("vllm:cache_config_info{")]
     if len(cache) != 1:
         raise RuntimeError("Require one observed cache configuration")
     result["prefix_cache"] = 'enable_prefix_caching="True"' in cache[0]
     result["cache_config"] = cache[0]
     return result
+
+
+def wait_external_stores(base, timeout):
+    """Wait for both GPU-to-LMCache and filesystem stores before a restore."""
+    names = (("num_submitted_stores_total", "num_finished_stores_total"),
+             ("l2_store_submitted_requests_total", "l2_store_completed_requests_total"))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with read_url(base, "/metrics") as response:
+            raw = response.read().decode()
+        values = {}
+        for pair in names:
+            for name in pair:
+                samples = [float(line.rsplit(" ", 1)[1]) for line in raw.splitlines()
+                           if line.startswith("lmcache_mp_" + name + "{")
+                           or line.startswith("lmcache_mp_" + name + " ")]
+                values[name] = sum(samples) if samples else None
+        if all(values[a] is not None and values[b] is not None and values[a] == values[b]
+               for a, b in names):
+            return values
+        time.sleep(1)
+    raise RuntimeError("LMCache stores did not drain before external restore")
+
+
+def reset_gpu_prefix_cache(base, timeout=120):
+    """Wait for completed-request blocks to be released; keep external cache."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with read_url(base,
+                      "/reset_prefix_cache?reset_running_requests=false&reset_external=false",
+                      {}, timeout=30) as response:
+            result = json.load(response)
+        if result.get("success") is True:
+            return
+        time.sleep(1)
+    raise RuntimeError("GPU-only APC reset failed after waiting for block release")
 
 
 def classify(response, case):
@@ -186,9 +225,12 @@ def main():
     parser.add_argument("--ids", nargs="+")
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=900)
+    parser.add_argument("--external-cache-metrics", help="LMCache metrics URL; reset GPU APC before each warm request")
     args = parser.parse_args()
     if args.max_tokens < 1 or args.repetitions < 1 or args.timeout <= 0:
         parser.error("Budget, repetitions and timeout must be positive")
+    if args.external_cache_metrics and args.phase != "on":
+        parser.error("External restore requires --phase on")
     cases = json.loads(args.corpus.read_text())
     if len({c["id"] for c in cases}) != len(cases):
         parser.error("Duplicate corpus ids")
@@ -241,6 +283,10 @@ def main():
                     row["request"] = body
                     fatal = None
                     try:
+                        if phase == "on_warm" and args.external_cache_metrics:
+                            row["drained_stores"] = wait_external_stores(
+                                args.external_cache_metrics.rstrip("/"), 120)
+                            reset_gpu_prefix_cache(base)
                         before = metrics(base)
                         if before["num_requests_running"] or before["num_requests_waiting"]:
                             raise RuntimeError("Require idle endpoint for isolated cache observations")
@@ -257,13 +303,26 @@ def main():
                                 time.sleep(0.1)
                                 after = metrics(base)
                         hits = after["prefix_cache_hits_total"] - before["prefix_cache_hits_total"]
+                        external_before = before["external_prefix_cache_hits_total"]
+                        external_after = after["external_prefix_cache_hits_total"]
+                        external_hits = (external_after - external_before
+                                         if external_before is not None and external_after is not None else None)
                         queries = after["prefix_cache_queries_total"] - before["prefix_cache_queries_total"]
-                        row.update(metrics_before=before, metrics_after=after, cached_tokens=hits, cache_queries=queries)
+                        row.update(metrics_before=before, metrics_after=after, cached_tokens=hits,
+                                   external_cached_tokens=external_hits, cache_queries=queries)
                         if args.phase == "on" and queries != row["tokens"]["prompt"]:
                             raise RuntimeError("Cache query counters not isolated or not updated")
                         if phase != "on_warm" and hits != 0:
                             raise RuntimeError("Unexpected cache hit in off/cold request")
-                        row["warm_hit_observed"] = hits > 0 if phase == "on_warm" else None
+                        if args.external_cache_metrics:
+                            if external_hits is None:
+                                raise RuntimeError("External cache hit counter is missing")
+                            if phase == "on_warm" and (external_hits <= 0 or hits != 0):
+                                raise RuntimeError("Warm request did not use isolated external cache")
+                            if phase == "on_cold" and external_hits != 0:
+                                raise RuntimeError("Cold request unexpectedly used external cache")
+                        row["warm_hit_observed"] = (external_hits > 0 if args.external_cache_metrics
+                                                    else hits > 0) if phase == "on_warm" else None
                     except Exception as exc:
                         fatal = exc
                         row.update(status="api_or_measurement_error", error=f"{type(exc).__name__}: {exc}")

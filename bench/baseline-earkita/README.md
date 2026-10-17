@@ -5,6 +5,14 @@ per-script notes live in [`serve/baseline-earkita/glm`](../../serve/baseline-ear
 [`serve/baseline-earkita/glm/testing.md`](../../serve/baseline-earkita/glm/testing.md). It is a **new protocol**;
 results from older, differently configured runs are not comparable.
 
+The opt-in [`glm-mtp3-k4.json`](glm-mtp3-k4.json) is a separate, focused
+C1/C4 × 130816-token comparison of checkpoint MTP3 + LMCache against DFlash
+K4 + LMCache. It requires the previously frozen exact-token corpus and explicit
+`PROTOCOL_TEMPLATE`, `SPECULATIVE_PROFILE` and `FROZEN_CORPUS` settings for
+each leg. Its NIAH gate requires a completed exact final answer, rather than
+mere retrieval in reasoning. See the [candidate profile note](../../serve/baseline-earkita/glm/glm-5.3-flash-c4-mtp3-lmcache.md).
+The default `bash bench/baseline-earkita/glm.sh` still runs the full K4 matrix.
+
 ## GLM matrix
 
 | Dimension | Frozen values |

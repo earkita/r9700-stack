@@ -150,7 +150,7 @@ finally:
         time.sleep(1)
 
 
-def cache_proof(state, before, after, length, count, chunk):
+def cache_proof(state, before, after, length, count, chunk, profile='dflash-k4'):
     d = {k: after.get(k, 0)-before.get(k, 0) for k in after if k not in ('running','waiting','l1_bytes')}
     if any(v < 0 for v in d.values()):
         raise RuntimeError('Counters reset during batch; service restart or concurrent reset')
@@ -158,7 +158,15 @@ def cache_proof(state, before, after, length, count, chunk):
         raise RuntimeError('Preemption or GPU APC hit invalidates cache-tier measurement')
     if d['success'] != count:
         raise RuntimeError('Missing completion or foreign request detected')
-    expected = (length // chunk) * chunk * count
+    # Align-mode Mamba + MTP relocates a scratch block over the final full
+    # prompt chunk. LMCache #5004 marks that old slot null and deliberately
+    # omits the unwritten state, so the restorable prefix is one chunk shorter.
+    if profile not in ('dflash-k4', 'mtp3'):
+        raise RuntimeError('Unknown speculative profile for cache geometry')
+    expected_chunks = length // chunk - int(profile == 'mtp3')
+    if expected_chunks < 0:
+        raise RuntimeError('Prompt shorter than MTP3 cache alignment gap')
+    expected = expected_chunks * chunk * count
     if state == 'cold' and (d['gpu_stores_done'] <= 0 or d['stores_done'] <= 0 or d['stored_objects'] <= 0):
         # Completed L2 requests include failed tasks; successful objects do not.
         raise RuntimeError('Cold cache population not proven by GPU/L2 successful-store counters')
@@ -195,13 +203,36 @@ def flag(args, name):
 
 
 def sources():
-    paths = [*HERE.glob('*.py'), HERE/'glm.json', HERE/'setup.sh',
+    paths = [*HERE.glob('*.py'), *HERE.glob('*.json'), HERE/'setup.sh', HERE/'glm.sh',
              HERE.parent/'glm_quality.py', HERE.parent/'api_smoke.py', HERE.parent/'glm_niah_corpus.py']
     paths += list((ROOT/'r9700_vllm').rglob('*.py'))
     paths += list((ROOT/'r9700_vllm/kernels').glob('*.so'))
     paths += [ROOT/'serve/serve.sh', ROOT/'serve/glm-kv-cache.sh',
-              ROOT/'serve/baseline-earkita/glm/glm-5.3-flash-c4-lmcache.sh']
+              ROOT/'serve/baseline-earkita/glm/glm-5.3-flash-c4-lmcache.sh',
+              ROOT/'serve/baseline-earkita/glm/glm-5.3-flash-c4-mtp3-lmcache.sh']
     return {str(p.relative_to(ROOT)):digest(p) for p in paths}
+
+
+def template(path):
+    path = (HERE / path).resolve()
+    if path.parent != HERE or path.suffix != '.json':
+        raise RuntimeError('Protocol template must be a JSON file in bench/baseline-earkita')
+    return json.loads(path.read_text()), path.name
+
+
+def check_speculative_profile(args, profile):
+    spec = json.loads(flag(args, '--speculative-config'))
+    if profile == 'dflash-k4':
+        if spec.get('method') != 'dflash' or spec.get('num_speculative_tokens') != 4:
+            raise RuntimeError('DFlash K4 profile requires four draft tokens')
+        if spec.get('kv_cache_dtype') != 'fp8_e4m3' or spec.get('draft_tensor_parallel_size') != 8:
+            raise RuntimeError('DFlash K4 profile requires FP8 draft KV and draft TP8')
+    elif profile == 'mtp3':
+        if spec != {'method': 'mtp', 'num_speculative_tokens': 3}:
+            raise RuntimeError('MTP3 profile requires the checkpoint NextN drafter at depth three')
+    else:
+        raise RuntimeError('Unknown speculative profile: ' + str(profile))
+    return spec
 
 
 def host_memory():
@@ -212,7 +243,9 @@ def host_memory():
 
 
 def prepare(a):
-    p = json.loads((HERE/'glm.json').read_text())
+    p, template_file = template(getattr(a, 'protocol_template', 'glm.json'))
+    p['template_file'] = template_file
+    p['speculative_profile'] = getattr(a, 'speculative_profile', 'dflash-k4')
     a.out = a.out.resolve()
     a.out.relative_to(ROOT/'bench/results')
     a.out.mkdir(parents=True, exist_ok=False)
@@ -238,11 +271,15 @@ def prepare(a):
     for k in ('--pipeline-parallel-size','--data-parallel-size'):
         if k in mi['args'] and flag(mi['args'],k) != '1':
             raise RuntimeError('HIP-to-worker mapping requires PP1/DP1')
-    spec = json.loads(flag(mi['args'], '--speculative-config'))
-    if spec.get('method') != 'dflash' or spec.get('num_speculative_tokens') != 4:
-        raise RuntimeError('This standard requires DFlash K4')
-    if spec.get('kv_cache_dtype') != 'fp8_e4m3' or spec.get('draft_tensor_parallel_size') != 8:
-        raise RuntimeError('This standard requires FP8 draft KV and draft TP8')
+    if p['template_file'] == 'glm.json' and p['speculative_profile'] != 'dflash-k4':
+        raise RuntimeError('The established glm.json standard requires DFlash K4')
+    p['speculative_config'] = check_speculative_profile(mi['args'], p['speculative_profile'])
+    if p.get('required_max_model_len') is not None and int(flag(mi['args'], '--max-model-len')) != p['required_max_model_len']:
+        raise RuntimeError('Model context capacity differs from the focused protocol')
+    if p.get('required_kv_cache_bytes') is not None and int(flag(mi['args'], '--kv-cache-memory')) != p['required_kv_cache_bytes']:
+        raise RuntimeError('GPU KV budget differs from the focused protocol')
+    if p['speculative_profile'] == 'mtp3' and mi['env'].get('R9K_GLM_DFLASH') != '0':
+        raise RuntimeError('MTP3 profile must disable the DFlash adapter')
     if '--no-enable-prefix-caching' in mi['args'] or '--kv-transfer-config' not in mi['args']:
         raise RuntimeError('APC and LMCache must be enabled')
     if int(flag(ci['args'], '--port')) != p['cache_port']:
@@ -252,11 +289,15 @@ def prepare(a):
     if int(flag(mi['args'], '--port')) != urlparse(p['base']).port:
         raise RuntimeError('Model API port mismatch')
     p['configured_l1_gib'] = float(flag(ci['args'], '--l1-size-gb'))
+    if p.get('required_l1_gib') is not None and p['configured_l1_gib'] != p['required_l1_gib']:
+        raise RuntimeError('L1 cache budget differs from the focused protocol')
     p['host_memory_at_prepare'] = host_memory()
     if int(flag(ci['args'], '--chunk-size')) != p['chunk_tokens']:
         raise RuntimeError('Cache chunk geometry differs from protocol')
     adapter = json.loads(flag(ci['args'], '--l2-adapter'))
     p['configured_l2_gib'] = adapter.get('max_capacity_gb', 0)
+    if p.get('required_l2_gib') is not None and p['configured_l2_gib'] != p['required_l2_gib']:
+        raise RuntimeError('L2 cache budget differs from the focused protocol')
     p['l2_eviction'] = adapter.get('eviction')
     mount = next(m for m in ci['mounts'] if m['destination']=='/kv-cache')
     if adapter['type'] != 'fs_native' or adapter.get('use_odirect') is not False:
@@ -276,11 +317,33 @@ def prepare(a):
         p['pcie_policy'] = policy
         p['pcie_expected'] = policy['links']
     p['corpora'] = {}
+    frozen_corpus = None
+    if p.get('frozen_corpus_sha256'):
+        if not getattr(a, 'frozen_corpus', None):
+            raise RuntimeError('Focused protocol requires --frozen-corpus')
+        frozen_corpus = dict(path=str(a.frozen_corpus.resolve().relative_to(ROOT/'bench/results')),
+                             sha256=p['frozen_corpus_sha256'])
+        p['frozen_corpus'] = frozen_corpus
+    if frozen_corpus:
+        source = ROOT/'bench/results'/frozen_corpus['path']
+        if digest(source) != frozen_corpus['sha256']:
+            raise RuntimeError('Frozen comparison corpus has changed')
+        raw_cases = json.loads(source.read_text())
+        if not isinstance(raw_cases,list) or len(raw_cases) < max(p['concurrency']):
+            raise RuntimeError('Frozen comparison corpus lacks independent cases')
+        expected_lengths = {int(c['id'].split('_')[1]) for c in raw_cases}
+        if expected_lengths != set(p['lengths']) or len({c['id'] for c in raw_cases}) != len(raw_cases):
+            raise RuntimeError('Frozen comparison corpus length/IDs differ from protocol')
     model_path = flag(mi['args'], '--model') if '--model' in mi['args'] else next(
         (x for x in mi['args'] if x.startswith('/models/')), None)
     if not model_path:
         raise RuntimeError('Cannot determine tokenizer path')
     for effort in p['efforts']:
+        if frozen_corpus:
+            file = a.out/f'corpus-{effort}.json'
+            save(file, {'corpus': raw_cases})
+            p['corpora'][effort] = dict(file=file.name,sha256=digest(file),source_sha256=frozen_corpus['sha256'])
+            continue
         # Model's repo mount can be read-only. Build in a temporary container
         # directory and return JSON, rather than writing through that mount.
         argv = ['glm_niah_corpus.py','--model',model_path,'--effort',effort,'--records','4096',
@@ -365,6 +428,48 @@ def batch(p, out, cases, salts, effort, length, quality):
     return rows, samples, errors
 
 
+def comparison_salts(p, length, effort, count, repetition, num_cases):
+    """Use the same request salt in matched legs when explicitly frozen.
+
+    The default retains a run-private salt. A warm-only comparison reuses one
+    salt per case across the excluded cold prime and all warm requests.
+    """
+    root = p.get('comparison_salt', p['run_id'])
+    cycle = 0 if p.get('warm_only_prime_once') else repetition
+    return [hashlib.sha256(f'{root}:{length}:{effort}:{count}:{cycle}:{i}'.encode()).hexdigest()
+            for i in range(num_cases)]
+
+
+def prime_warm_only(p, out, cases, salts, effort, length, count):
+    """Prove a cold cache fill before a RAM-only decode series."""
+    target = out/f'prime-{length}-C{count}-{effort}'
+    target.mkdir()
+    save(out/'status.json', dict(status='running', phase='prime',
+                                 length=length, concurrency=count, effort=effort))
+    idle(p)
+    reset_gpu(p)
+    clear_l1(p)
+    before = snapshot(p, target/'before')
+    prime_config = dict(p, output_tokens=1)
+    rows, samples, errors = batch(prime_config, target, cases, salts, effort, length, False)
+    result = dict(phase='prime', requests=rows, valid=False)
+    save(target/'result.json', result)
+    idle(p)
+    after = snapshot(p, target/'after')
+    if errors:
+        raise RuntimeError('Cold-prime telemetry failed: '+str(errors))
+    if any(r.get('error') or not r['result']['ok']
+           or r['result']['prompt_tokens'] != length
+           or r['result']['completion_tokens'] != 1 for r in rows):
+        raise RuntimeError('Cold-prime request incomplete')
+    hardware.check_loaded([s['links'] for s in samples], p['idle_links'], p['pcie_expected'])
+    result.update(before=before, after=after,
+                  cache_proof=cache_proof('cold', before, after, length, count,
+                                          p['chunk_tokens'], p['speculative_profile']),
+                  valid=True)
+    save(target/'result.json', result)
+
+
 def summarize(rows, length):
     duration = max(r['end'] for r in rows)-min(r['start'] for r in rows)
     starts = [r['start']+r['result']['ttft_ms']/1000 for r in rows]
@@ -388,6 +493,24 @@ def qualify_decode_overlap(summary, count, state, allow_serial_cold_prefill=Fals
     if not qualified and not (state == 'cold' and allow_serial_cold_prefill):
         raise RuntimeError('No simultaneous decode observed for all clients')
     return qualified
+
+
+def qualify_quality(rows, gate='retrieval_completed'):
+    """Preserve the old diagnostic gate; require exact final answers for comparisons."""
+    if gate not in ('retrieval_completed', 'strict_exact_completed'):
+        raise ValueError('Unknown NIAH quality gate: '+str(gate))
+    for row in rows:
+        scores = row.get('niah') or {}
+        if row.get('error') or row.get('foreign_key') or scores.get('generation_completed') != 'PASS':
+            return False
+        if gate == 'strict_exact_completed':
+            if (scores.get('strict_exact_match') != 'PASS'
+                    or scores.get('output_format_compliance') != 'PASS'
+                    or scores.get('backend_runtime_error') != 'NO'):
+                return False
+        elif scores.get('semantic_needle_retrieval') != 'PASS':
+            return False
+    return True
 
 
 def report(out, batches, status):
@@ -468,10 +591,14 @@ def run(a):
                 for effort in p['efforts']:
                     for count in p['concurrency']:
                         cases = [c for c in corpora[effort] if c['id'].startswith(f'niah_{length}_')][:count]
+                        if p.get('warm_only_prime_once'):
+                            if p['cache_states'] != ['ram']:
+                                raise RuntimeError('warm_only_prime_once requires RAM-only cache state')
+                            salts = comparison_salts(p, length, effort, count, 0, len(cases))
+                            prime_warm_only(p, out, cases, salts, effort, length, count)
                         phases = ['warmup']*p['warmup_batches']+['measured']*p['measured_batches']+['quality']
                         for repetition,phase in enumerate(phases):
-                            salts = [hashlib.sha256(f"{p['run_id']}:{length}:{effort}:{count}:{repetition}:{i}".encode()).hexdigest()
-                                     for i in range(len(cases))]
+                            salts = comparison_salts(p, length, effort, count, repetition, len(cases))
                             for state in p['cache_states']:
                                 if shutil.disk_usage(p['disk_path']).free < p['minimum_disk_free_gib']*2**30:
                                     raise RuntimeError('Insufficient free cache disk space; no files deleted')
@@ -507,15 +634,15 @@ def run(a):
                                 if errors:
                                     raise RuntimeError('Telemetry failed: '+str(errors))
                                 hardware.check_loaded([s['links'] for s in samples],p['idle_links'],p['pcie_expected'])
-                                d = cache_proof(state,before,after,length,count,p['chunk_tokens'])
+                                d = cache_proof(state,before,after,length,count,p['chunk_tokens'],
+                                                p['speculative_profile'])
                                 b['cache_proof'] = d
                                 b['acceptance'] = dict(ratio=d['accepted']/d['draft_tokens'] if d['draft_tokens'] else None,
                                     per_position={k:dict(accepted=v,per_draft=v/d['drafts'] if d['drafts'] else None)
                                                   for k,v in d.items() if k.startswith('accepted_position_')},drafts=d['drafts'])
                                 if phase=='quality':
-                                    if any(r.get('error') or r.get('foreign_key') or r['niah']['generation_completed']!='PASS'
-                                           or r['niah']['semantic_needle_retrieval']!='PASS' for r in rows):
-                                        raise RuntimeError('Quality retrieval/completion/runtime gate failed; see separate NIAH fields')
+                                    if not qualify_quality(rows,p.get('quality_gate','retrieval_completed')):
+                                        raise RuntimeError('NIAH quality gate failed; see separate final-answer/retrieval/format/completion fields')
                                 else:
                                     if any(r.get('error') or not r['result']['ok'] or r['result']['prompt_tokens']!=length
                                            or r['result']['completion_tokens']!=p['output_tokens'] or not r['result']['decode_tps'] for r in rows):
@@ -538,7 +665,8 @@ def run(a):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action',required=True)
-    sub.add_parser('plan')
+    planning = sub.add_parser('plan')
+    planning.add_argument('--protocol-template',default='glm.json')
     prep = sub.add_parser('prepare')
     prep.add_argument('--out',type=Path,required=True)
     prep.add_argument('--model-container',required=True)
@@ -547,11 +675,14 @@ def main():
     prep.add_argument('--cache-metrics',default='http://127.0.0.1:9091')
     prep.add_argument('--cache-port',type=int,default=5555)
     prep.add_argument('--pcie-policy',type=Path,help='Explicit expected links + reason for wired limits below device capabilities')
+    prep.add_argument('--protocol-template',default='glm.json',help='JSON filename in bench/baseline-earkita; default preserves the full K4 standard')
+    prep.add_argument('--speculative-profile',choices=('dflash-k4','mtp3'),default='dflash-k4')
+    prep.add_argument('--frozen-corpus',type=Path,help='Exact previously generated comparison corpus under bench/results')
     execute = sub.add_parser('run')
     execute.add_argument('--out',type=Path,required=True)
     a = parser.parse_args()
     if a.action=='plan':
-        p = json.loads((HERE/'glm.json').read_text())
+        p, _ = template(a.protocol_template)
         groups = len(p['lengths'])*len(p['efforts'])*len(p['cache_states'])
         perf = groups*(p['warmup_batches']+p['measured_batches'])
         print(json.dumps(dict(protocol=p,performance_batches=perf*len(p['concurrency']),

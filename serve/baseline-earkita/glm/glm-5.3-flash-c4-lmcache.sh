@@ -11,6 +11,7 @@ MAXLEN=${MAXLEN:-auto}
 KV_OFFLOAD=${KV_OFFLOAD:-lmcache} # 0 = APC w VRAM; lmcache = eksperymentalny RAM + NVMe.
 KV_CACHE_NAME=${KV_CACHE_NAME:-glm53-kv-cache-c4} # Nazwa osobnego kontenera cache.
 KV_CACHE_PORT=${KV_CACHE_PORT:-5555} # Port osobno uruchamianego serve/glm-kv-cache.sh.
+KV_CACHE_REUSE=${KV_CACHE_REUSE:-0} # 1 = uzyj juz dzialajacego cache; nie alokuj drugiej puli RAM.
 KV_CACHE_START_TIMEOUT=${KV_CACHE_START_TIMEOUT:-600} # Pelna alokacja duzej puli RAM moze trwac dluzej niz minute.
 for arg in "$@"; do
   case "$arg" in
@@ -21,6 +22,7 @@ for arg in "$@"; do
   esac
 done
 [[ "$KV_CACHE_START_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || { echo 'KV_CACHE_START_TIMEOUT must be positive seconds.' >&2; exit 2; }
+[[ "$KV_CACHE_REUSE" = 0 || "$KV_CACHE_REUSE" = 1 ]] || { echo 'KV_CACHE_REUSE must be 0 or 1.' >&2; exit 2; }
 case "$NSEQ" in
   1) graphs=5 ;;
   2) graphs=5,10 ;;
@@ -118,7 +120,29 @@ if [ "$KV_OFFLOAD" = lmcache ]; then
     "NAME=$KV_CACHE_NAME" "KV_CACHE_PORT=$KV_CACHE_PORT"
     "KV_CACHE_DIR=${KV_CACHE_DIR-/mnt/ai/cache/}"
     "GPUS=${GPUS:-0,1,2,3,4,5,6,7}" "DOCKER_SUDO=${DOCKER_SUDO-}")
-  if [ "${DRYRUN:-0}" = 1 ]; then
+  if [ "$KV_CACHE_REUSE" = 1 ]; then
+    if [ "${DRYRUN:-0}" != 1 ]; then
+      python3 - "$KV_CACHE_NAME" "$KV_CACHE_PORT" "${IMG:-r9700/vllm:glm53-lmcache055}" <<'PY' || exit $?
+import json, subprocess, sys, urllib.request
+name, port, image = sys.argv[1:]
+cache = json.loads(subprocess.check_output(['docker', 'inspect', name]))[0]
+image_id = json.loads(subprocess.check_output(['docker', 'image', 'inspect', image]))[0]['Id']
+args = cache['Config']['Cmd']
+def option(key):
+    return args[args.index(key) + 1] if key in args else None
+if (not cache['State']['Running'] or cache['Image'] != image_id
+        or cache['HostConfig']['NetworkMode'] != 'host'
+        or option('--port') != port or option('--chunk-size') != '1152'):
+    raise SystemExit('Existing LMCache container/image/port/chunk geometry does not match this GLM profile')
+with urllib.request.urlopen('http://127.0.0.1:9091/metrics', timeout=5) as response:
+    if response.status != 200:
+        raise SystemExit('Existing LMCache metrics endpoint is not ready')
+print(f'Reusing LMCache {name}; no second host RAM pool allocated.')
+PY
+    else
+      echo "DRYRUN: reuse running LMCache $KV_CACHE_NAME on port $KV_CACHE_PORT"
+    fi
+  elif [ "${DRYRUN:-0}" = 1 ]; then
     bash "$serve_dir/glm-kv-cache.sh" "${cache_args[@]}" DRYRUN=1 || exit $?
   else
     read -r -a docker_prefix <<< "${DOCKER_SUDO-}"

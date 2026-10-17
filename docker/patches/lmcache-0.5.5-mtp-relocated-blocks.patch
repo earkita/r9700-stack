@@ -1,0 +1,77 @@
+--- a/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -594,6 +594,15 @@
+                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
+             )
+             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
++            # Backport LMCache #5004: in align mode vLLM can relocate MTP
++            # scratch blocks without reporting their old null slots.
++            spec_cfg = getattr(vllm_config, "speculative_config", None)
++            self._mamba_relocation_window = (
++                getattr(spec_cfg, "num_speculative_tokens", 0) or 0
++                if getattr(vllm_config.cache_config, "mamba_cache_mode", None)
++                == "align"
++                else 0
++            )
+ 
+             # GPU block pool reference
+             self._gpu_block_pool: "BlockPool | None" = None
+@@ -1144,7 +1153,7 @@
+             existing = existing_counts.get(engine_group_idx, 0)
+             new_block_ids.append(list(group_blocks[existing:]))
+         if any(new_block_ids):
+-            tracker.append_block_ids(tuple(new_block_ids))
++            tracker.append_block_ids(tuple(new_block_ids), self._mamba_relocation_window)
+ 
+         # Update the state of the tracker
+         if tracker.state == LMCacheMPRequestState.BYPASS_LMCACHE:
+@@ -1449,7 +1458,7 @@
+             # Update block ids
+             new_block_ids = cached_reqs.new_block_ids[idx] or ()
+             if request_id not in cached_reqs.resumed_req_ids:
+-                request_tracker.append_block_ids(new_block_ids)
++                request_tracker.append_block_ids(new_block_ids, self._mamba_relocation_window)
+ 
+             # Use the incremental num_scheduled_tokens to
+             # stay consistent with _process_new_requests.
+--- a/lmcache/integration/vllm/lmcache_mp_metadata.py
++++ b/lmcache/integration/vllm/lmcache_mp_metadata.py
+@@ -132,15 +132,32 @@
+     def append_block_ids(
+         self,
+         new_block_ids: tuple[list[int], ...],
++        relocation_window: int = 0,
+     ):
+-        """Update the block ids for the current request
+-        This function will be called when processing the cached requests.
++        """Append new block slots, nulling relocated MTP scratch slots.
++
++        In align-mode Mamba, vLLM can move an existing speculative block from
++        one of the last relocation_window positions to the tail while
++        replacing the old slot with the null block. Its new_block_ids reports
++        only the tail. A repeated ID in that bounded window identifies the
++        unreported old slot; see LMCache PR #5004.
+         """
+         for engine_group_idx, group_block_ids in enumerate(new_block_ids):
+-            if group_block_ids:
+-                self.allocated_block_ids.setdefault(engine_group_idx, []).extend(
+-                    group_block_ids
+-                )
++            if not group_block_ids:
++                continue
++            block_ids = self.allocated_block_ids.setdefault(engine_group_idx, [])
++            if relocation_window == 0:
++                block_ids.extend(group_block_ids)
++                continue
++            prev_len = len(block_ids)
++            window_start = max(0, prev_len - relocation_window)
++            for block_id in group_block_ids:
++                if block_id != 0:
++                    for slot in range(window_start, prev_len):
++                        if block_ids[slot] == block_id:
++                            block_ids[slot] = 0
++                            break
++                block_ids.append(block_id)
+ 
+     def num_allocated_blocks(self) -> dict[int, int]:
+         return {

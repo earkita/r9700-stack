@@ -17,6 +17,131 @@ b = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(b)
 
 
+class FocusedComparisonProtocol(unittest.TestCase):
+    def test_warm_only_protocol_reuses_identical_salts_across_legs(self):
+        focused, _ = b.template('glm-paged-logits-128k.json')
+        self.assertEqual(focused['cache_states'], ['ram'])
+        self.assertTrue(focused['warm_only_prime_once'])
+        a = dict(focused, run_id='first')
+        c = dict(focused, run_id='second')
+        initial = b.comparison_salts(a, 130816, 'high', 4, 0, 4)
+        self.assertEqual(initial, b.comparison_salts(a, 130816, 'high', 4, 4, 4))
+        self.assertEqual(initial, b.comparison_salts(c, 130816, 'high', 4, 4, 4))
+        self.assertEqual(4, len(set(initial)))
+        self.assertNotEqual(initial, b.comparison_salts(a, 130816, 'high', 1, 0, 4))
+
+    def test_warm_only_cold_prime_checks_cache_and_keeps_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            cases = [dict(id='niah_130816_depth005', messages=[])]
+            config = dict(chunk_tokens=1152, speculative_profile='dflash-k4',
+                          output_tokens=256, idle_links={}, pcie_expected={})
+            row = dict(result=dict(ok=True, prompt_tokens=130816, completion_tokens=1))
+            with ExitStack() as stack:
+                for obj, name, value in [
+                    (b, 'idle', lambda _:None),
+                    (b, 'reset_gpu', lambda _:None),
+                    (b, 'clear_l1', lambda _:None),
+                    (b, 'snapshot', lambda *args:{}),
+                    (b, 'batch', lambda p,*args: ([row],[dict(links={})],[]) if p['output_tokens']==1 else None),
+                    (b, 'cache_proof', lambda *args:{'cold_store_proven':True}),
+                    (b.hardware, 'check_loaded', lambda *args:None),
+                ]:
+                    stack.enter_context(patch.object(obj,name,side_effect=value))
+                b.prime_warm_only(config,out,cases,['fixed-salt'],'high',130816,1)
+            attempt = json.loads((out/'prime-130816-C1-high/result.json').read_text())
+            self.assertTrue(attempt['valid'])
+            self.assertEqual(attempt['cache_proof'], {'cold_store_proven':True})
+            self.assertEqual(json.loads((out/'status.json').read_text())['phase'], 'prime')
+
+    def test_existing_standard_stays_k4_and_focused_protocol_matches_frozen_corpus(self):
+        full, name = b.template('glm.json')
+        self.assertEqual(name, 'glm.json')
+        self.assertEqual(full['concurrency'], [1, 2, 4])
+        focused, name = b.template('glm-mtp3-k4.json')
+        self.assertEqual(name, 'glm-mtp3-k4.json')
+        self.assertEqual(focused['lengths'], [130816])
+        self.assertEqual(focused['concurrency'], [1, 4])
+        self.assertEqual(focused['warmup_batches'], 1)
+        self.assertEqual(focused['measured_batches'], 3)
+        self.assertEqual(focused['quality_gate'], 'strict_exact_completed')
+        self.assertEqual(focused['required_max_model_len'], 262144)
+        self.assertEqual(focused['required_kv_cache_bytes'], int(4.125 * 2**30))
+        corpus = b.ROOT/'bench/results/glm-mtp3-k4-20261017-prep/corpus/corpus.json'
+        if corpus.exists():
+            self.assertEqual(b.digest(corpus), focused['frozen_corpus_sha256'])
+        with self.assertRaisesRegex(RuntimeError, 'Protocol template'):
+            b.template('../other.json')
+
+    def test_speculative_profiles_are_explicit_and_draft_geometry_is_checked(self):
+        k4 = ['--speculative-config', json.dumps(dict(method='dflash',num_speculative_tokens=4,
+                    kv_cache_dtype='fp8_e4m3',draft_tensor_parallel_size=8))]
+        mtp3 = ['--speculative-config', json.dumps(dict(method='mtp',num_speculative_tokens=3))]
+        self.assertEqual(b.check_speculative_profile(k4,'dflash-k4')['method'],'dflash')
+        self.assertEqual(b.check_speculative_profile(mtp3,'mtp3')['method'],'mtp')
+        with self.assertRaises(RuntimeError):
+            b.check_speculative_profile(k4,'mtp3')
+        with self.assertRaises(RuntimeError):
+            b.check_speculative_profile(mtp3,'dflash-k4')
+        with self.assertRaises(RuntimeError):
+            b.check_speculative_profile(['--speculative-config',json.dumps(dict(
+                method='mtp',num_speculative_tokens=4))],'mtp3')
+
+    def test_mtp3_prepare_freezes_exact_corpus_without_regenerating_it(self):
+        results_root = b.ROOT/'bench/results'
+        results_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=results_root) as tmp:
+            root = Path(tmp)
+            source = root/'source.json'
+            cases = [dict(id=f'niah_130816_depth{depth:03}',messages=[dict(role='user',content=str(depth))])
+                     for depth in (5,35,65,95)]
+            source.write_text(json.dumps(cases))
+            protocol, _ = b.template('glm-mtp3-k4.json')
+            protocol['frozen_corpus_sha256'] = b.digest(source)
+            model_args = ['--host','127.0.0.1','--tensor-parallel-size','8','--max-num-seqs','4',
+                          '--kv-cache-dtype','fp8_e4m3','--speculative-config',json.dumps(dict(
+                              method='mtp',num_speculative_tokens=3)),
+                          '--max-model-len','262144','--kv-cache-memory',str(int(4.125*2**30)),
+                          '--port','8081','--model','/models/GLM-5.3-Flash-Quark-MXFP4',
+                          '--kv-transfer-config','{}']
+            cache_args = ['--port','5556','--prometheus-port','9092','--l1-size-gb','128',
+                          '--chunk-size','1152','--l2-adapter',json.dumps(dict(
+                              type='fs_native',base_path='/kv-cache/mtp3',max_capacity_gb=512,
+                              use_odirect=False))]
+            model = dict(running=True,image='same',args=model_args,
+                         env={'VLLM_SERVER_DEV_MODE':'1','R9K_GLM_DFLASH':'0'},mounts=[])
+            cache = dict(running=True,image='same',args=cache_args,env={},mounts=[
+                dict(source=str(root/'cache'),destination='/kv-cache')])
+            a = SimpleNamespace(out=root/'attempt',model_container='mtp-model',
+                cache_container='mtp-cache',base='http://127.0.0.1:8081',
+                cache_metrics='http://127.0.0.1:9092',cache_port=5556,
+                pcie_policy=None,protocol_template='glm-mtp3-k4.json',
+                speculative_profile='mtp3',frozen_corpus=source)
+            def command(*args):
+                return 'head' if args[0]=='git' else json.dumps(dict(
+                    vllm='0.3.1.dev311+ge97573215',lmcache='0.5.5',torch='test',triton='test'))
+            with ExitStack() as stack:
+                for obj,name,value in [
+                    (b,'template',lambda _: (protocol.copy(),'glm-mtp3-k4.json')),
+                    (b,'sources',lambda:{}),
+                    (b,'container_identity',lambda name: model if name=='mtp-model' else cache),
+                    (b,'host_memory',lambda:{}),
+                    (b,'snapshot',lambda *args:{}),
+                    (b.hardware,'command',command),
+                    (b.hardware,'hip_mapping',lambda _:[]),
+                    (b.hardware,'capture',lambda *args:{}),
+                    (b.hardware,'expected_links',lambda _:{}),
+                ]:
+                    stack.enter_context(patch.object(obj,name,side_effect=value))
+                b.prepare(a)
+            frozen = json.loads((a.out/'protocol.json').read_text())
+            self.assertEqual(frozen['speculative_profile'],'mtp3')
+            self.assertEqual(frozen['frozen_corpus']['sha256'],b.digest(source))
+            copied = json.loads((a.out/'corpus-high.json').read_text())
+            self.assertEqual(copied['corpus'],cases)
+            self.assertEqual(frozen['corpora']['high']['sha256'],b.digest(a.out/'corpus-high.json'))
+
+
 class CacheGates(unittest.TestCase):
     def setUp(self):
         self.before = dict.fromkeys(b.COUNTERS,0.) | dict(l1_bytes=0.,running=0.,waiting=0.)
@@ -32,6 +157,16 @@ class CacheGates(unittest.TestCase):
         for state, after in variants:
             with self.subTest(state=state):
                 self.assertEqual(b.cache_proof(state,self.before,after,8192,4,1152)['success'],4)
+
+    def test_mtp3_restore_excludes_the_unwritten_relocated_mamba_chunk(self):
+        # 130816 tokens contain 113 full chunks. The observed patched MTP3
+        # restore returns 112: LMCache must not persist the skipped Mamba state.
+        expected = 112 * 1152 * 4
+        warm = self.after(external_hit=expected,l1_hit=expected)
+        self.assertEqual(b.cache_proof('ram',self.before,warm,130816,4,1152,'mtp3')['l1_hit'],
+                         expected)
+        with self.assertRaisesRegex(RuntimeError,'Cache source not proven'):
+            b.cache_proof('ram',self.before,warm,130816,4,1152,'dflash-k4')
 
     def test_wrong_tier_partial_hits_gpu_hits_preemption_and_foreign_work_fail(self):
         expected = 7*1152*4
@@ -189,6 +324,18 @@ class HardwareAndReport(unittest.TestCase):
         self.assertEqual(scores['generation_completed'],'PASS')
         self.assertEqual(scores['backend_runtime_error'],'NO')
 
+    def test_focused_quality_requires_the_completed_exact_final_answer(self):
+        case = dict(expected='R9700-NIAH-005-ABCDEF',scoring='exact')
+        response = dict(content='The answer is R9700-NIAH-005-ABCDEF.',finish_reason='stop')
+        row = dict(niah=b.niah_scores(response,case),foreign_key=False)
+        self.assertTrue(b.qualify_quality([row]))
+        self.assertFalse(b.qualify_quality([row],'strict_exact_completed'))
+        response['content'] = case['expected']
+        row['niah'] = b.niah_scores(response,case)
+        self.assertTrue(b.qualify_quality([row],'strict_exact_completed'))
+        row['niah']['generation_completed'] = 'FAIL'
+        self.assertFalse(b.qualify_quality([row],'strict_exact_completed'))
+
     def test_partial_report_excludes_warmups_and_failed_performance(self):
         s = dict(per_request=[dict(decode_tps=20,ttft_ms=300,ttfa_ms=None,effective_prompt_tps=99)],
                  aggregate_e2e_output_tps=15,all_clients_decode_overlap_s=0)
@@ -222,7 +369,7 @@ class UnattendedLifecycle(unittest.TestCase):
                  cache_port=5555,model='glm',model_container='model',cache_container='cache',
                  model_identity={},cache_identity={},mapping=[],idle_links={},pcie_expected={},
                  lengths=[8192],efforts=['high'],concurrency=[1],measured_batches=1,
-                 run_id='offline-test',disk_path=str(out),sources={})
+                 run_id='offline-test',disk_path=str(out),sources={},speculative_profile='dflash-k4')
         case = dict(id='niah_8192_depth005',messages=[{'role':'user','content':'fixture'}],
                     expected='R9700-NIAH-005-ABCDEF',scoring='exact')
         b.save(out/'corpus.json',{'corpus':[case]})
