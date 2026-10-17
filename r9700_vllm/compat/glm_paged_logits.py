@@ -32,9 +32,9 @@ def patch() -> bool:
     if getattr(ops.rocm_fp8_paged_mqa_logits, "_r9700_glm_paged_logits", False):
         return True
     from .gate import check, vllm_commit
-    if (not vllm_commit().startswith(("e97573215", "77154ca6"))
+    if (not vllm_commit().startswith(("e97573215", "77154ca6", "2067297b"))
             or "deepgemm_fp8_paged_mqa_logits_stage1" not in inspect.getsource(ops.rocm_fp8_paged_mqa_logits)):
-        raise RuntimeError("GLM tiled logits adapter requires audited vLLM e97573215 or 77154ca6")
+        raise RuntimeError("GLM tiled logits adapter requires an audited vLLM commit")
     check("glm_paged_logits")
     from r9700_vllm.attn.glm_paged_logits import paged_logits
     ops.rocm_fp8_paged_mqa_logits = _wrap(ops.rocm_fp8_paged_mqa_logits, paged_logits)

@@ -12,13 +12,13 @@ from vllm.logger import init_logger
 logger = init_logger("vllm." + __name__)
 
 TESTED = {
-    "glm_sparse_fp8": (("e97573215", "77154ca6"), "GLM E4M3 reader; retire when upstream RDNA4 sparse MLA supports scaled FP8 KV"),
+    "glm_sparse_fp8": (("e97573215", "77154ca6", "2067297b"), "GLM E4M3 reader; retire when upstream RDNA4 sparse MLA supports scaled FP8 KV"),
     "glm_dflash": (("e97573215",), "GLM completed auxiliary states and draft cache allocation; vllm#55423/#56983"),
-    "glm_head_gemv": (("e97573215", "77154ca6"), "GLM C1 head projection via existing FP32-output router GEMV"),
-    "glm_paged_logits": (("e97573215", "77154ca6"), "GLM tiled indexer cache vs AITER RDNA stage1 token-major reader (#58858)"),
+    "glm_head_gemv": (("e97573215", "77154ca6", "2067297b"), "GLM C1 head projection via existing FP32-output router GEMV"),
+    "glm_paged_logits": (("e97573215", "77154ca6", "2067297b"), "GLM tiled indexer cache vs AITER RDNA stage1 token-major reader (#58858)"),
     "glm_mamba_seed": (("e97573215",), "vllm-project/vllm#55601; GLM V2 APC state block units"),
-    "glm_w4a4_c1": (("e97573215", "77154ca6"), "Opt-in GLM C1 Quark W4A4 grouped WMMA adapter"),
-    "glm_rdna_indexer": (("e97573215", "77154ca6"), "GLM kpool RDNA4 predicate and token-sized cache pages"),
+    "glm_w4a4_c1": (("e97573215", "77154ca6", "2067297b"), "Opt-in GLM C1 Quark W4A4 grouped WMMA adapter"),
+    "glm_rdna_indexer": (("e97573215", "77154ca6", "2067297b"), "GLM kpool RDNA4 predicate and token-sized cache pages"),
     # patch name: (vLLM commits tested, upstream issue/PR that would retire it)
     "mtp_allowlist": (("dee37d891", "e97573215", "8cbd5d030", "fe4df3df0"), "vllm-project/vllm#55292 (closed unmerged 2026-10)"),
     # the modular MoE kernel copies its workspace into the layer output on ROCm unless aiter is on (moe/fold.py)

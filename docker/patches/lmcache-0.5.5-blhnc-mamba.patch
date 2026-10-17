@@ -1,0 +1,16 @@
+diff --git a/lmcache/integration/vllm/kv_cache_group_edits.py b/lmcache/integration/vllm/kv_cache_group_edits.py
+--- a/lmcache/integration/vllm/kv_cache_group_edits.py
++++ b/lmcache/integration/vllm/kv_cache_group_edits.py
+@@ -418,6 +418,10 @@ class _MambaUnifiedViewEdit(KVCacheGroupEdit):
+         """
+         assert isinstance(kv_cache, torch.Tensor), (
+             "single-layer KV cache must be a torch.Tensor"
+         )
+         kv_layout = layout_hints.get("kv_layout", "none")
++        # vLLM's BLHNC allocation is [block, layer, head, token, channel].
++        # After selecting one layer, this edit must use the HND page order.
++        if kv_layout == "BLHNC":
++            kv_layout = "HND"
+         if kv_layout not in ("NHD", "HND"):
+             raise ValueError(
+                 f"Unsupported kv_layout: {kv_layout}. Only NHD and HND are supported."

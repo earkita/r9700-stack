@@ -27,7 +27,7 @@ def register_glm() -> None:
     if os.environ.get("R9K_GLM_BASELINE") != "1":
         return
     from .compat.gate import vllm_commit
-    if vllm_commit().startswith("77154ca6"):
+    if vllm_commit().startswith(("77154ca6", "2067297b")):
         from .compat.glm_latest import patch
         patch()
         return

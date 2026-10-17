@@ -80,10 +80,10 @@ def patch() -> bool:
     source = inspect.getsource(sparse_indexer.SparseAttnIndexerKpool.forward_hip)
     from .gate import check, vllm_commit
     version = vllm_commit()
-    latest = version.startswith("77154ca6")
+    latest = version.startswith(("77154ca6", "2067297b"))
     if (not (version.startswith("e97573215") or latest)
             or source.count("if not rocm_aiter_ops.is_enabled():") != 1):
-        raise RuntimeError("GLM RDNA4 indexer adapter requires audited vLLM e97573215 or 77154ca6")
+        raise RuntimeError("GLM RDNA4 indexer adapter requires audited vLLM e97573215, 77154ca6 or 2067297b")
     check("glm_rdna_indexer")
     from vllm.models.glm5next.common.attention import Glm5NextIndexerCache, Indexer
     from r9700_vllm.attn.glm_indexer import get_glm_indexer_backend

@@ -1,4 +1,4 @@
-"""Opt-in LMCache 0.5.5 connector for GLM Flash on pinned e97573215 ROCm.
+"""Opt-in LMCache 0.5.5 connector for audited GLM Flash ROCm pins.
 
 Only external-cache metadata/views are adapted. Circular kpool scratch is
 rebuilt during the aligned suffix prefill, just as for vLLM's GPU APC.
@@ -18,11 +18,12 @@ from .glm_cache_geometry import (
 
 class GlmLMCacheMPConnector(LMCacheMPConnector):
     def __init__(self, vllm_config, role, kv_cache_config=None):
-        if (version('lmcache') != '0.5.5' or 'e97573215' not in version('vllm')
+        if (version('lmcache') != '0.5.5'
+                or not any(pin in version('vllm') for pin in ('e97573215', '2067297b'))
                 or not torch.version.hip
                 or vllm_config.model_config.hf_config.model_type != 'glm5_next'
                 or kv_cache_config is None):
-            raise RuntimeError('GLM offload requires ROCm, GLM Flash, e97573215 and LMCache 0.5.5')
+            raise RuntimeError('GLM offload requires ROCm, GLM Flash, an audited vLLM pin and LMCache 0.5.5')
         pc = vllm_config.parallel_config
         extra = vllm_config.kv_transfer_config.kv_connector_extra_config
         if (pc.tensor_parallel_size != 8 or pc.pipeline_parallel_size != 1

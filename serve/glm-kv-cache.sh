@@ -17,6 +17,7 @@ KV_CACHE_PORT=${KV_CACHE_PORT:-5555} # Local ZMQ port; same value in the GLM pro
 KV_CACHE_METRICS_PORT=${KV_CACHE_METRICS_PORT:-9091}
 KV_CACHE_IO_WORKERS=${KV_CACHE_IO_WORKERS:-4}
 IMG=${IMG:-r9700/vllm:glm53-lmcache055} # Build docker/Dockerfile.glm-lmcache first; use the same image for GLM.
+EXPECTED_VLLM_COMMIT=${EXPECTED_VLLM_COMMIT:-e97573215} # Candidate may opt in to another audited pin.
 NAME=${NAME:-glm53-kv-cache}
 GPUS=${GPUS:-0,1,2,3,4,5,6,7} # HIP ordinal mapping must match the model workers.
 DOCKER_SUDO=${DOCKER_SUDO-}
@@ -24,7 +25,7 @@ DRYRUN=${DRYRUN:-0}
 
 for arg in "$@"; do
   case "$arg" in
-    KV_CACHE_DIR=*|KV_CACHE_NAMESPACE=*|KV_CACHE_RAM_GB=*|KV_CACHE_ALLOCATOR=*|KV_CACHE_DISK_GB=*|KV_CACHE_DISK_WATERMARK=*|KV_CACHE_DISK_EVICTION_RATIO=*|KV_CACHE_CHUNK=*|KV_CACHE_PORT=*|KV_CACHE_METRICS_PORT=*|KV_CACHE_IO_WORKERS=*|IMG=*|NAME=*|GPUS=*|DOCKER_SUDO=*|DRYRUN=*)
+    KV_CACHE_DIR=*|KV_CACHE_NAMESPACE=*|KV_CACHE_RAM_GB=*|KV_CACHE_ALLOCATOR=*|KV_CACHE_DISK_GB=*|KV_CACHE_DISK_WATERMARK=*|KV_CACHE_DISK_EVICTION_RATIO=*|KV_CACHE_CHUNK=*|KV_CACHE_PORT=*|KV_CACHE_METRICS_PORT=*|KV_CACHE_IO_WORKERS=*|EXPECTED_VLLM_COMMIT=*|IMG=*|NAME=*|GPUS=*|DOCKER_SUDO=*|DRYRUN=*)
       export "$arg" ;;
     *) echo "Unknown setting: ${arg%%=*}" >&2; exit 2 ;;
   esac
@@ -70,9 +71,10 @@ PY
 )
 
 # Guard the inspected interfaces before LMCache initializes its GPU transfer path.
-preflight='import importlib.metadata as m, runpy, sys
-if "e97573215" not in m.version("vllm") or m.version("lmcache") != "0.5.5":
-    sys.exit("GLM KV offload requires e97573215 / LMCache 0.5.5; use the same candidate image for GLM and cache.")
+preflight='import importlib.metadata as m, os, runpy, sys
+expected = os.environ["EXPECTED_VLLM_COMMIT"]
+if expected not in m.version("vllm") or m.version("lmcache") != "0.5.5":
+    sys.exit(f"GLM KV offload requires vLLM {expected} / LMCache 0.5.5; use the same image for GLM and cache.")
 import inspect, json
 adapter = json.loads(sys.argv[sys.argv.index("--l2-adapter")+1])
 if adapter.get("max_capacity_gb", 0):
@@ -89,6 +91,7 @@ runpy.run_module("lmcache.v1.multiprocess.server", run_name="__main__")'
 CMD=(docker run -d --name "$NAME" --network=host --ipc=host --pid=host
   --device=/dev/kfd --device=/dev/dri --group-add 44 --group-add 991
   --ulimit memlock=-1 -e "HIP_VISIBLE_DEVICES=$GPUS"
+  -e "EXPECTED_VLLM_COMMIT=$EXPECTED_VLLM_COMMIT"
   "${allocator_env[@]}"
   -e HSA_ENABLE_IPC_MODE_LEGACY=0 # Match serve.sh; the nightly image defaults to incompatible legacy IPC.
   -v "$STACK_ROOT:/opt/r9700:ro" -e PYTHONPATH=/opt/r9700

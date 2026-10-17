@@ -1,0 +1,26 @@
+# Rebuild the exact upstream source on the latest published ROCm 10 runtime.
+# The source commit is immutable; the base image digest keeps the toolchain fixed.
+# This produces a separate candidate and never changes the qualified K4 image.
+FROM vllm/vllm-openai-rocm@sha256:fe8256813e979a16e7d4528204b93b6523d9286bff420427118a4943628c3582
+
+ARG VLLM_COMMIT=2067297b2f15f0776be6d2a7e1b435bd20af60c1
+ENV VLLM_TARGET_DEVICE=rocm PYTORCH_ROCM_ARCH=gfx1201 MAX_JOBS=4 \
+    TRITON_KERNELS_SRC_DIR=/usr/local/lib/python3.12/dist-packages/vllm/third_party/triton_kernels
+RUN git clone --filter=blob:none --no-checkout https://github.com/vllm-project/vllm.git /opt/vllm-main \
+ && cd /opt/vllm-main \
+ && git fetch --depth=1 origin "${VLLM_COMMIT}" \
+ && git checkout --detach "${VLLM_COMMIT}" \
+ && test "$(git rev-parse HEAD)" = "${VLLM_COMMIT}"
+
+# Build against the ROCm/PyTorch runtime in the digest-pinned base.  A Python
+# overlay alone would leave the newly added native operators unavailable.
+RUN python3 -m pip install --no-deps --no-build-isolation --no-cache-dir /opt/vllm-main \
+ && python3 -c 'import vllm; assert "2067297b" in vllm.__version__, vllm.__version__; print(vllm.__version__)'
+
+# A depth-one checkout has no release tag, so setuptools-scm labels it 0.1.dev1.
+# Repackage the already compiled tree with the adjacent nightly's version
+# (the published 39983a5e7 image is 0.32.0rc1.dev329, and this is its one
+# successor commit).  The source/extension objects remain unchanged.
+RUN VLLM_VERSION_OVERRIDE=0.32.0rc1.dev330+g2067297b2.rocm100 \
+    python3 -m pip install --no-deps --no-build-isolation --no-cache-dir /opt/vllm-main \
+ && python3 -c 'import importlib.metadata as m, vllm; expected="0.32.0rc1.dev330+g2067297b2.rocm100"; assert m.version("vllm")==vllm.__version__==expected, (m.version("vllm"), vllm.__version__)'

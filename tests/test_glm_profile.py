@@ -83,6 +83,47 @@ class Launcher(unittest.TestCase):
                 self.assertIn(flag, cache)
                 self.assertIn(flag, model)
 
+    def test_main206_k4_cache_candidate_is_isolated_and_pinned(self):
+        profile = ROOT / "serve/baseline-earkita/glm/glm-5.3-flash-c4-lmcache-main206.sh"
+        clean = {k: v for k, v in os.environ.items()
+                 if not k.startswith(("R9K_", "VLLM_", "KV_CACHE_", "EXPECTED_VLLM_"))}
+        out = subprocess.check_output(["bash", str(profile), "DRYRUN=1"],
+                                      env=clean, text=True)
+        cache_line, model_line = out.splitlines()
+        cache, model = shlex.split(cache_line), shlex.split(model_line)
+        self.assertIn("EXPECTED_VLLM_COMMIT=2067297b", cache)
+        self.assertIn("glm53-main206-fp8-dflash-k4-b1280-v1", cache_line)
+        self.assertIn("glm53-main206-kv-cache-c4", cache)
+        self.assertIn("--l1-size-gb", cache)
+        self.assertEqual(cache[cache.index("--l1-size-gb") + 1], "128")
+        self.assertEqual(cache[cache.index("--chunk-size") + 1], "1280")
+        l2 = json.loads(cache[cache.index("--l2-adapter") + 1])
+        self.assertEqual(l2["max_capacity_gb"], 512.0)
+        self.assertIn("r9700/vllm:glm53-lmcache055-main206-blhnc", cache)
+        self.assertIn("r9700/vllm:glm53-lmcache055-main206-blhnc", model)
+        self.assertIn("glm53-main206-flash-c4-lmcache", model)
+        self.assertEqual(model[model.index("--port") + 1], "8086")
+        self.assertEqual(model[model.index("--host") + 1], "127.0.0.1")
+        self.assertIn("VLLM_SERVER_DEV_MODE=1", model)
+        self.assertIn("VLLM_KV_CACHE_LAYOUT=BLHNC", model)
+        self.assertEqual(model[model.index("--max-num-seqs") + 1], "4")
+        self.assertNotIn("--kv-cache-memory", model)
+        self.assertEqual(model[model.index("--kv-cache-memory-bytes") + 1],
+                         "3489660928")
+        spec = json.loads(model[model.index("--speculative-config") + 1])
+        self.assertEqual((spec["method"], spec["num_speculative_tokens"]),
+                         ("dflash", 4))
+        transfer = json.loads(model[model.index("--kv-transfer-config") + 1])
+        self.assertEqual(transfer["kv_connector_extra_config"]["lmcache.mp.port"], 5655)
+
+        override = subprocess.check_output(
+            ["bash", str(profile), "DRYRUN=1", "KV_OFFLOAD=0", "KVMEM_GB=4.5"],
+            env=clean, text=True)
+        override_args = shlex.split(override)
+        self.assertEqual(
+            override_args[override_args.index("--kv-cache-memory-bytes") + 1],
+            str(int(4.5 * 2**30)))
+
     def test_mtp3_lmcache_candidate_is_isolated_from_k4(self):
         profile = ROOT / "serve/baseline-earkita/glm/glm-5.3-flash-c4-mtp3-lmcache.sh"
         clean = {k: v for k, v in os.environ.items()

@@ -109,14 +109,16 @@ def patch():
     from vllm.platforms import current_platform
     from .gate import check, vllm_commit
     version = vllm_commit()
-    latest = version.startswith('77154ca6')
+    latest = version.startswith(('77154ca6', '2067297b'))
     if (not current_platform.is_rocm() or not (version.startswith('e97573215') or latest)
             or torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(':')[0] != 'gfx1201'):
-        raise RuntimeError('GLM FP8 adapter requires gfx1201 and audited vLLM e97573215 or 77154ca6')
+        raise RuntimeError('GLM FP8 adapter requires gfx1201 and an audited vLLM commit')
     from vllm.v1.attention.backends.mla import rocm_aiter_mla_sparse as backend
     from vllm.v1.attention.ops import rocm_aiter_mla_sparse as ops
     # Reject already source-patched images too: do not stack two integrations.
     hashes = (
+        ('4a9e18584b32c8fe7728ce88dc730cd5ca3dcd930a5800ccde82362c42787680',
+         'fa6a9c47537abdc156bfa07987d17e66f481937e0535a3bc6be957740ab53584') if version.startswith('2067297b') else
         ('52d589e61c3a1c31b30aeca1773227e1acf3c2047f19c56673339ce0ef8755d7',
          'fa6a9c47537abdc156bfa07987d17e66f481937e0535a3bc6be957740ab53584') if latest else
         ('7444de2f0a2e85f74c5e06e6c2109b290936b32167594bb8a2583c72393e9e83',

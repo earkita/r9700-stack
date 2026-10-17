@@ -1,0 +1,10 @@
+# Candidate-only compatibility layer for vLLM 2067297b's BLHNC Mamba pages.
+# Build after Dockerfile.glm-lmcache; the qualified K4 image remains unchanged.
+ARG BASE=r9700/vllm:glm53-lmcache055-main206
+FROM ${BASE}
+COPY docker/patches/lmcache-0.5.5-blhnc-mamba.patch /tmp/lmcache-blhnc.patch
+RUN python3 -c 'import importlib.metadata as m; assert "2067297b" in m.version("vllm"); assert m.version("lmcache")=="0.5.5"' \
+ && cd /usr/local/lib/python3.12/dist-packages \
+ && git apply --check /tmp/lmcache-blhnc.patch \
+ && git apply /tmp/lmcache-blhnc.patch \
+ && rm /tmp/lmcache-blhnc.patch

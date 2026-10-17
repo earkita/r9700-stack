@@ -76,9 +76,9 @@ def patch():
     from .gate import vllm_commit
     commit = vllm_commit()
     if (not current_platform.is_rocm()
-            or not commit.startswith(("e97573215", "77154ca6"))
+            or not commit.startswith(("e97573215", "77154ca6", "2067297b"))
             or torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(":")[0] != "gfx1201"):
-        raise RuntimeError("GLM dense FP8 requires gfx1201 and vLLM e97573215 or 77154ca6")
+        raise RuntimeError("GLM dense FP8 requires gfx1201 and an audited vLLM commit")
     from vllm.model_executor.layers.quantization.quark.schemes.quark_w8a8_fp8 import QuarkW8A8Fp8PerBlock as Scheme
     if getattr(Scheme, "_r9k_glm_dense_installed", False):
         return True
@@ -102,7 +102,7 @@ def patch():
         process(self, layer)
         # Exclude vision and drafters even if constructed under target config.
         if not target_prefix(getattr(layer, "prefix", ""),
-                             native_glm=commit.startswith("77154ca6")):
+                             native_glm=commit.startswith(("77154ca6", "2067297b"))):
             return
         from vllm.logger import init_logger
         if prepare(self, layer, permute_fp8):

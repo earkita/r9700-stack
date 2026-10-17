@@ -59,8 +59,8 @@ def patch() -> bool:
     from .gate import check, vllm_commit
     if (not current_platform.is_rocm()
             or torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(":")[0] != "gfx1201"
-            or not vllm_commit().startswith(("e97573215", "77154ca6"))):
-        raise RuntimeError("GLM W4A4 candidate requires gfx1201 and audited vLLM e97573215 or 77154ca6")
+            or not vllm_commit().startswith(("e97573215", "77154ca6", "2067297b"))):
+        raise RuntimeError("GLM W4A4 candidate requires gfx1201 and an audited vLLM commit")
     from vllm.model_executor.layers.fused_moe.experts.ocp_mx_emulation_moe import (
         OCP_MXQuantizationEmulationTritonExperts as Experts,
     )
